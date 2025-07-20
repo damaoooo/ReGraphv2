@@ -11,6 +11,7 @@ import multiprocessing as mp
 from typing import List, Union
 from transformers import PreTrainedTokenizerFast
 import datasets
+import sqlite3
 
 from rich.console import Console
 from rich.table import Table
@@ -32,22 +33,15 @@ class DatasetBuilder:
     def __init__(self, 
                  tokenizer: PreTrainedTokenizerFast,
                  tokenizer_path: str,
-                 file_list: List[str],
-                 ddg_so_path: str = DEFAULT_DDG_SO_PATH,
-                 purify_so_path: str = DEFAULT_PURIFY_SO_PATH,
-                 cfg_so_path: str = DEFAULT_CFG_SO_PATH,
+                 db_file: str,
                  num_processes: int = None,
                  cleanup_temp_files: bool = True,
-                 max_workers_multiplier: float = 1.5,
                  cache: bool = True):
         self.tokenizer = tokenizer
-        self.file_list = file_list
-        self.ddg_so_path = ddg_so_path
-        self.purify_so_path = purify_so_path
-        self.cfg_so_path = cfg_so_path
+        self.db_file = db_file
         self.tokenizer_path = tokenizer_path
         # Increase max workers to handle I/O bound operations
-        self.num_processes = num_processes or min(int(mp.cpu_count() * max_workers_multiplier), len(file_list))
+        self.num_processes = num_processes
         self.cleanup_temp_files = cleanup_temp_files
         self.cache = cache
         self._setup_logging()
@@ -55,9 +49,6 @@ class DatasetBuilder:
         # Initialize components
         self.file_processor = FileProcessor(
             tokenizer=tokenizer,
-            ddg_so_path=ddg_so_path,
-            purify_so_path=purify_so_path,
-            cfg_so_path=cfg_so_path,
             cleanup_temp_files=cleanup_temp_files
         )
         self.parallel_processor = ParallelProcessor(num_processes=self.num_processes)
@@ -104,7 +95,6 @@ class DatasetBuilder:
 
     def process_dataset(self, output_path: str, batch_size: int = 1000, use_parallel: bool = False, skip_filtering: bool = False, use_hf: bool = False):
         """Main method to process entire dataset"""
-        console.print(f"[bold blue]Starting dataset processing: {len(self.file_list)} files")
         console.print(f"[yellow]Using {self.num_processes} processes, batch size: {batch_size}")
 
         if not os.path.exists(output_path):
@@ -113,39 +103,37 @@ class DatasetBuilder:
         else:
             console.print(f"[yellow]Output directory already exists: {output_path}")
         
-        # 预筛选文件（除非明确跳过）
-        if not skip_filtering:
-            console.print(f"[yellow]Pre-filtering files to skip small functions...")
-            
-            file_cache = os.path.join(output_path, 'file_list_cache.pkl')
-            if self.cache and os.path.exists(file_cache):
-                console.print(f"[yellow]Loading file cache from {file_cache}")
-                with open(file_cache, 'rb') as f:
-                    filtered_files = pickle.load(f)
-            else:
-                filter_start_time = time.time()
-                filtered_files = self.file_filter.filter_files_parallel(self.file_list)
-                filter_end_time = time.time()
-                console.print(f"[green]Pre-filtering completed in {filter_end_time - filter_start_time:.2f} seconds")
-                console.print(f"[green]Files after filtering: {len(filtered_files)} (skipped {len(self.file_list) - len(filtered_files)})")
-                if self.cache:
-                    console.print(f"[yellow]Saving file cache to {file_cache}")
-                    with open(file_cache, 'wb') as f:
-                        pickle.dump(filtered_files, f)
-        else:
-            filtered_files = self.file_list
-            console.print(f"[yellow]Skipping file filtering as requested")
+
+        console.print(f"[yellow]loading source file names...")
         
-        if not filtered_files:
-            console.print("[red]No files to process after filtering!")
-            return []
+        file_cache = os.path.join(output_path, 'file_list_cache.pkl')
+        if self.cache and os.path.exists(file_cache):
+            console.print(f"[yellow]Loading file cache from {file_cache}")
+            with open(file_cache, 'rb') as f:
+                filtered_files = pickle.load(f)
+        else:
+            filter_start_time = time.time()
+            
+            with sqlite3.connect(self.db_file, uri=True) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT input_path FROM results")
+                filtered_files = [row[0] for row in cursor.fetchall()]
+
+            filter_end_time = time.time()
+            console.print(f"[green]Pre-filtering completed in {filter_end_time - filter_start_time:.2f} seconds")
+            console.print(f"[green]Files after filtering: {len(filtered_files)}")
+            if self.cache:
+                console.print(f"[yellow]Saving file cache to {file_cache}")
+                with open(file_cache, 'wb') as f:
+                    pickle.dump(filtered_files, f)
 
         # Load progress.txt as the resume point
         console.print("[yellow]Checking for resume file...")
+        processed_files_set = set()
         resume_file = os.path.join(output_path, 'progress.txt')
-        if os.path.exists(resume_file):
+        if os.path.exists(resume_file) and not skip_filtering:
             console.print("[yellow]Loading processed files from resume file...")
-            processed_files_set = set()
+            
             with open(resume_file, 'r') as f:
                 for line in f:
                     processed_files_set.add(line.strip())
@@ -166,10 +154,8 @@ class DatasetBuilder:
             # Create dataset using the standalone function
             dataset = create_hf_dataset_from_files(
                 file_paths=filtered_files,
+                db_path=self.db_file,
                 tokenizer_path=self.tokenizer_path,
-                ddg_so_path=self.ddg_so_path,
-                purify_so_path=self.purify_so_path,
-                cfg_so_path=self.cfg_so_path,
                 num_processes=self.num_processes,
                 cleanup_temp_files=self.cleanup_temp_files
             )
@@ -185,10 +171,6 @@ class DatasetBuilder:
             table = Table(title="Processing Summary (Hugging Face Dataset)")
             table.add_column("Metric", style="cyan")
             table.add_column("Value", style="magenta")
-            table.add_row("Original files", str(len(self.file_list)))
-            if not skip_filtering:
-                table.add_row("Files after filtering", str(len(filtered_files)))
-                table.add_row("Files skipped by filter", str(len(self.file_list) - len(filtered_files)))
             table.add_row("Successfully processed files", str(len(dataset)))
             table.add_row("Processing time", f"{end_time - start_time:.2f} seconds")
             if len(dataset) > 0:
@@ -201,15 +183,16 @@ class DatasetBuilder:
         if self.num_processes == 1:
             console.print(f"[yellow]Processing method: Sequential (debug mode)")
             start_time = time.time()
-            results = self.parallel_processor.process_files_sequential(self.file_processor, filtered_files)
+            results = self.parallel_processor.process_files_sequential(self.file_processor, filtered_files, db_file=self.db_file)
             end_time = time.time()
         else:
             console.print(f"[yellow]Processing method: {'Parallel chunks' if use_parallel else 'Batched'}")
             start_time = time.time()
             if use_parallel:
-                results = self.parallel_processor.process_files_parallel(self.file_processor, filtered_files, output_path=output_path, start_index=len(processed_files_set))
+                results = self.parallel_processor.process_files_parallel(file_processor=self.file_processor, file_paths=filtered_files, 
+                                                                         db_file=self.db_file, output_path=output_path, start_index=len(processed_files_set))
             else:
-                results = self.parallel_processor.process_files_batch(self.file_processor, filtered_files, batch_size)
+                results = self.parallel_processor.process_files_batch(self.file_processor, filtered_files, db_file=self.db_file, batch_size=batch_size)
             end_time = time.time()
         
         successful_count = sum(1 for r in results if r.success)
@@ -218,16 +201,13 @@ class DatasetBuilder:
         table = Table(title="Processing Summary")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="magenta")
-        
-        table.add_row("Original files", str(len(self.file_list)))
-        if not skip_filtering:
-            table.add_row("Files after filtering", str(len(filtered_files)))
-            table.add_row("Files skipped by filter", str(len(self.file_list) - len(filtered_files)))
+    
         table.add_row("Files processed", str(len(filtered_files)))
-        table.add_row("Successful", str(successful_count))
-        table.add_row("Failed", str(len(filtered_files) - successful_count))
-        table.add_row("Processing time", f"{end_time - start_time:.2f} seconds")
-        table.add_row("Average time per file", f"{(end_time - start_time) / len(filtered_files):.4f} seconds")
+        if len(filtered_files) > 0:
+            table.add_row("Successful", str(successful_count))
+            table.add_row("Failed", str(len(filtered_files) - successful_count))
+            table.add_row("Processing time", f"{end_time - start_time:.2f} seconds")
+            table.add_row("Average time per file", f"{(end_time - start_time) / len(filtered_files):.4f} seconds")
         
         console.print(table)
         if use_hf or (self.num_processes == 1) or self.num_processes == 1:

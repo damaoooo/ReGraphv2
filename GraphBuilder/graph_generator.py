@@ -148,7 +148,7 @@ def process_one_file(llvm_ir_path: str) -> Optional[Tuple[str, str, str, str]]:
     if cfg_dot_file is None:
         return None
     
-    return llvm_ir_path, purified_llvm_ir_path, instrumented_file, ddg_dot_file, cfg_dot_file
+    return llvm_ir_path, purified_llvm_ir_path, instrumented_file, cfg_dot_file, ddg_dot_file
 
 
 def process_chunk(file_paths: List[str], queue: multiprocessing.Queue) -> List[Optional[Tuple[str, str, str, str]]]:
@@ -162,7 +162,7 @@ def process_chunk(file_paths: List[str], queue: multiprocessing.Queue) -> List[O
 
 def init_database(output_db_path: str):
     """Initialize the SQLite database for storing results."""
-    with sqlite3.connect(output_db_path) as conn:
+    with sqlite3.connect(output_db_path,) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS results (

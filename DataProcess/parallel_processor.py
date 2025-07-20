@@ -3,11 +3,13 @@ Parallel processing utilities for dataset building
 """
 import logging
 import sys
+from transformers import PreTrainedTokenizerFast
 from typing import List
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pebble import ProcessPool
 from tqdm import tqdm
 import traceback
+import sqlite3
 import multiprocessing
 
 from rich.console import Console
@@ -23,28 +25,26 @@ console = Console()
 
 
 def process_single_file_standalone(
-    llvm_ir_path: str,
-    tokenizer,
-    tokenizer_path: str,
-    ddg_so_path: str,
-    purify_so_path: str,
-    cfg_so_path: str,
+    input_path: str,
+    purified_file: str,
+    cfg_dot: str,
+    ddg_dot: str,
+    instrumented_file: str,
+    tokenizer: PreTrainedTokenizerFast,
     cleanup_temp_files: bool = True
 ) -> ProcessingResult:
     """Standalone version of process_single_file that doesn't require self"""
     try:
         processor = FileProcessor(
             tokenizer=tokenizer,
-            ddg_so_path=ddg_so_path,
-            purify_so_path=purify_so_path,
-            cfg_so_path=cfg_so_path,
             cleanup_temp_files=cleanup_temp_files
         )
-        return processor.process_single_file(llvm_ir_path)
+        return processor.process_single_file(input_file=input_path, purified_file=purified_file, 
+                                             cfg_dot=cfg_dot, ddg_dot=ddg_dot, instrumented_file=instrumented_file)
         
     except Exception as e:
         return ProcessingResult(
-            file_path=llvm_ir_path,
+            file_path=input_path,
             success=False,
             error_message=str(e)
         )
@@ -52,21 +52,36 @@ def process_single_file_standalone(
 
 def process_chunk_standalone(
     file_paths: List[str],
+    db_file: str,
     tokenizer_path: str,
-    ddg_so_path: str,
-    purify_so_path: str,
-    cfg_so_path: str,
     cleanup_temp_files: bool = True
 ) -> List[ProcessingResult]:
     """Standalone version of _process_chunk"""
     from Tokenizer.ir_tokenizer import load_tokenizer
     
     tokenizer = load_tokenizer(tokenizer_path)
+    with sqlite3.connect(db_file, uri=True) as conn:
+        cursor = conn.cursor()
+        placeholders = ','.join(['?'] * len(file_paths))
+        sql_query = f"SELECT input_path, purify_path, instrumented_path, cfg_dot, ddg_dot FROM results WHERE input_path IN ({placeholders})"
+        cursor.execute(sql_query, file_paths)
+        file_paths = cursor.fetchall()
+        conn.commit()
+
     results = []
     for file_path in file_paths:
+        input_file, purified_file, instrumented_file, cfg_dot, ddg_dot,  = file_path
+        if not input_file or not purified_file or not cfg_dot or not ddg_dot or not instrumented_file:
+            print(f"Invalid file paths in chunk: {file_path}")
+            continue
         result = process_single_file_standalone(
-            file_path, tokenizer, tokenizer_path, ddg_so_path, 
-            purify_so_path, cfg_so_path, cleanup_temp_files
+            input_path=input_file,
+            purified_file=purified_file,
+            cfg_dot=cfg_dot,
+            ddg_dot=ddg_dot,
+            instrumented_file=instrumented_file,
+            tokenizer=tokenizer,
+            cleanup_temp_files=cleanup_temp_files
         )
         results.append(result)
     return results
@@ -79,7 +94,7 @@ class ParallelProcessor:
         self.num_processes = num_processes
         self.logger = logging.getLogger(__name__)
         
-    def process_files_sequential(self, file_processor: FileProcessor, file_paths: List[str]) -> List[ProcessingResult]:
+    def process_files_sequential(self, file_processor: FileProcessor, file_paths: List[str], db_file: str) -> List[ProcessingResult]:
         """Process files sequentially for debugging (when num_processes=1)"""
         console.print(f"[yellow]Using sequential processing for debugging")
         results = []
@@ -93,6 +108,15 @@ class ParallelProcessor:
             TimeRemainingColumn(),
             console=console
         ) as progress:
+            conn = sqlite3.connect(db_file, uri=True)
+            cursor = conn.cursor()
+            placeholders = ','.join(['?'] * len(file_paths))
+            sql_query = f"SELECT input_path, purify_path, instrumented_path, cfg_dot, ddg_dot FROM results WHERE input_path IN ({placeholders})"
+            cursor.execute(sql_query, file_paths)
+            file_paths = cursor.fetchall()
+            conn.commit()
+            cursor.close()
+            conn.close()
             
             task = progress.add_task(
                 f"[green]Processing {len(file_paths)} files sequentially", 
@@ -101,7 +125,13 @@ class ParallelProcessor:
             
             for i, file_path in enumerate(file_paths):
                 try:
-                    result = file_processor.process_single_file(file_path)
+                    result = file_processor.process_single_file(
+                        input_file=file_path[0],
+                        purified_file=file_path[1],
+                        instrumented_file=file_path[2],
+                        cfg_dot=file_path[3],
+                        ddg_dot=file_path[4]
+                    )
                     results.append(result)
                     
                     # Log progress for debugging
@@ -123,7 +153,7 @@ class ParallelProcessor:
                     
         return results
         
-    def process_files_batch(self, file_processor: FileProcessor, file_paths: List[str], batch_size: int = 1000) -> List[ProcessingResult]:
+    def process_files_batch(self, file_processor: FileProcessor, file_paths: List[str], db_file, batch_size: int = 1000) -> List[ProcessingResult]:
         """Process files in batches using multiprocessing with rich progress bars"""
         all_results = []
         total_batches = (len(file_paths) + batch_size - 1) // batch_size
@@ -157,8 +187,17 @@ class ParallelProcessor:
                 with ThreadPoolExecutor(max_workers=self.num_processes) as executor:
                     # Submit all tasks in the batch with immediate execution
                     futures = []
-                    for file_path in batch:
-                        future = executor.submit(file_processor.process_single_file, file_path)
+                    with sqlite3.connect(db_file, uri=True) as conn:
+                        cursor = conn.cursor()
+                        placeholders = ','.join(['?'] * len(batch))
+                        sql_query = f"SELECT input_path, purify_path, instrumented_path, cfg_dot, ddg_dot FROM results WHERE input_path IN ({placeholders})"
+                        cursor.execute(sql_query, batch)
+                        batch_files = cursor.fetchall()
+                        conn.commit()
+
+                    for file_path in batch_files:
+                        input_file, purified_file, instrumented_file, cfg_dot, ddg_dot = file_path
+                        future = executor.submit(file_processor.process_single_file, input_file, purified_file, instrumented_file, cfg_dot, ddg_dot)
                         futures.append((future, file_path))
                     
                     batch_results = []
@@ -186,7 +225,7 @@ class ParallelProcessor:
                 
         return all_results
 
-    def process_files_parallel(self, file_processor: FileProcessor, file_paths: List[str], output_path: str, start_index: int) -> List[ProcessingResult]:
+    def process_files_parallel(self, file_processor: FileProcessor, file_paths: List[str], db_file: str, output_path: str, start_index: int) -> List[ProcessingResult]:
         """Alternative processing method using map for better CPU utilization"""
         console.print(f"[yellow]Using parallel processing with {self.num_processes} workers")
         
@@ -226,7 +265,7 @@ class ParallelProcessor:
                 future_to_files = {}
                 for i in range(0, len(file_paths), chunk_size):
                     chunk = file_paths[i:i + chunk_size]
-                    future = executor.submit(self._process_chunk, file_processor, chunk)
+                    future = executor.submit(self._process_chunk, file_processor, chunk, db_file)
                     future_to_files[future] = chunk
                 
                 for future in as_completed(future_to_files):
@@ -247,21 +286,32 @@ class ParallelProcessor:
         console.print(f"[green]Parallel processing completed. Results written to {output_path}")
         return []
     
-    def _process_chunk(self, file_processor: FileProcessor, file_paths: List[str]) -> List[ProcessingResult]:
+    def _process_chunk(self, file_processor: FileProcessor, file_paths: List[str], db_file: str) -> List[ProcessingResult]:
         """Process a chunk of files in a single process"""
         results = []
+        with sqlite3.connect(db_file, uri=True) as conn:
+            cursor = conn.cursor()
+            placeholders = ','.join(['?'] * len(file_paths))
+            sql_query = f"SELECT input_path, purify_path, instrumented_path, cfg_dot, ddg_dot FROM results WHERE input_path IN ({placeholders})"
+            cursor.execute(sql_query, file_paths)
+            file_paths = cursor.fetchall()
+            conn.commit()
+
         for file_path in file_paths:
-            result = file_processor.process_single_file(file_path)
+            input_file, purified_file, instrumented_file, cfg_dot, ddg_dot = file_path
+            result = file_processor.process_single_file(input_file=input_file,
+                                                        purified_file=purified_file,
+                                                        instrumented_file=instrumented_file,
+                                                        cfg_dot=cfg_dot,
+                                                        ddg_dot=ddg_dot)
             results.append(result)
         return results
 
 
 def create_hf_dataset_from_files(
     file_paths: List[str],
+    db_path: str,
     tokenizer_path: str,
-    ddg_so_path: str,
-    purify_so_path: str,
-    cfg_so_path: str,
     num_processes: int,
     cleanup_temp_files: bool = True
 ) -> 'datasets.Dataset':
@@ -271,7 +321,7 @@ def create_hf_dataset_from_files(
         """Standalone generator that doesn't capture any class instances"""
         print(f"Starting parallel processing generator for HF with {num_processes} workers", file=sys.stderr)
         
-        chunk_size = 40
+        chunk_size = 400
         
         # Use tqdm progress bar which is more serialization-friendly
         with tqdm(total=len(file_paths), desc="Processing files for HF dataset", file=sys.stderr, dynamic_ncols=True) as pbar:
@@ -282,12 +332,11 @@ def create_hf_dataset_from_files(
                     future = executor.schedule(
                         process_chunk_standalone,
                         args=(
-                        chunk, 
-                        tokenizer_path, 
-                        ddg_so_path, 
-                        purify_so_path,
-                        cfg_so_path,
-                        cleanup_temp_files)
+                            chunk, 
+                            db_path,
+                            tokenizer_path, 
+                            cleanup_temp_files
+                        )
                     )
                     future_to_files[future] = chunk
                 
