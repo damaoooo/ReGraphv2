@@ -245,13 +245,13 @@ class ParallelProcessor:
                 total=len(file_paths)
             )
 
-            chunk_size = 100  # Smaller chunks for better load balancing
+            chunk_size = 500  # Smaller chunks for better load balancing
 
-            result_queue = multiprocessing.Manager().Queue(maxsize=1000)
+            result_queue = multiprocessing.Manager().Queue()
             pd_writer = PDWriter(
                 queue=result_queue,
                 output_path=output_path,
-                bin_size=chunk_size*10,
+                bin_size=chunk_size*20,
                 start_index=start_index
             )
             
@@ -265,28 +265,29 @@ class ParallelProcessor:
                 future_to_files = {}
                 for i in range(0, len(file_paths), chunk_size):
                     chunk = file_paths[i:i + chunk_size]
-                    future = executor.submit(self._process_chunk, file_processor, chunk, db_file)
+                    future = executor.submit(self._process_chunk, file_processor, chunk, db_file, result_queue)
                     future_to_files[future] = chunk
                 
                 for future in as_completed(future_to_files):
                     try:
                         chunk_results = future.result()
-                        chunk_results = [result.to_dict() for result in chunk_results if result.success]
-                        result_queue.put(chunk_results)
-                        progress.update(task, advance=len(chunk_results))
+                        success, total = chunk_results[0], chunk_results[1]
+                        progress.update(task, advance=total)
                     except Exception as e:
                         chunk = future_to_files[future]
                         self.logger.error(f"Error processing chunk: {e}")
                         # Add failed results for the chunk
                         progress.update(task, advance=len(chunk))
+                    finally:
+                        future_to_files.pop(future)
                         
             result_queue.put('STOP')  # Signal end of processing
             pd_process.join()  # Wait for the PDWriter process to finish
             
         console.print(f"[green]Parallel processing completed. Results written to {output_path}")
         return []
-    
-    def _process_chunk(self, file_processor: FileProcessor, file_paths: List[str], db_file: str) -> List[ProcessingResult]:
+
+    def _process_chunk(self, file_processor: FileProcessor, file_paths: List[str], db_file: str, queue: multiprocessing.Queue) -> List[int]:
         """Process a chunk of files in a single process"""
         results = []
         with sqlite3.connect(db_file, uri=True) as conn:
@@ -305,7 +306,12 @@ class ParallelProcessor:
                                                         cfg_dot=cfg_dot,
                                                         ddg_dot=ddg_dot)
             results.append(result)
-        return results
+        total_len = len(results)
+        success = sum(1 for r in results if r.success)
+        
+        results = [result.to_dict() for result in results if result.success]
+        queue.put(results)
+        return [success, total_len] 
 
 
 def create_hf_dataset_from_files(
