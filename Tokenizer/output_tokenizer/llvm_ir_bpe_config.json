@@ -1,0 +1,18 @@
+{
+  "model_type": "BPE",
+  "vocab_size": 65535,
+  "min_frequency": 2,
+  "special_tokens": [
+    "<pad>",
+    "<unk>",
+    "<bos>",
+    "<eos>",
+    "<mask>",
+    "<func>",
+    "<bb>",
+    "<var>",
+    "<const>"
+  ],
+  "tokenizer_path": "output_tokenizer/llvm_ir_bpe.json",
+  "vocab_path": "output_tokenizer/llvm_ir_bpe_vocab.json"
+}
