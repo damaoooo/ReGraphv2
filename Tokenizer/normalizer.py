@@ -47,6 +47,15 @@ class LLVMIRNormalizer:
             'constant_hex': re.compile(r'\b0x[0-9a-fA-F]+\b'),
             'function_call': re.compile(r'@(\w+)\s*\('),
             'global_var': re.compile(r'@(\w+)'),
+            # Addtional patterns for metadata and other constructs
+            'regular_function_names': re.compile(r'@(\w[\w\d\.]*)'),
+            'quoted_function_names': re.compile(r'@"([^"]*)"'),
+            # Normalize Constants
+            'bb_label_def': re.compile(r'^([^:]+):\s*$'),
+            'bb_ref': re.compile(r'(label\s+%"[^"]*"|%"[^"]*"|\s@"[^"]*")'),
+            'function_ref': re.compile(r'@[^\s,\)\]:]+'),
+            'line_interger_constants': re.compile(r'(?<!i)(?<!\[)(?<!%\.)(\b\d+\b)(?![*.]|\s*x\s)'),
+            'line_float_constants': re.compile(r'(?<!%\.)\b\d+\.\d+(?:e[+-]?\d+)?\b')
         }
     
     def normalize_with_llvmlite(self, ir_code: str) -> str:
@@ -282,10 +291,10 @@ class LLVMIRNormalizer:
             return f'@{self.get_normalized_func(func_name)}'
         
         # Handle regular function names
-        line = re.sub(r'@(\w[\w\d\.]*)', replace_func_call, line)
+        line = self.patterns['regular_function_names'].sub(replace_func_call, line)
         # Handle quoted function names
-        line = re.sub(r'@"([^"]*)"', replace_quoted_func_call, line)
-        
+        line = self.patterns['quoted_function_names'].sub(replace_quoted_func_call, line)
+
         return line
     
     def normalize_with_regex(self, ir_code: str) -> str:
@@ -382,20 +391,17 @@ class LLVMIRNormalizer:
         
         # Protect basic block label definitions (lines ending with colon)
         # Examples: "@0":, "@2":, "@3":, "bb1":, etc.
-        bb_label_def_pattern = r'^([^:]+):\s*$'
-        if re.match(bb_label_def_pattern, line.strip()):
+        if self.patterns['bb_label_def'].match(line.strip()):
             # This is a basic block label definition line, don't modify it
             return line
         
         # Protect basic block references in branch instructions
         # Examples: label %"@3", label %"@2", %"@0", etc.
-        bb_ref_pattern = r'(label\s+%"[^"]*"|%"[^"]*"|\s@"[^"]*")'
-        line = re.sub(bb_ref_pattern, protect_bb_label_refs, line)
+        line = self.patterns['bb_ref'].sub(protect_bb_label_refs, line)
         
         # Protect function references and other @ symbols
         # Examples: @_Z9etoupperww, @towupper, etc.
-        function_ref_pattern = r'@[^\s,\)\]:]+'
-        line = re.sub(function_ref_pattern, protect_bb_labels, line)
+        line = self.patterns['function_ref'].sub(protect_bb_labels, line)
         
         # Normalize integer constants (preserve common small values and alignment values)
         def replace_int(match):
@@ -418,10 +424,10 @@ class LLVMIRNormalizer:
         
         # Normalize integer constants (avoid matching array sizes in type declarations and register names)
         # Avoid matching register names like %.160
-        line = re.sub(r'(?<!i)(?<!\[)(?<!%\.)(\b\d+\b)(?![*.]|\s*x\s)', replace_int, line)
+        line = self.patterns['line_interger_constants'].sub(replace_int, line)
         
         # Normalize float constants (avoid matching register names like %.160)
-        line = re.sub(r'(?<!%\.)\b\d+\.\d+(?:e[+-]?\d+)?\b', '<FLOAT_CONST>', line)
+        line = self.patterns['line_float_constants'].sub('<FLOAT_CONST>', line)
         
         # Restore basic block label references first
         for i, bb_label_ref in enumerate(bb_label_refs):
@@ -539,10 +545,10 @@ class LLVMIRNormalizer:
             return f'@{self.get_normalized_func(name)}'
         
         # Handle regular function names
-        line = re.sub(r'@(\w[\w\d\.]*)', replace_global, line)
+        line = self.patterns['regular_function_names'].sub(replace_global, line)
         # Handle quoted function names
-        line = re.sub(r'@"([^"]*)"', replace_quoted_global, line)
-        
+        line = self.patterns['quoted_function_names'].sub(replace_quoted_global, line)
+
         # Normalize constants
         line = self.normalize_constants(line)
         

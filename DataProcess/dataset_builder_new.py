@@ -256,8 +256,8 @@ class DatasetBuilder:
                 result_dict['has_tokens'] = False
                 
             serializable_results.append(result_dict)
-        
-        with open(output_path, 'w') as f:
+        output_json = os.path.join(output_path, 'results.json')
+        with open(output_json, 'w') as f:
             json.dump(serializable_results, f, indent=2)
             
         console.print(f"[green]Results saved successfully")

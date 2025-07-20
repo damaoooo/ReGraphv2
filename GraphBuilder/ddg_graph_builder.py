@@ -5,6 +5,7 @@ import os
 import sys
 from Tokenizer.normalizer import normalize_file, normalize_string
 from transformers import PreTrainedTokenizerFast
+import bisect
 
 from Tokenizer.ir_tokenizer import load_tokenizer
 
@@ -65,15 +66,23 @@ class DataDependencyGraphBuilder:
         
         offsets = tokens['offset_mapping']
 
-        # More efficient token range finding
+        search_start_idx = bisect.bisect_left(offsets, (start_index, 0))
+        scan_start_idx = max(0, search_start_idx - 1)
         token_idx_start = None
         token_idx_end = None
-        
-        for token_idx, (start, end) in enumerate(offsets):
-            if start >= start_index and end <= end_index:
-                if token_idx_start is None:
-                    token_idx_start = token_idx
-                token_idx_end = token_idx
+        # More efficient token range finding
+        for token_idx in range(scan_start_idx, len(offsets)):
+                start, end = offsets[token_idx]
+
+                # Early Break if we are past the end of the target range
+                if start >= end_index:
+                    break
+                    
+                # Filter out (0, 0) and judge the overlap
+                if start < end and end > start_index:
+                    if token_idx_start is None:
+                        token_idx_start = token_idx
+                    token_idx_end = token_idx
 
         if token_idx_start is None or token_idx_end is None:
             return None, None

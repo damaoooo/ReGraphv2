@@ -15,6 +15,7 @@ __pycache__/
 *.pkl
 *.log
 *.png
+*.svg
 *.ll
 *.bc
 *.dot
