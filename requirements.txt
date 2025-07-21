@@ -6,6 +6,8 @@ datasets
 networkx
 pygraphviz
 llvmlite
+pebble
+tensorboard
 
 --index-url https://download.pytorch.org/whl/cu128
 torch

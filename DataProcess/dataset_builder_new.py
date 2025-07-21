@@ -195,7 +195,10 @@ class DatasetBuilder:
                 results = self.parallel_processor.process_files_batch(self.file_processor, filtered_files, db_file=self.db_file, batch_size=batch_size)
             end_time = time.time()
         
-        successful_count = sum(1 for r in results if r.success)
+        if use_parallel:
+            successful_count = results[0]
+        else:
+            successful_count = sum(1 for r in results if r.success)
         
         # Create summary table
         table = Table(title="Processing Summary")

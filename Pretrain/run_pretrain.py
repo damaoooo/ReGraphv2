@@ -1,120 +1,79 @@
-# file: pretrain/run_pretrain.py
+from Pretrain.pretrain_dataset import MyFinalDataCollator, load_dataset
+from transformers import PreTrainedTokenizerFast, DataCollatorForLanguageModeling
+from transformers import Trainer, TrainingArguments
+from transformers import BertForMaskedLM
+import os
 
-import torch
-from transformers import (
-    PreTrainedTokenizerFast,
-    DebertaV2Config,
-    DebertaV2ForMaskedLM,
-    Trainer,
-    TrainingArguments,
-    DataCollatorForLanguageModeling,
-)
-
-# Import our own dataset function
-from ir_dataset import load_and_tokenize_dataset
-
-def create_deberta_v3_config(vocab_size: int, max_seq_len: int = 4096) -> DebertaV2Config:
-    """
-    Create a new DeBERTa V3 model config with the given vocab size and max sequence length.
-    
-    Args:
-        vocab_size (int): Vocabulary size, must match the tokenizer.
-        max_seq_len (int): Maximum sequence length supported by the model.
-
-    Returns:
-        DebertaV2Config: Configuration object for DeBERTa V3.
-    """
-    print(f"Creating DeBERTa V3 config: Vocab Size={vocab_size}, Max Length={max_seq_len}")
-    
-    # These parameters are for the "base" model; adjust as needed for your resources
-    config = DebertaV2Config(
-        vocab_size=vocab_size,
-        max_position_embeddings=max_seq_len,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        intermediate_size=3072,
-        relative_attention=True,
-        pos_att_type="p2c|c2p",  # Standard for DeBERTa V2/V3
-        torch_dtype="bfloat16",  # Recommended for training with Flash Attention
-        use_flash_attn=True,  # Enable Flash Attention if supported
-    )
-    return config
 
 def main():
-    # --- 1. Define all paths and core parameters ---
-    TOKENIZER_PATH = "/home/damaoooo/Downloads/regraphv2/DataProcess/small_sample_tokenizer/llvm_ir_bpe.json"
-    CORPUS_DIR = "/home/damaoooo/Downloads/regraphv2/DataProcess/small_sample_corpus"
-    OUTPUT_DIR = "output/deberta-v3-pretrained-4096"
-    MAX_SEQ_LENGTH = 4096
-
-    # --- 2. Load and configure Tokenizer ---
-    print("Loading and configuring Tokenizer...")
-    tokenizer = PreTrainedTokenizerFast(tokenizer_file=TOKENIZER_PATH)
     
-    special_tokens_map = {
-        'pad_token': '<pad>', 'unk_token': '<unk>', 'bos_token': '<bos>',
-        'eos_token': '<eos>', 'mask_token': '<mask>',
-        'additional_special_tokens': ["<func>", "<bb>", "<var>", "<const>"]
-    }
-    tokenizer.add_special_tokens(special_tokens_map)
-    tokenizer.cls_token = tokenizer.bos_token
-    tokenizer.sep_token = tokenizer.eos_token
+    tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
+    tokenizer = PreTrainedTokenizerFast(tokenizer_path)
+    dataset_path = "/home/damaoooo/Downloads/regraphv2/IR/binary_save_truncated"
+    dataset = load_dataset(dataset_path)
     
-    print(f"Tokenizer loaded. Vocabulary size: {len(tokenizer)}")
-
-    # --- 3. Load and process dataset ---
-    tokenized_dataset = load_and_tokenize_dataset(CORPUS_DIR, tokenizer, MAX_SEQ_LENGTH)
-
-    # --- 4. Create model ---
-    config = create_deberta_v3_config(vocab_size=len(tokenizer), max_seq_len=MAX_SEQ_LENGTH)
+    my_collator = MyFinalDataCollator(tokenizer=tokenizer)
     
-    print("Initializing DeBERTa V3 model from scratch...")
-    model = DebertaV2ForMaskedLM(config=config)
-    print(f"Model created! Number of parameters: {model.num_parameters():,}")
-
-    # --- 5. Set up training ---
-    print("Configuring training arguments and Trainer...")
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer, mlm=True, mlm_probability=0.15
-    )
-
-    training_args = TrainingArguments(
-        output_dir=OUTPUT_DIR,
-        overwrite_output_dir=True,
+    model = BertForMaskedLM.from_pretrained("bert-base-uncased")
+    
+    train_args = TrainingArguments(
+        output_dir="./output",
         num_train_epochs=3,
-        per_device_train_batch_size=8,  # 4096 sequence length is very memory intensive!
-        gradient_accumulation_steps=32, # Effective batch size = 2 * 32 = 64
-        save_steps=10_000,
-        save_total_limit=3,
-        prediction_loss_only=True,
+        per_device_train_batch_size=8,
+        fp16=True,
+        dataloader_num_workers=max(4, os.cpu_count() // 2),  # Use half of the available CPU cores
+        torch_compile=True,  # Enable TorchScript compilation for performance
+        logging_dir="./logs",
         learning_rate=5e-5,
-        weight_decay=0.01,
         warmup_steps=1000,
-        fp16=True if torch.cuda.is_available() else False, # Mixed precision training
-        logging_steps=100, # More frequent logging
-
+        weight_decay=0.01,
+        optim="adamw_torch",
+        save_strategy="steps",
+        save_steps=500000,
+        save_total_limit=3,
+        # === 5. 日志与评估设置 (Logging & Evaluation) ===
+        logging_strategy="steps",            # 按步数记录日志。
+        logging_steps=100,                   # 每隔100步在控制台打印一次训练损失等信息。
+        report_to="tensorboard",             # 将日志报告给TensorBoard。你也可以设置为 "wandb" 或 "comet_ml" 等。
     )
-
+    
     trainer = Trainer(
         model=model,
-        args=training_args,
-        data_collator=data_collator,
-        train_dataset=tokenized_dataset,
-        tokenizer=tokenizer,
+        args=train_args,
+        train_dataset=dataset,
+        data_collator=my_collator,
     )
-
-    # --- 6. Start training ---
-    print("="*50)
-    print("Everything is ready. Starting pretraining!")
-    print("="*50)
     
-    trainer.train()
+    # 检查输出目录中是否存在检查点
+    # last_checkpoint = None
+    # if os.path.isdir(training_args.output_dir):
+    #     # 寻找最新的检查点文件夹
+    #     checkpoints = [d for d in os.listdir(training_args.output_dir) if d.startswith("checkpoint-")]
+    #     if checkpoints:
+    #         last_checkpoint = os.path.join(training_args.output_dir, max(checkpoints, key=lambda x: int(x.split('-')[-1])))
 
-    # --- 7. Save final model ---
-    print("Training complete! Saving final model...")
-    trainer.save_model(f"{OUTPUT_DIR}-final")
-    print("All tasks completed!")
+    # 方式一：自动从最新的检查点恢复
+    # 如果 output_dir 存在检查点，Trainer会自动从那里恢复
+    # 如果你想确保是这样，可以传入 resume_from_checkpoint=True
+    # train_result = trainer.train(resume_from_checkpoint=True)
 
-if __name__ == "__main__":
-    main()
+    # 方式二：从指定的检查点恢复
+    # train_result = trainer.train(resume_from_checkpoint=last_checkpoint)
+
+    # 如果是从头开始训练
+    print("Starting training...")
+    train_result = trainer.train(resume_from_checkpoint=True)
+    print("Training finished.")
+
+    # --- 训练完成后 ---
+
+    # 保存最终的模型、分词器和配置
+    # 这会创建一个干净的、可以被 from_pretrained 加载的最终模型文件夹
+    trainer.save_model("./final_model")
+    tokenizer.save_pretrained("./final_model")
+
+    # 记录训练过程中的一些指标
+    metrics = train_result.metrics
+    trainer.log_metrics("train", metrics)
+    trainer.save_metrics("train", metrics)
+    trainer.save_state() # 保存Trainer的状态，包括随机种子等

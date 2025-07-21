@@ -240,6 +240,8 @@ class ParallelProcessor:
             console=console
         ) as progress:
             
+            total, success_t = len(file_paths), 0
+            
             task = progress.add_task(
                 f"[green]Processing {len(file_paths)} files", 
                 total=len(file_paths)
@@ -272,6 +274,7 @@ class ParallelProcessor:
                     try:
                         chunk_results = future.result()
                         success, total = chunk_results[0], chunk_results[1]
+                        success_t += success
                         progress.update(task, advance=total)
                     except Exception as e:
                         chunk = future_to_files[future]
@@ -285,7 +288,7 @@ class ParallelProcessor:
             pd_process.join()  # Wait for the PDWriter process to finish
             
         console.print(f"[green]Parallel processing completed. Results written to {output_path}")
-        return []
+        return success_t, total
 
     def _process_chunk(self, file_processor: FileProcessor, file_paths: List[str], db_file: str, queue: multiprocessing.Queue) -> List[int]:
         """Process a chunk of files in a single process"""
