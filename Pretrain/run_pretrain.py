@@ -3,25 +3,33 @@ from transformers import PreTrainedTokenizerFast, DataCollatorForLanguageModelin
 from transformers import Trainer, TrainingArguments
 from transformers import BertForMaskedLM
 import os
+from Tokenizer.ir_tokenizer import load_tokenizer
+from Model.model_backbone import BinDebertaV2Model, create_deberta_v3_config
 
 
 def main():
     
     tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
-    tokenizer = PreTrainedTokenizerFast(tokenizer_path)
+    tokenizer = load_tokenizer(tokenizer_path)
     dataset_path = "/home/damaoooo/Downloads/regraphv2/IR/binary_save_truncated"
     dataset = load_dataset(dataset_path)
-    
+    # dataset = dataset.remove_columns({
+    #     "cfg_graph": "cfg_adj_list",
+    #     "ddg_graph": "ddg_adj_list",
+    # })
     my_collator = MyFinalDataCollator(tokenizer=tokenizer)
     
-    model = BertForMaskedLM.from_pretrained("bert-base-uncased")
+    model_config = create_deberta_v3_config(vocab_size=tokenizer.vocab_size)
+    model = BinDebertaV2Model(config=model_config)
     
     train_args = TrainingArguments(
         output_dir="./output",
         num_train_epochs=3,
         per_device_train_batch_size=8,
         fp16=True,
-        dataloader_num_workers=max(4, os.cpu_count() // 2),  # Use half of the available CPU cores
+        remove_unused_columns=False,
+        # dataloader_num_workers=max(4, os.cpu_count() // 2),  # Use half of the available CPU cores
+        dataloader_num_workers=1,
         torch_compile=True,  # Enable TorchScript compilation for performance
         logging_dir="./logs",
         learning_rate=5e-5,
@@ -62,7 +70,7 @@ def main():
 
     # 如果是从头开始训练
     print("Starting training...")
-    train_result = trainer.train(resume_from_checkpoint=True)
+    train_result = trainer.train()
     print("Training finished.")
 
     # --- 训练完成后 ---
@@ -77,3 +85,7 @@ def main():
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
     trainer.save_state() # 保存Trainer的状态，包括随机种子等
+
+
+if __name__ == "__main__":
+    main()

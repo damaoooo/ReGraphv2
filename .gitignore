@@ -21,6 +21,8 @@ __pycache__/
 *.dot
 **/build
 
+logs/
+
 .idea/
 .vscode/
 

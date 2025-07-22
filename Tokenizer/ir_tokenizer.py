@@ -1,9 +1,9 @@
 from transformers import PreTrainedTokenizerFast
-from tokenizers import Tokenizer
+from tokenizers import Tokenizer as tk
 from tokenizers.processors import TemplateProcessing
 
 def load_tokenizer(tokenizer_path: str):
-    raw_tokenizer = Tokenizer.from_file(tokenizer_path)
+    raw_tokenizer = tk.from_file(tokenizer_path)
     raw_tokenizer.post_processor = TemplateProcessing(
         single="<bos> $A <eos>",
         pair="<bos> $A <eos> <bos> $B:1 <eos>:1",
