@@ -417,24 +417,123 @@ class BinDebertaV2Model(DebertaV2Model):
             hidden_states=encoder_outputs.hidden_states if output_hidden_states else None,
             attentions=encoder_outputs.attentions,
         )
-
 if __name__ == "__main__":
+    import time
+    import gc
+    
     # Small test to ensure the model can be created
     vocab_size = 65535
     model = BinDebertaV2Model(create_deberta_v3_config(vocab_size))
+    
+    # Performance testing function
+    def benchmark_model(model, device='cpu', batch_sizes=[1, 2, 4, 8], seq_len=128, num_warmup=5, num_iterations=20):
+        """
+        Benchmark the model with different batch sizes
+        
+        Args:
+            model: The model to benchmark
+            device: Device to run on ('cpu' or 'cuda')
+            batch_sizes: List of batch sizes to test
+            seq_len: Sequence length
+            num_warmup: Number of warmup iterations
+            num_iterations: Number of benchmark iterations
+        """
+        model = model.to(device)
+        model.eval()  # Set to evaluation mode
+        
+        print(f"\n{'='*60}")
+        print(f"Benchmarking on {device.upper()}")
+        print(f"{'='*60}")
+        print(f"{'Batch Size':<12} {'Latency (ms)':<15} {'Throughput (samples/s)':<20} {'Memory (MB)':<12}")
+        print(f"{'-'*60}")
+        
+        for batch_size in batch_sizes:
+            try:
+                # Generate dummy data
+                input_ids = torch.randint(0, vocab_size, (batch_size, seq_len)).to(device)
+                attention_mask = torch.ones((batch_size, seq_len), dtype=torch.bool).to(device)
+                
+                # Generate dummy adjacency lists
+                ddg_adj_list = [
+                    torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]]).to(device) 
+                    for _ in range(batch_size)
+                ]
+                cfg_adj_list = [
+                    torch.tensor([[0, 1, 2, 3, 0.5], [1, 2, 3, 4, 0.8]]).to(device) 
+                    for _ in range(batch_size)
+                ]
+                
+                # Warmup
+                with torch.no_grad():
+                    for _ in range(num_warmup):
+                        _ = model(
+                            input_ids=input_ids,
+                            ddg_adj_list=ddg_adj_list,
+                            cfg_adj_list=cfg_adj_list,
+                            attention_mask=attention_mask
+                        )
+                
+                # Clear cache if using GPU
+                if device == 'cuda':
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                
+                # Benchmark
+                start_time = time.time()
+                
+                with torch.no_grad():
+                    for _ in range(num_iterations):
+                        if device == 'cuda':
+                            torch.cuda.synchronize()
+                        
+                        iter_start = time.time()
+                        _ = model(
+                            input_ids=input_ids,
+                            ddg_adj_list=ddg_adj_list,
+                            cfg_adj_list=cfg_adj_list,
+                            attention_mask=attention_mask
+                        )
+                        
+                        if device == 'cuda':
+                            torch.cuda.synchronize()
+                
+                end_time = time.time()
+                
+                # Calculate metrics
+                total_time = end_time - start_time
+                avg_latency = (total_time / num_iterations) * 1000  # Convert to ms
+                throughput = (batch_size * num_iterations) / total_time  # samples per second
+                
+                # Memory usage
+                if device == 'cuda':
+                    memory_used = torch.cuda.max_memory_allocated() / 1024 / 1024  # Convert to MB
+                    torch.cuda.reset_peak_memory_stats()
+                else:
+                    memory_used = 0  # Hard to measure CPU memory accurately
+                
+                print(f"{batch_size:<12} {avg_latency:<15.2f} {throughput:<20.2f} {memory_used:<12.1f}")
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"{batch_size:<12} {'OOM':<15} {'OOM':<20} {'OOM':<12}")
+                    if device == 'cuda':
+                        torch.cuda.empty_cache()
+                    break
+                else:
+                    raise e
+    
+    # Test model creation and basic functionality
+    print("Testing model creation and basic functionality...")
     
     # Generate dummy input
     input_ids = torch.randint(0, vocab_size, (2, 128))
 
     # Generate dummy ddg_adj_list and cfg_adj_list
-    # in the ddg_adj_list, we assume each edge is represented as a tuple of (source_start, source_end, dest_start, dest_end)
-    # and source_start < source_end and dest_start < dest_end
     ddg_adj_list = [
         torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]]),  # Batch 0
         torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])   # Batch 1
     ]
 
-    # in the cfg_adj_list, we assume each edge is represented as a tuple of (source_start, source_end, dest_start, dest_end, probability)
     cfg_adj_list = [
         torch.tensor([[0, 1, 2, 3, 0.5], [1, 2, 3, 4, 0.8]]),  # Batch 0
         torch.tensor([[0, 1, 2, 3, 0.6], [1, 2, 3, 4, 0.9]])   # Batch 1
@@ -447,25 +546,114 @@ if __name__ == "__main__":
         attention_mask=torch.ones((2, 128), dtype=torch.bool)
     )
 
-    print("Model output shape:", model_output.last_hidden_state.shape)
-
+    print("✓ Model output shape:", model_output.last_hidden_state.shape)
+    
+    
     # Try it on GPU if available
     if torch.cuda.is_available():
-        model = model.to('cuda')
-        input_ids = input_ids.to('cuda')
-        ddg_adj_list = [adj.to('cuda') for adj in ddg_adj_list]
-        cfg_adj_list = [adj.to('cuda') for adj in cfg_adj_list]
+        print(f"\nCUDA is available. GPU: {torch.cuda.get_device_name()}")
         
-        model_output = model(
-            input_ids=input_ids,
-            ddg_adj_list=ddg_adj_list,
-            cfg_adj_list=cfg_adj_list,
+        # Test basic GPU functionality
+        model_gpu = model.to('cuda')
+        input_ids_gpu = input_ids.to('cuda')
+        ddg_adj_list_gpu = [adj.to('cuda') for adj in ddg_adj_list]
+        cfg_adj_list_gpu = [adj.to('cuda') for adj in cfg_adj_list]
+        
+        model_output_gpu = model_gpu(
+            input_ids=input_ids_gpu,
+            ddg_adj_list=ddg_adj_list_gpu,
+            cfg_adj_list=cfg_adj_list_gpu,
             attention_mask=torch.ones((2, 128), dtype=torch.bool).to('cuda')
         )
         
-        print("Model output shape on GPU:", model_output.last_hidden_state.shape)
+        print("✓ Model output shape on GPU:", model_output_gpu.last_hidden_state.shape)
+        
+        # Benchmark on GPU
+        benchmark_model(model_gpu, device='cuda', batch_sizes=[1, 2, 4, 8, 16], seq_len=128)
+        
+        # Additional GPU-specific metrics
+        print(f"\nGPU Memory Summary:")
+        print(f"Total GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        print(f"Current GPU Memory Usage: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        print(f"Peak GPU Memory Usage: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
+        
     else:
-        print("CUDA is not available, running on CPU.")
-        print("Model output shape on CPU:", model_output.last_hidden_state.shape)
+        print("\nCUDA is not available, skipping GPU benchmarks.")
+    
+    # Test with different sequence lengths
+    print(f"\n{'='*60}")
+    print("Testing different sequence lengths (batch_size=2)")
+    print(f"{'='*60}")
+    print(f"{'Seq Length':<12} {'Latency (ms)':<15} {'Throughput (tok/s)':<20}")
+    print(f"{'-'*50}")
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = model.to(device)
+    
+    for seq_len in [512, 1024, 2048, 4096]:
+        try:
+            batch_size = 2
+            input_ids = torch.randint(0, vocab_size, (batch_size, seq_len)).to(device)
+            attention_mask = torch.ones((batch_size, seq_len), dtype=torch.bool).to(device)
+            
+            # Adjust adjacency lists for different sequence lengths
+            ddg_adj_list = [
+                torch.tensor([[0, 1, min(seq_len-2, 2), min(seq_len-1, 3)]]).to(device) 
+                for _ in range(batch_size)
+            ]
+            cfg_adj_list = [
+                torch.tensor([[0, 1, min(seq_len-2, 2), min(seq_len-1, 3), 0.5]]).to(device) 
+                for _ in range(batch_size)
+            ]
+            
+            # Warmup
+            with torch.no_grad():
+                for _ in range(3):
+                    _ = model(
+                        input_ids=input_ids,
+                        ddg_adj_list=ddg_adj_list,
+                        cfg_adj_list=cfg_adj_list,
+                        attention_mask=attention_mask
+                    )
+            
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            
+            # Benchmark
+            start_time = time.time()
+            num_iterations = 10
+            
+            with torch.no_grad():
+                for _ in range(num_iterations):
+                    _ = model(
+                        input_ids=input_ids,
+                        ddg_adj_list=ddg_adj_list,
+                        cfg_adj_list=cfg_adj_list,
+                        attention_mask=attention_mask
+                    )
+            
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            
+            end_time = time.time()
+            
+            total_time = end_time - start_time
+            avg_latency = (total_time / num_iterations) * 1000
+            tokens_per_second = (batch_size * seq_len * num_iterations) / total_time
+            
+            print(f"{seq_len:<12} {avg_latency:<15.2f} {tokens_per_second:<20.2f}")
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"{seq_len:<12} {'OOM':<15} {'OOM':<20}")
+                if device == 'cuda':
+                    torch.cuda.empty_cache()
+                break
+            else:
+                raise e
+    
+    print(f"\n{'='*60}")
+    print("Benchmark completed!")
+    print(f"{'='*60}")
 
 
