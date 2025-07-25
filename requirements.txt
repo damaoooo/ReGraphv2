@@ -13,3 +13,6 @@ tensorboard
 torch
 torchvision
 torchaudio
+
+bitsandbytes
+xformers

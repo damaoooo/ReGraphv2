@@ -5,14 +5,22 @@ from datasets import load_dataset
 import datasets
 from tqdm import tqdm
 import pandas as pd
+import numpy as np
 
+from collections import defaultdict
+from itertools import combinations
 import os
 from typing import Dict, List, Any, Tuple
+import pickle
 
 
 def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, List[int]]) -> None:
 
     print("原始数据集总大小:", len(original_dataset))
+    
+    # Add columns to the dataset
+    indices_column = np.arange(len(original_dataset))
+    original_dataset = original_dataset.add_column("original_idx", column=indices_column)
 
     # === 2. 构建完整的相似关系图 ===
     print("构建关系图中...")
@@ -36,7 +44,7 @@ def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, Li
     random.seed(42)
     random.shuffle(connected_components)
 
-    # 假设我们按 90% 训练集, 5% 验证集, 5% 测试集来划分这些“朋友圈”
+    # 假设我们按 90% 训练集, 10% 验证集
     num_groups = len(connected_components)
     train_split_idx = int(num_groups * 0.9)
     valid_split_idx = int(num_groups)
@@ -71,28 +79,66 @@ def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, Li
     final_train_dataset = original_dataset.select(train_indices)
     final_validation_dataset = original_dataset.select(validation_indices)
 
-    final_train_dataset.save_to_disk('train_dataset')
-    final_validation_dataset.save_to_disk('validation_dataset')
+    # final_train_dataset.save_to_disk('train_dataset')
+    # final_validation_dataset.save_to_disk('validation_dataset')
 
     train_indices_set = set(train_indices)
     validation_indices_set = set(validation_indices)
 
-    # 还需要把positive_map按照训练集和验证集进行划分
-    train_positive_map = {}
-    validation_positive_map = {}
-    for k, v in tqdm(positive_map.items(), desc="划分positive_map"):
-        if int(k) in train_indices_set:
-            train_positive_map[k] = v
+    train_df_index = final_train_dataset.select_columns(['original_idx']).to_pandas()
+    train_df_index['new_idx'] = train_df_index.index
+    train_old_to_new_map = pd.Series(train_df_index.new_idx.values, index=train_df_index.original_idx).to_dict()
 
-        if int(k) in validation_indices_set:
-            validation_positive_map[k] = v
+    validation_df_index = final_validation_dataset.select_columns(['original_idx']).to_pandas()
+    validation_df_index['new_idx'] = validation_df_index.index
+    validation_old_to_new_map = pd.Series(validation_df_index.new_idx.values, index=validation_df_index.original_idx).to_dict()
+
+    def filter_and_translate_map(global_map, index_set, old_to_new_map):
+        new_map_with_new_indices = {}
+        for anchor_old_idx_str, positive_old_list in tqdm(global_map.items(), desc="Filtering and translating map"):
+            anchor_old_idx = int(anchor_old_idx_str)
+
+            if anchor_old_idx in index_set:
+                # 过滤正样本列表
+                filtered_positives_old = [p_idx for p_idx in positive_old_list if p_idx in index_set]
+
+                if filtered_positives_old:
+                    # 【关键翻译步骤】
+                    anchor_new_idx = old_to_new_map[anchor_old_idx] 
+                    translated_positives_new = [old_to_new_map[p_idx] for p_idx in filtered_positives_old]
+
+                    new_map_with_new_indices[anchor_new_idx] = translated_positives_new
+        return new_map_with_new_indices
+
+    # 还需要把positive_map按照训练集和验证集进行划分
+    train_positive_map = filter_and_translate_map(positive_map, train_indices_set, train_old_to_new_map)
+    validation_positive_map = filter_and_translate_map(positive_map, validation_indices_set, validation_old_to_new_map)
 
     # 分别保存下来
-    with open('train_positive_map.json', 'w') as f:
-        json.dump(train_positive_map, f)
-    with open('validation_positive_map.json', 'w') as f:
-        json.dump(validation_positive_map, f)
-
+    with open('train_positive_map.pkl', 'wb') as f:
+        pickle.dump(train_positive_map, f)
+    with open('validation_positive_map.pkl', 'wb') as f:
+        pickle.dump(validation_positive_map, f)
+    
+    # dataset 里面有些没有正样本的函数，这些函数在positive_map中没有对应的键
+    # 所以我们需要在datasets里面去掉这些函数
+    train_function_set = set(train_positive_map.keys())
+    validation_function_set = set(validation_positive_map.keys())
+    
+    # Convert every element in the set into int
+    train_function_set = {int(x) for x in train_function_set}
+    validation_function_set = {int(x) for x in validation_function_set}
+    
+    train_task_dataset = dataset.from_dict({'anchor_idx': train_positive_map})
+    validation_task_dataset = dataset.from_dict({'anchor_idx': validation_positive_map})
+    
+    # 保存最终的任务数据集
+    train_task_dataset.save_to_disk('train_task_dataset')
+    validation_task_dataset.save_to_disk('validation_task_dataset')
+    
+    final_train_dataset.save_to_disk('train_dataset_pool')
+    final_validation_dataset.save_to_disk('validation_dataset_pool')
+        
 
 def build_positive_indices(dataset: datasets.Dataset) -> dict:
     """
@@ -104,17 +150,6 @@ def build_positive_indices(dataset: datasets.Dataset) -> dict:
     df: pd.DataFrame = dataset.select_columns(['file_path']).to_pandas()
     df['original_idx'] = range(len(df))
     base_path = "/home/damaoooo/Downloads/regraphv2/IR/BinaryCorp/small_train"
-
-    def extract_binary_info(file_path: str) -> tuple[str, str, str]:
-        ll_name = os.path.basename(file_path)
-        dir_name = os.path.dirname(file_path)
-        dir_name = os.path.basename(dir_name)
-        origin_dir_name = dir_name.replace('_functions', '')
-        binary_hash = origin_dir_name.split('-')[-1]
-        opt_level = origin_dir_name.split('-')[-2]
-        origin_binary_name = '-'.join(origin_dir_name.split('-')[:-2])
-
-        return ll_name, opt_level, dir_name, origin_binary_name
 
     def extract_binary_info_vectorized(file_paths: pd.Series) -> pd.DataFrame:
         """向量化版本的信息提取"""
@@ -158,25 +193,30 @@ def build_positive_indices(dataset: datasets.Dataset) -> dict:
 
     full_info_df = pd.concat(processed_groups)
 
-    final_grouped = full_info_df.groupby('function_name')
+    full_info_df.dropna(subset=['origin_binary_name', 'function_name'], inplace=True)
+    # -------------------------------------------------------------------
 
-    positive_map = {}
+    # ===================================================================
+    # === 核心修正：使用复合键进行分组 ===
+    # ===================================================================
+    print("Grouping by [origin_binary_name, function_name] to find correct positive pairs...")
+    final_grouped = full_info_df.groupby(['origin_binary_name', 'function_name'])
 
-    for func_name, group in tqdm(final_grouped, desc="Processing functions"):
-        if group['dir_name'].nunique() > 1:
-            # Find the original idx of the func_name
+    # 使用defaultdict可以简化代码
+    positive_map = defaultdict(list)
+
+    for name, group in tqdm(final_grouped, desc="Generating pairs from correct groups"):
+        # 只要一个组里有多个成员（比如不同优化等级），它们就互为正样本
+        if len(group) > 1:
             indices = group['original_idx'].tolist()
-            for index in indices:
-                if index not in positive_map:
-                    positive_map[index] = []
-                new_indices = indices.copy()
-                new_indices.remove(index)  # Remove the current index to avoid self-reference
-                positive_map[index].extend(new_indices)
-    # 去重
-    for key in positive_map:
-        positive_map[key] = list(set(positive_map[key]))
+            
+            # 【优化建议】使用itertools.combinations可以更高效、简洁地生成组内所有不重复的配对
+            for idx1, idx2 in combinations(indices, 2):
+                positive_map[idx1].append(idx2)
+                positive_map[idx2].append(idx1)
 
-    return positive_map
+    # 将defaultdict转换回普通字典
+    return dict(positive_map)
         
 
 if __name__ == "__main__":

@@ -30,6 +30,8 @@ from transformers.models.deberta_v2.modeling_deberta_v2 import (
     DebertaV2Model
 )
 
+import xformers.ops as xops
+
 @torch.jit.script
 def scaled_size_sqrt(query_layer: torch.Tensor, scale_factor: int):
     return torch.sqrt(torch.tensor(query_layer.size(-1), dtype=torch.float) * scale_factor)
@@ -88,6 +90,7 @@ class BinDebertaDisentangleV2Attention(DisentangledSelfAttention):
     ):
         if query_states is None:
             query_states = hidden_states
+        
         query_layer = self.transpose_for_scores(self.query_proj(query_states), self.num_attention_heads)
         key_layer = self.transpose_for_scores(self.key_proj(hidden_states), self.num_attention_heads)
         value_layer = self.transpose_for_scores(self.value_proj(hidden_states), self.num_attention_heads)
@@ -107,8 +110,20 @@ class BinDebertaDisentangleV2Attention(DisentangledSelfAttention):
                 query_layer, key_layer, relative_pos, rel_embeddings, scale_factor
             )
 
+        batch_size, seq_len, _ = hidden_states.shape
+        qkv_shape = (batch_size, self.num_attention_heads, seq_len, self.attention_head_size)
+        query_layer_x = query_layer.view(qkv_shape).permute(0, 2, 1, 3)
+        key_layer_x = key_layer.view(qkv_shape).permute(0, 2, 1, 3)
+        value_layer_x = value_layer.view(qkv_shape).permute(0, 2, 1, 3)
+
+
+        # 2. 将 rel_att 从 [B*H, S, S] 变形成 [B, H, S, S]
         if rel_att is not None:
-            attention_scores = attention_scores + rel_att
+            rel_att = rel_att.view(batch_size, self.num_attention_heads, seq_len, seq_len)
+        
+        total_bias = rel_att if rel_att is not None else torch.zeros(
+            batch_size, self.num_attention_heads, seq_len, seq_len, device=hidden_states.device, dtype=hidden_states.dtype
+        )
 
         attention_scores = attention_scores
         attention_scores = attention_scores.view(
@@ -122,33 +137,27 @@ class BinDebertaDisentangleV2Attention(DisentangledSelfAttention):
             edge_bucket_values = (cfg_adj_matrix[edge_mask] * (self.num_cfg_buckets - 1)).round().long() + 1
             bucket_indices[edge_mask] = edge_bucket_values
             cfg_bias = self.cfg_bias_embedding(bucket_indices).squeeze(-1).unsqueeze(1)
-            attention_scores = attention_scores + cfg_bias
+            total_bias += cfg_bias
 
         if ddg_adj_matrix is not None:
             ddg_bias = self.ddg_bias_embedding(ddg_adj_matrix.long()).squeeze(-1).unsqueeze(1)
-            attention_scores = attention_scores + ddg_bias
+            total_bias += ddg_bias
 
- 
+        if attention_mask is not None:
+            total_bias = total_bias.masked_fill(
+                attention_mask == 0, # [B,1,1,S] -> [B,1,S,S]
+                torch.finfo(total_bias.dtype).min
+            )
 
-        attention_mask = attention_mask.bool()
-        attention_scores = attention_scores.masked_fill(~(attention_mask), torch.finfo(query_layer.dtype).min)
-        # bsz x height x length x dimension
-        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
-
-        attention_probs = self.dropout(attention_probs)
-        context_layer = torch.bmm(
-            attention_probs.view(-1, attention_probs.size(-2), attention_probs.size(-1)), value_layer
+        context_layer_x = xops.memory_efficient_attention(
+            query_layer_x, # [B, S, H, D]
+            key_layer_x,   # [B, S, H, D]
+            value_layer_x,   # [B, S, H, D]
+            attn_bias=total_bias, # [B, H, S, S]
+            p=self.dropout.p if self.training else 0.0,
         )
-        context_layer = (
-            context_layer.view(-1, self.num_attention_heads, context_layer.size(-2), context_layer.size(-1))
-            .permute(0, 2, 1, 3)
-            .contiguous()
-        )
-        new_context_layer_shape = context_layer.size()[:-2] + (-1,)
-        context_layer = context_layer.view(new_context_layer_shape)
-        if not output_attentions:
-            return (context_layer, None)
-        return (context_layer, attention_probs)
+        context_layer = context_layer_x.view(batch_size, seq_len, -1)
+        return (context_layer, None) if not output_attentions else (context_layer, None)
     
 
 class BinDebertaV2Attention(DebertaV2Attention):
@@ -486,7 +495,7 @@ if __name__ == "__main__":
                         if device == 'cuda':
                             torch.cuda.synchronize()
                         
-                        iter_start = time.time()
+
                         _ = model(
                             input_ids=input_ids,
                             ddg_adj_list=ddg_adj_list,

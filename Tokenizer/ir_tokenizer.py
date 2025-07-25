@@ -124,7 +124,7 @@ bb1:
 
 if __name__ == "__main__":
     # Example usage
-    tokenizer_path = "/home/damaoooo/Downloads/regraphv2/DataProcess/output_tokenizer/llvm_ir_bpe.json"  # Replace with your actual path
+    tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"  # Replace with your actual path
     tokenizer = load_tokenizer(tokenizer_path)
     
     # Validate special tokens
@@ -132,3 +132,5 @@ if __name__ == "__main__":
     
     # Test tokenization
     test_tokenization(tokenizer)
+    
+    print(len(tokenizer.get_vocab()))
