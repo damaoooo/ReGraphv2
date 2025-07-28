@@ -7,16 +7,26 @@ import torch
 import random
 
 from typing import List, Dict, Any, Optional
+from .pretrain_config import PretrainConfig, DEFAULT_CONFIG
 
 @dataclass
 class MyFinalDataCollator: # 这里我们简化，不再继承，因为它逻辑很不一样了
     tokenizer: PreTrainedTokenizerFast
     dataset_pool: datasets.Dataset
     map_file: Dict[int, List[int]]
-    mlm: bool = True
-    mlm_probability: float = 0.15
-    # 为 ddg_graph 的边定义列表定义一个填充值
-    edge_pad_value: int = -1
+    config: PretrainConfig = DEFAULT_CONFIG
+    mlm: bool = None  # 将从config中获取
+    mlm_probability: float = None  # 将从config中获取
+    edge_pad_value: int = None  # 将从config中获取
+    
+    def __post_init__(self):
+        """初始化后设置默认值"""
+        if self.mlm is None:
+            self.mlm = self.config.mlm
+        if self.mlm_probability is None:
+            self.mlm_probability = self.config.mlm_probability
+        if self.edge_pad_value is None:
+            self.edge_pad_value = self.config.edge_pad_value
 
     def __call__(self, examples: Dict[str, List]) -> Dict[str, Any]:
         # --- 分离自定义列 ---
@@ -42,12 +52,22 @@ class MyFinalDataCollator: # 这里我们简化，不再继承，因为它逻辑
         assert len(total_indices) == len(anchor_indices) * 3, "Total indices should be three times the number of anchors"
         
         batch_cache = self.dataset_pool.select(total_indices)
-        mlm_collator = DataCollatorForLanguageModeling(tokenizer=self.tokenizer, mlm=self.mlm, mlm_probability=self.mlm_probability, pad_to_multiple_of=8)
+        mlm_collator = DataCollatorForLanguageModeling(
+            tokenizer=self.tokenizer, 
+            mlm=self.mlm, 
+            mlm_probability=self.mlm_probability, 
+            pad_to_multiple_of=self.config.pad_to_multiple_of
+        )
         batch = mlm_collator(batch_cache['input_ids'])
         
         # Shape: [batch_size, max_seq_length]
         max_seq_length = batch['input_ids'].shape[1]
-        pad_collator = DataCollatorWithPadding(tokenizer=self.tokenizer, padding='max_length', max_length=max_seq_length, pad_to_multiple_of=8)
+        pad_collator = DataCollatorWithPadding(
+            tokenizer=self.tokenizer, 
+            padding='max_length', 
+            max_length=max_seq_length, 
+            pad_to_multiple_of=self.config.pad_to_multiple_of
+        )
         new_batch_cache = pad_collator({'input_ids': batch_cache['input_ids']})
 
         batch['contract_input_ids'] = new_batch_cache['input_ids']

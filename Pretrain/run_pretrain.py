@@ -7,28 +7,33 @@ from .pretrain_model import BinDebertaV2ModelForPretrain
 import pickle
 from torch.utils.data import DataLoader
 from Tokenizer.ir_tokenizer import load_tokenizer
-from Model.model_backbone import BinDebertaV2Model, create_deberta_v3_config
+from Model.model_backbone import BinDebertaV2Model, create_deberta_v3_config_from_pretrain_config
+from .pretrain_config import PretrainConfig, DEFAULT_CONFIG
 
 
-def debug_cpu():
+def debug_cpu(config: PretrainConfig = DEFAULT_CONFIG):
     print("--- Running in debug mode ---")
     
-    tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
-    tokenizer = load_tokenizer(tokenizer_path)
+    tokenizer = load_tokenizer(config.tokenizer_path)
     
-    train_dataset_pool_path = "/home/damaoooo/Downloads/regraphv2/IR/train_dataset_pool"
-    train_dataset_pool = load_dataset(train_dataset_pool_path)
+    train_dataset_pool = load_dataset(config.train_dataset_pool_path)
     
-    train_dataset_idx_path = '/home/damaoooo/Downloads/regraphv2/IR/train_task_dataset'
-    train_dataset_idx = load_dataset(train_dataset_idx_path)
+    train_dataset_idx = load_dataset(config.train_dataset_idx_path)
     
-    train_dataset_map_path = '/home/damaoooo/Downloads/regraphv2/IR/train_positive_map.pkl'
-    with open(train_dataset_map_path, 'rb') as f:
+    with open(config.train_dataset_map_path, 'rb') as f:
         train_positive_map = pickle.load(f)
     
-    my_collator = MyFinalDataCollator(tokenizer=tokenizer, dataset_pool=train_dataset_pool, map_file=train_positive_map)
+    my_collator = MyFinalDataCollator(
+        tokenizer=tokenizer, 
+        dataset_pool=train_dataset_pool, 
+        map_file=train_positive_map,
+        config=config
+    )
     
-    model_config = create_deberta_v3_config(vocab_size=len(tokenizer.get_vocab()))
+    model_config = create_deberta_v3_config_from_pretrain_config(
+        vocab_size=len(tokenizer.get_vocab()),
+        pretrain_config=config
+    )
     model = BinDebertaV2ModelForPretrain(config=model_config)
     
     # 将模型设置为评估模式，这会关闭 dropout 等只在训练时使用的层
@@ -97,7 +102,7 @@ def debug_cpu():
     print("\n--- Debug mode finished ---")
 
 
-def debug_gpu():
+def debug_gpu(config: PretrainConfig = DEFAULT_CONFIG):
     print("--- Running in debug mode (GPU) ---")
     
     import torch
@@ -112,22 +117,26 @@ def debug_gpu():
     print(f"GPU device name: {torch.cuda.get_device_name(0)}")
     print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
     
-    tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
-    tokenizer = load_tokenizer(tokenizer_path)
+    tokenizer = load_tokenizer(config.tokenizer_path)
     
-    train_dataset_pool_path = "/home/damaoooo/Downloads/regraphv2/IR/train_dataset_pool"
-    train_dataset_pool = load_dataset(train_dataset_pool_path)
+    train_dataset_pool = load_dataset(config.train_dataset_pool_path)
     
-    train_dataset_idx_path = '/home/damaoooo/Downloads/regraphv2/IR/train_task_dataset'
-    train_dataset_idx = load_dataset(train_dataset_idx_path)
+    train_dataset_idx = load_dataset(config.train_dataset_idx_path)
     
-    train_dataset_map_path = '/home/damaoooo/Downloads/regraphv2/IR/train_positive_map.pkl'
-    with open(train_dataset_map_path, 'rb') as f:
+    with open(config.train_dataset_map_path, 'rb') as f:
         train_positive_map = pickle.load(f)
     
-    my_collator = MyFinalDataCollator(tokenizer=tokenizer, dataset_pool=train_dataset_pool, map_file=train_positive_map)
+    my_collator = MyFinalDataCollator(
+        tokenizer=tokenizer, 
+        dataset_pool=train_dataset_pool, 
+        map_file=train_positive_map,
+        config=config
+    )
     
-    model_config = create_deberta_v3_config(vocab_size=len(tokenizer.get_vocab()))
+    model_config = create_deberta_v3_config_from_pretrain_config(
+        vocab_size=len(tokenizer.get_vocab()),
+        pretrain_config=config
+    )
     model = BinDebertaV2ModelForPretrain(config=model_config)
     
     # 将模型移动到GPU并启用bf16
@@ -233,19 +242,15 @@ def debug_gpu():
     print("\n--- GPU Debug mode finished ---")
 
 
-def main():
+def main(config: PretrainConfig = DEFAULT_CONFIG):
     
-    tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
-    tokenizer = load_tokenizer(tokenizer_path)
+    tokenizer = load_tokenizer(config.tokenizer_path)
     
-    train_dataset_pool_path = "/home/damaoooo/Downloads/regraphv2/IR/train_dataset_pool"
-    train_dataset_pool = load_dataset(train_dataset_pool_path)
+    train_dataset_pool = load_dataset(config.train_dataset_pool_path)
     
-    train_dataset_idx_path = '/home/damaoooo/Downloads/regraphv2/IR/train_task_dataset'
-    train_dataset_idx = load_dataset(train_dataset_idx_path)
+    train_dataset_idx = load_dataset(config.train_dataset_idx_path)
     
-    train_dataset_map_path = '/home/damaoooo/Downloads/regraphv2/IR/train_positive_map.pkl'
-    with open(train_dataset_map_path, 'rb') as f:
+    with open(config.train_dataset_map_path, 'rb') as f:
         train_positive_map = pickle.load(f)
     
 
@@ -254,34 +259,40 @@ def main():
     #     "cfg_graph": "cfg_adj_list",
     #     "ddg_graph": "ddg_adj_list",
     # })
-    my_collator = MyFinalDataCollator(tokenizer=tokenizer, dataset_pool=train_dataset_pool, map_file=train_positive_map)
+    my_collator = MyFinalDataCollator(
+        tokenizer=tokenizer, 
+        dataset_pool=train_dataset_pool, 
+        map_file=train_positive_map,
+        config=config
+    )
 
-    model_config = create_deberta_v3_config(vocab_size=len(tokenizer.get_vocab()))
+    model_config = create_deberta_v3_config_from_pretrain_config(
+        vocab_size=len(tokenizer.get_vocab()),
+        pretrain_config=config
+    )
     model = BinDebertaV2ModelForPretrain(config=model_config)
     
     train_args = TrainingArguments(
-        output_dir="./output",
-        num_train_epochs=3,
-        per_device_train_batch_size=1,
-        fp16=False, # 关闭fp16
-        bf16=True,  # 开启bf16
-        remove_unused_columns=False,
-        # dataloader_num_workers=max(4, os.cpu_count() // 2),  # Use half of the available CPU cores
-        dataloader_num_workers=max(4, os.cpu_count() // 2),
-        torch_compile=False,
-        gradient_checkpointing=True,
-        logging_dir="./logs",
-        learning_rate=5e-5,
-        warmup_steps=1000,
-        weight_decay=0.01,
-        optim="paged_adamw_8bit",
-        save_strategy="steps",
-        save_steps=500000,
-        save_total_limit=3,
-        # === 5. 日志与评估设置 (Logging & Evaluation) ===
-        logging_strategy="steps",            # 按步数记录日志。
-        logging_steps=100,                   # 每隔100步在控制台打印一次训练损失等信息。
-        report_to="tensorboard",             # 将日志报告给TensorBoard。你也可以设置为 "wandb" 或 "comet_ml" 等。
+        output_dir=config.output_dir,
+        max_steps=config.max_steps,  # 使用 max_steps 而不是 num_train_epochs
+        per_device_train_batch_size=config.per_device_train_batch_size,
+        fp16=config.fp16,
+        bf16=config.bf16,
+        remove_unused_columns=config.remove_unused_columns,
+        dataloader_num_workers=config.dataloader_num_workers,
+        torch_compile=config.torch_compile,
+        gradient_checkpointing=config.gradient_checkpointing,
+        logging_dir=config.logging_dir,
+        learning_rate=config.learning_rate,
+        warmup_steps=config.warmup_steps,
+        weight_decay=config.weight_decay,
+        optim=config.optim,
+        save_strategy=config.save_strategy,
+        save_steps=config.save_steps,
+        save_total_limit=config.save_total_limit,
+        logging_strategy=config.logging_strategy,
+        logging_steps=config.logging_steps,
+        report_to=config.report_to,
     )
     model.gradient_checkpointing_enable()
     trainer = Trainer(
@@ -316,8 +327,8 @@ def main():
 
     # 保存最终的模型、分词器和配置
     # 这会创建一个干净的、可以被 from_pretrained 加载的最终模型文件夹
-    trainer.save_model("./final_model")
-    tokenizer.save_pretrained("./final_model")
+    trainer.save_model(config.final_model_dir)
+    tokenizer.save_pretrained(config.final_model_dir)
 
     # 记录训练过程中的一些指标
     metrics = train_result.metrics

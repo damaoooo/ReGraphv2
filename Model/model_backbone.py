@@ -36,13 +36,25 @@ import xformers.ops as xops
 def scaled_size_sqrt(query_layer: torch.Tensor, scale_factor: int):
     return torch.sqrt(torch.tensor(query_layer.size(-1), dtype=torch.float) * scale_factor)
 
-def create_deberta_v3_config(vocab_size: int, max_seq_len: int = 4096) -> DebertaV2Config:
+def create_deberta_v3_config(vocab_size: int, max_seq_len: int = 4096, 
+                             hidden_size: int = 768, num_hidden_layers: int = 12,
+                             num_attention_heads: int = 12, intermediate_size: int = 3072,
+                             relative_attention: bool = True, pos_att_type: str = "p2c|c2p",
+                             torch_dtype: str = "bfloat16", use_flash_attn: bool = True) -> DebertaV2Config:
     """
     Create a new DeBERTa V3 model config with the given vocab size and max sequence length.
     
     Args:
         vocab_size (int): Vocabulary size, must match the tokenizer.
         max_seq_len (int): Maximum sequence length supported by the model.
+        hidden_size (int): Hidden size of the model.
+        num_hidden_layers (int): Number of hidden layers.
+        num_attention_heads (int): Number of attention heads.
+        intermediate_size (int): Intermediate size in feed-forward layers.
+        relative_attention (bool): Whether to use relative attention.
+        pos_att_type (str): Position attention type.
+        torch_dtype (str): Torch data type.
+        use_flash_attn (bool): Whether to use Flash Attention.
 
     Returns:
         DebertaV2Config: Configuration object for DeBERTa V3.
@@ -53,16 +65,41 @@ def create_deberta_v3_config(vocab_size: int, max_seq_len: int = 4096) -> Debert
     config = DebertaV2Config(
         vocab_size=vocab_size,
         max_position_embeddings=max_seq_len,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        intermediate_size=3072,
-        relative_attention=True,
-        pos_att_type="p2c|c2p",  # Standard for DeBERTa V2/V3
-        torch_dtype="bfloat16",  # Recommended for training with Flash Attention
-        use_flash_attn=True,  # Enable Flash Attention if supported
+        hidden_size=hidden_size,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=num_attention_heads,
+        intermediate_size=intermediate_size,
+        relative_attention=relative_attention,
+        pos_att_type=pos_att_type,
+        torch_dtype=torch_dtype,
+        use_flash_attn=use_flash_attn,
     )
     return config
+
+
+def create_deberta_v3_config_from_pretrain_config(vocab_size: int, pretrain_config) -> DebertaV2Config:
+    """
+    从PretrainConfig创建DeBERTa V3模型配置
+    
+    Args:
+        vocab_size (int): 词汇表大小，必须与tokenizer匹配
+        pretrain_config: PretrainConfig实例
+        
+    Returns:
+        DebertaV2Config: DeBERTa V3的配置对象
+    """
+    return create_deberta_v3_config(
+        vocab_size=vocab_size,
+        max_seq_len=pretrain_config.max_seq_length,
+        hidden_size=pretrain_config.hidden_size,
+        num_hidden_layers=pretrain_config.num_hidden_layers,
+        num_attention_heads=pretrain_config.num_attention_heads,
+        intermediate_size=pretrain_config.intermediate_size,
+        relative_attention=pretrain_config.relative_attention,
+        pos_att_type=pretrain_config.pos_att_type,
+        torch_dtype=pretrain_config.torch_dtype,
+        use_flash_attn=pretrain_config.use_flash_attn,
+    )
 
 
 def get_model(vocab_size: int, max_seq_len: int = 4096) -> DebertaV2ForMaskedLM:
