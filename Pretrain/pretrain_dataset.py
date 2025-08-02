@@ -2,7 +2,7 @@ import datasets
 from transformers import PreTrainedTokenizerFast
 from Tokenizer.ir_tokenizer import load_tokenizer
 from transformers import DataCollatorForLanguageModeling, DataCollatorWithPadding
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import torch
 import random
 
@@ -14,7 +14,7 @@ class MyFinalDataCollator: # 这里我们简化，不再继承，因为它逻辑
     tokenizer: PreTrainedTokenizerFast
     dataset_pool: datasets.Dataset
     map_file: Dict[int, List[int]]
-    config: PretrainConfig = DEFAULT_CONFIG
+    config: PretrainConfig = field(default_factory=lambda: PretrainConfig())
     mlm: bool = None  # 将从config中获取
     mlm_probability: float = None  # 将从config中获取
     edge_pad_value: int = None  # 将从config中获取
@@ -52,23 +52,32 @@ class MyFinalDataCollator: # 这里我们简化，不再继承，因为它逻辑
         assert len(total_indices) == len(anchor_indices) * 3, "Total indices should be three times the number of anchors"
         
         batch_cache = self.dataset_pool.select(total_indices)
+        # Truncate the input_ids to max_seq_length
+        truncated_input_ids = []
+        for input_ids in batch_cache['input_ids']:
+            if len(input_ids) > self.config.max_seq_length:
+                truncated_input_ids.append(input_ids[:self.config.max_seq_length-1] + [self.tokenizer.eos_token_id])  # 保留 EOS token
+            else:
+                truncated_input_ids.append(input_ids)
+
         mlm_collator = DataCollatorForLanguageModeling(
             tokenizer=self.tokenizer, 
             mlm=self.mlm, 
             mlm_probability=self.mlm_probability, 
             pad_to_multiple_of=self.config.pad_to_multiple_of
         )
-        batch = mlm_collator(batch_cache['input_ids'])
+        batch = mlm_collator(truncated_input_ids)
         
         # Shape: [batch_size, max_seq_length]
-        max_seq_length = batch['input_ids'].shape[1]
+        max_seq_length = min(batch['input_ids'].shape[1], self.config.max_seq_length)
+
         pad_collator = DataCollatorWithPadding(
             tokenizer=self.tokenizer, 
             padding='max_length', 
             max_length=max_seq_length, 
             pad_to_multiple_of=self.config.pad_to_multiple_of
         )
-        new_batch_cache = pad_collator({'input_ids': batch_cache['input_ids']})
+        new_batch_cache = pad_collator({'input_ids': truncated_input_ids})
 
         batch['contract_input_ids'] = new_batch_cache['input_ids']
         batch['contract_attention_mask'] = new_batch_cache['attention_mask']

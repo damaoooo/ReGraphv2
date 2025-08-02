@@ -32,8 +32,8 @@ class PretrainConfig:
     
     # === 训练配置 ===
     num_train_epochs: int = 3  # 保留以防兼容性需要，但将被 max_steps 覆盖
-    max_steps: int = 10000  # 最大训练步数，设置后将忽略 num_train_epochs
-    per_device_train_batch_size: int = 1
+    max_steps: int = 20000  # 最大训练步数，设置后将忽略 num_train_epochs
+    per_device_train_batch_size: int = 2
     fp16: bool = False
     bf16: bool = True
     gradient_checkpointing: bool = True
