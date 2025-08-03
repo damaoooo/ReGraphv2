@@ -18,7 +18,7 @@ except ImportError:
         tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
     config = FallbackConfig()
 
-dataset_path = glob.glob("/home/damaoooo/Downloads/regraphv2/IR/binary_save2/*.parquet")
+dataset_path = glob.glob("/home/damaoooo/Downloads/regraphv2/IR/binary_save/*.parquet")
 dataset = datasets.Dataset.from_parquet(dataset_path, split='train')
 
 tokenizer = load_tokenizer(config.tokenizer_path)
