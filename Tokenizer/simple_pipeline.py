@@ -6,9 +6,9 @@ LLVM IR -> BPE Tokenizer Pipeline
 import os
 import typer
 import multiprocessing as mp
-from normalizer import LLVMIRNormalizer
-from corpus_builder import LLVMIRCorpusBuilder  
-from bpe_tokenizer import LLVMIRTokenizerTrainer
+from .normalizer import LLVMIRNormalizer
+from .corpus_builder import LLVMIRCorpusBuilder  
+from .bpe_tokenizer import LLVMIRTokenizerTrainer
 
 def main(
     input_dir: str = typer.Argument(..., help="Input directory with LLVM IR files"),
