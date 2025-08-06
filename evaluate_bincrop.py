@@ -180,10 +180,9 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, positive_map, pool_si
     使用GPU加速计算相似度。
     """
     recalls = {}
-    for pool_size in pool_sizes:
-        recalls[pool_size] = {}
-        for k in k_values:
-            recalls[pool_size][k] = [0, 0]  # 每次都创建新的列表
+
+    for k in k_values:
+        recalls[k] = [0, 0]  # 每次都创建新的列表
     
     anchors = all_embeddings[anchor_batch]
     max_pool_size = max(pool_sizes)
