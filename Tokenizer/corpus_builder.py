@@ -19,7 +19,7 @@ from datasets import load_dataset
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
 
-from normalizer import LLVMIRNormalizer
+from .normalizer import LLVMIRNormalizer
 
 
 def extract_optimization(filename: str) -> str:

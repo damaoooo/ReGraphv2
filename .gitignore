@@ -28,3 +28,4 @@ logs/
 
 temp.*
 *.tmp
+*log.txt
