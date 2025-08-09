@@ -74,7 +74,7 @@ def main(
     for root, dirs, files in os.walk(db_path):
         for file in files:
             # Skip IDA database files
-            if file.endswith((".i64", ".idb")):
+            if file.endswith((".i64", ".idb", ".id0", ".id1", ".id2",".til", ".nam", ".asm")):
                 continue
                 
             file_path = os.path.join(root, file)

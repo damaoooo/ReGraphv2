@@ -13,7 +13,7 @@ from .bpe_tokenizer import LLVMIRTokenizerTrainer
 def main(
     input_dir: str = typer.Argument(..., help="Input directory with LLVM IR files"),
     output_dir: str = typer.Argument("output", help="Output directory prefix"),
-    vocab_size: int = typer.Option(10000, help="Vocabulary size for BPE tokenizer"),
+    vocab_size: int = typer.Option(65535, help="Vocabulary size for BPE tokenizer"),
     num_processes: int = typer.Option(os.cpu_count(), help="Number of processes (default: CPU count)"),
     corpus_name: str = typer.Option("ir_corpus", help="Name for the corpus directory, defaults to 'ir_corpus' if not specified"),
     start_from: int = typer.Option(1, help="Start from step (1: corpus building, 2: tokenizer training)"),
