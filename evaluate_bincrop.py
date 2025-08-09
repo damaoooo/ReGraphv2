@@ -174,7 +174,7 @@ def generate_embeddings_with_model(dataset_path: Path, batch_size: int, tokenize
     return np.vstack(all_embeddings)
 
 
-def process_anchor_batch_gpu(all_embeddings, anchor_batch, positive_map, pool_sizes, k_values: List[int], use_gpu: bool = True) -> dict:
+def process_anchor_batch_gpu(all_embeddings, anchor_batch, k_values: List[int], use_gpu: bool = True) -> dict:
     """
     处理锚点批次，计算与所有嵌入向量的相似度，并返回Recall@K结果。
     使用GPU加速计算相似度。
@@ -184,34 +184,14 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, positive_map, pool_si
     for k in k_values:
         recalls[k] = [0, 0]  # 每次都创建新的列表
     
-    anchors = all_embeddings[anchor_batch]
-    max_pool_size = max(pool_sizes)
-    pool_size = max_pool_size - 1
-    pools = []
-    batch_size = len(anchor_batch)
-    
-    for i in range(batch_size):
-        anchor_idx = anchor_batch[i]
-        positive = positive_map[anchor_idx]
-        positive_anchor_idx = random.choice(positive)
-        
-        while True:
-            # Sample the random Pool
-            candidate_indices = np.random.choice(len(all_embeddings), size=pool_size, replace=False)
-            candidate_indices_set = set(candidate_indices)
-            if positive_anchor_idx in candidate_indices_set or anchor_idx in candidate_indices_set:
-                continue
-            else:
-                batch_pool = np.concatenate(([positive_anchor_idx], candidate_indices))
-                pools.append(batch_pool)
-                break
+    anchor_index = [anchor['anchor'] for anchor in anchor_batch]
+    pool_index = [[anchor['positive']] + anchor['negatives'] for anchor in anchor_batch]
 
-    pools = np.array(pools)
-    embedding_pools = all_embeddings[pools] # size: (batch_size, pool_size, embedding_dim)
-    anchor_emb = anchors[:, np.newaxis, :]  # size: (batch_size, 1, embedding_dim)
-    
 
-    anchor_emb_gpu = cp.asarray(anchor_emb)
+    anchor_emb = all_embeddings[anchor_index]
+    embedding_pools = all_embeddings[pool_index]
+
+    anchor_emb_gpu = cp.asarray(anchor_emb)[:, cp.newaxis, :]  # size: (batch_size, 1, embedding_dim)
     embedding_pools_gpu = cp.asarray(embedding_pools)
     similarities = cp.einsum('bij,bkj->bik', anchor_emb_gpu, embedding_pools_gpu)
     similarities = cp.squeeze(similarities, axis=1)  # size: (batch_size, pool_size)
@@ -219,15 +199,14 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, positive_map, pool_si
 
         
     # 计算Recall@K
-    for pool_size in pool_sizes:
-        top_indices = cp.argsort(cp.argsort(-similarities[:, :pool_size], axis=1), axis=1)[:, 0] + 1
-        for k in k_values:
-            success, total = 0, 0
-            success = (top_indices <= k).sum()
-            total = len(top_indices)
-            assert success <= total, f"Success count {success} cannot be greater than total {total}."
-            recalls[pool_size][k][0] += success
-            recalls[pool_size][k][1] += total
+    top_indices = cp.argsort(cp.argsort(-similarities, axis=1), axis=1)[:, 0] + 1
+    for k in k_values:
+        success, total = 0, 0
+        success = (top_indices <= k).sum()
+        total = len(top_indices)
+        assert success <= total, f"Success count {success} cannot be greater than total {total}."
+        recalls[k][0] += success
+        recalls[k][1] += total
 
     return recalls
 
@@ -307,15 +286,10 @@ def main(
         all_embeddings_gpu = None
 
 
-    # --- 4. 设置评估参数 ---
-    pool_sizes = [2**i for i in range(1, 14)] + [100, 10000]
-    # Sort it
-    pool_sizes = sorted(pool_sizes)
     k_values = sorted([int(k.strip()) for k in ks_str.split(',')])
-    max_k = max(k_values)
     results = {}
     
-    all_possible_anchors = list(positive_map.keys())
+    all_possible_anchors = list(positive_map)
     if eval_samples > 0 and eval_samples < len(all_possible_anchors):
         logging.info(f"将从 {len(all_possible_anchors):,} 个可能的锚点中随机采样 [yellow]{eval_samples:,}[/yellow] 个进行评估...")
         anchors_to_evaluate = random.sample(all_possible_anchors, eval_samples)
@@ -327,9 +301,7 @@ def main(
     # --- 5. 对不同的池大小进行评估 ---
     logging.info("开始对不同池大小进行批量GPU加速评估...")
     
-    temp_results = {}
-    for pool_size in pool_sizes:
-        temp_results[pool_size] = {k: [0, 0] for k in k_values}
+    temp_results = {k: [0, 0] for k in k_values}
     
     
     for i in track(range(0, len(anchors_to_evaluate), gpu_batch_size), description="正在评估..."):
@@ -337,33 +309,27 @@ def main(
         result = process_anchor_batch_gpu(
             all_embeddings_gpu if use_gpu else all_embeddings,
             anchor_batch,
-            positive_map,
-            pool_sizes,
             k_values,
             use_gpu=use_gpu
         )
         # 累加结果
-        for pool_size in pool_sizes:
-            for k in k_values:
-                temp_results[pool_size][k][0] += result[pool_size][k][0]
-                temp_results[pool_size][k][1] += result[pool_size][k][1]
+        for k in k_values:
+            temp_results[k][0] += result[k][0]
+            temp_results[k][1] += result[k][1]
                 
     # 将结果转换为百分比
     
-    for pool_size in pool_sizes:
-        results[pool_size] = {f"Recall@{k}": temp_results[pool_size][k][0] / temp_results[pool_size][k][1] if temp_results[pool_size][k][1] > 0 else 0 for k in k_values}
+
+    results = {f"Recall@{k}": temp_results[k][0] / temp_results[k][1] if temp_results[k][1] > 0 else 0 for k in k_values}
 
     # --- 6. 打印结果 ---
     console.rule("[bold green]评估结果[/bold green]")
-    table = Table(title="Recall@K 在不同大小的检索池中的表现")
-    table.add_column("Pool Size", justify="right", style="cyan")
+    table = Table(title="Recall@K 评估结果")
     for k in k_values:
         table.add_column(f"Recall@{k}", justify="right", style="magenta")
 
-    for pool_size, recalls in results.items():
-        row_data = [f"{pool_size:,}"] + [f"{recalls[f'Recall@{k}']:.4f}" for k in k_values]
-        table.add_row(*row_data)
-        
+    row_data = [f"{results[f'Recall@{k}']:.4f}" for k in k_values]
+    table.add_row(*row_data)
     console.print(table)
 
 
