@@ -29,3 +29,7 @@ logs/
 temp.*
 *.tmp
 *log.txt
+
+db1_model/
+*.pt
+test.py

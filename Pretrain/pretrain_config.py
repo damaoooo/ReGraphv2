@@ -12,12 +12,12 @@ class PretrainConfig:
     max_seq_length: int = 2048
     
     # === 路径配置 ===
-    tokenizer_path: str = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
-    train_dataset_pool_path: str = "/home/damaoooo/Downloads/regraphv2/IR/train_dataset_pool"
-    train_dataset_idx_path: str = "/home/damaoooo/Downloads/regraphv2/IR/train_task_dataset"
-    train_dataset_map_path: str = "/home/damaoooo/Downloads/regraphv2/IR/train_positive_map.pkl"
+    tokenizer_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json"
+    train_dataset_pool_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_dataset_pool"
+    train_dataset_idx_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_task_dataset"
+    train_dataset_map_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_positive_map.pkl"
     output_dir: str = "./output"
-    final_model_dir: str = "./final_model"
+    final_model_dir: str = "./db1_model"
     logging_dir: str = "./logs"
     
     # === 模型配置 ===
@@ -32,8 +32,8 @@ class PretrainConfig:
     
     # === 训练配置 ===
     num_train_epochs: int = 3  # 保留以防兼容性需要，但将被 max_steps 覆盖
-    max_steps: int = 20000  # 最大训练步数，设置后将忽略 num_train_epochs
-    per_device_train_batch_size: int = 2
+    max_steps: int = 300000  # 最大训练步数，设置后将忽略 num_train_epochs
+    per_device_train_batch_size: int = 3
     fp16: bool = False
     bf16: bool = True
     gradient_checkpointing: bool = True

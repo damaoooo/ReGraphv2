@@ -143,33 +143,57 @@ def generate_embeddings_with_model(dataset_path: Path, batch_size: int, tokenize
 
     all_embeddings = []
     
-    for batch in track(dataloader, description="正在通过本地模型生成嵌入向量..."):
-        # 将所有输入数据移动到CUDA
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        cfg_graphs = batch['cfg_graphs'].to(device)
-        ddg_graphs = batch['ddg_graphs'].to(device)
+    from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
+    import time
+    
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TaskProgressColumn(),
+        TextColumn("•"),
+        TextColumn("[cyan]{task.fields[speed]:.1f} 函数/秒"),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("正在生成嵌入向量...", total=len(dataloader.dataset), speed=0.0)
         
-        try:
-            with torch.no_grad():
-                # 使用模型生成嵌入
-                outputs = model.bindeberta(
-                    input_ids=input_ids, 
-                    attention_mask=attention_mask, 
-                    cfg_adj_list=cfg_graphs if len(cfg_graphs.shape) > 2 else None,
-                    ddg_adj_list=ddg_graphs if len(ddg_graphs.shape) > 2 else None,
-                ).last_hidden_state[:, 0, :]  # 取CLS token的输出
-                
-                # L2归一化
-                embeddings = F.normalize(outputs, p=2, dim=-1)
-                
-                # 转换为CPU numpy数组
-                batch_embeddings = embeddings.cpu().float().numpy()
-                all_embeddings.append(batch_embeddings)
-                
-        except Exception as e:
-            console.print(f"[bold red]错误: 模型推理失败: {e}[/bold red]")
-            raise typer.Exit(code=1)
+        start_time = time.time()
+        processed_count = 0
+        
+        for batch in dataloader:
+            # 将所有输入数据移动到CUDA
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            cfg_graphs = batch['cfg_graphs'].to(device)
+            ddg_graphs = batch['ddg_graphs'].to(device)
+            
+            try:
+                with torch.no_grad():
+                    # 使用模型生成嵌入
+                    outputs = model.bindeberta(
+                        input_ids=input_ids, 
+                        attention_mask=attention_mask, 
+                        cfg_adj_list=cfg_graphs if len(cfg_graphs.shape) > 2 else None,
+                        ddg_adj_list=ddg_graphs if len(ddg_graphs.shape) > 2 else None,
+                    ).last_hidden_state[:, 0, :]  # 取CLS token的输出
+                    
+                    # L2归一化
+                    embeddings = F.normalize(outputs, p=2, dim=-1)
+                    
+                    # 转换为CPU numpy数组
+                    batch_embeddings = embeddings.cpu().float().numpy()
+                    all_embeddings.append(batch_embeddings)
+                    
+                    # 更新进度条和速度统计
+                    processed_count += len(batch_embeddings)
+                    elapsed_time = time.time() - start_time
+                    speed = processed_count / elapsed_time if elapsed_time > 0 else 0
+                    progress.update(task, advance=len(batch_embeddings), speed=speed)
+                    
+            except Exception as e:
+                console.print(f"[bold red]错误: 模型推理失败: {e}[/bold red]")
+                raise typer.Exit(code=1)
 
     return np.vstack(all_embeddings)
 
