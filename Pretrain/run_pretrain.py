@@ -52,7 +52,7 @@ def debug_cpu(config: PretrainConfig = DEFAULT_CONFIG):
         config=config
     )
     
-    model_config = DEFAULT_CONFIG
+    model_config = PretrainConfig()
     model_config.vocab_size = len(tokenizer.get_vocab())
     model = MoCoPretrainModel(config=model_config)
     
@@ -162,7 +162,7 @@ def debug_gpu(config: PretrainConfig = DEFAULT_CONFIG):
         config=config
     )
     
-    model_config = DEFAULT_CONFIG
+    model_config = PretrainConfig()
     model_config.vocab_size = len(tokenizer.get_vocab())
     model = MoCoPretrainModel(config=model_config)
     
@@ -298,7 +298,7 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         config=config
     )
 
-    model_config = DEFAULT_CONFIG
+    model_config = PretrainConfig()
     model_config.vocab_size = len(tokenizer.get_vocab())
     model = MoCoPretrainModel(config=model_config)
     
@@ -319,6 +319,7 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         save_strategy=config.save_strategy,
         save_steps=config.save_steps,
         save_total_limit=config.save_total_limit,
+        save_safetensors=False,
         logging_strategy=config.logging_strategy,
         logging_steps=config.logging_steps,
         report_to=config.report_to,

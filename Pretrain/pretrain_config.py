@@ -11,7 +11,7 @@ class PretrainConfig(RoFormerConfig):
     def __init__(
         self,
         # === 序列长度配置 ===
-        max_seq_length: int = 2048,
+        max_seq_length: int = 4096,
         # === 路径配置 ===
         tokenizer_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json",
         train_dataset_pool_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_dataset_pool",

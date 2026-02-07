@@ -143,20 +143,32 @@ class MoCoPretrainModel(nn.Module):
     ):
         super().__init__()
         
+        # 对 config 进行深拷贝快照，防止后续修改影响模型
+        self.config = config
         self.moco_buffer_size = config.moco_buffer_size
         self.moco_momentum = config.moco_momentum
         self.moco_temperature = config.moco_temperature
-        self.config = config
 
         # 1. 初始化双塔
         # Encoder Q: 正常的梯度更新模型
         self.encoder_q = ReFormerPretrainModel(config)
-        # Encoder K: 动量更新模型 (完全独立的深拷贝，避免内存共享)
-        self.encoder_k = copy.deepcopy(self.encoder_q)
+        # Encoder K: 动量更新模型 (通过加载 Q 的状态字典来初始化)
+        self.encoder_k = ReFormerPretrainModel(config)
+        self.encoder_k.load_state_dict(self.encoder_q.state_dict())
 
         # 2. 设置 K 不进行梯度反传
         for param_k in self.encoder_k.parameters():
             param_k.requires_grad = False
+        
+        # 3. 验证 encoder_q 和 encoder_k 的参数大小是否匹配
+        for (name_q, param_q), (name_k, param_k) in zip(
+            self.encoder_q.named_parameters(), 
+            self.encoder_k.named_parameters()
+        ):
+            if param_q.shape != param_k.shape:
+                raise RuntimeError(
+                    f"Parameter size mismatch: {name_q} ({param_q.shape}) vs {name_k} ({param_k.shape})"
+                )
 
         # 3. 注册队列 (Queue)
         # shape: [Embedding_Dim, K]
