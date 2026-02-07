@@ -311,7 +311,6 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         remove_unused_columns=config.remove_unused_columns,
         dataloader_num_workers=config.dataloader_num_workers,
         torch_compile=config.torch_compile,
-        gradient_checkpointing=config.gradient_checkpointing,
         logging_dir=config.logging_dir,
         learning_rate=config.learning_rate,
         warmup_steps=config.warmup_steps,

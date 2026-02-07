@@ -26,7 +26,7 @@ class PretrainConfig(RoFormerConfig):
         # === 训练配置 ===
         num_train_epochs: int = 3,
         max_steps: int = 300000,
-        per_device_train_batch_size: int = 3,
+        per_device_train_batch_size: int = 4,
         fp16: bool = False,
         bf16: bool = True,
         gradient_checkpointing: bool = True,

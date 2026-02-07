@@ -6,6 +6,7 @@ from transformers import RoFormerForMaskedLM, GenerationMixin
 from .pretrain_config import PretrainConfig
 import torch.nn.functional as F
 import torch.distributed as dist
+import copy
 
 class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
     def __init__(self, config: PretrainConfig):
@@ -40,6 +41,11 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
     ) -> Union[Tuple, Dict[str, torch.Tensor]]:
         
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # 图张量不需要梯度，直接 detach
+        cfg_u = cfg_u.detach()
+        cfg_v = cfg_v.detach()
+        ddg_edges = ddg_edges.detach()
 
         # 1. Backbone Forward (融入 CFG/DDG)
         outputs = self.roformer(
@@ -145,13 +151,12 @@ class MoCoPretrainModel(nn.Module):
         # 1. 初始化双塔
         # Encoder Q: 正常的梯度更新模型
         self.encoder_q = ReFormerPretrainModel(config)
-        # Encoder K: 动量更新模型
-        self.encoder_k = ReFormerPretrainModel(config)
+        # Encoder K: 动量更新模型 (完全独立的深拷贝，避免内存共享)
+        self.encoder_k = copy.deepcopy(self.encoder_q)
 
-        # 2. 初始化 K 的参数 = Q 的参数
-        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k.data.copy_(param_q.data)  # 复制权重
-            param_k.requires_grad = False     # K 不进行梯度反传
+        # 2. 设置 K 不进行梯度反传
+        for param_k in self.encoder_k.parameters():
+            param_k.requires_grad = False
 
         # 3. 注册队列 (Queue)
         # shape: [Embedding_Dim, K]
@@ -212,17 +217,15 @@ class MoCoPretrainModel(nn.Module):
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """
         启用 Gradient Checkpointing 以节省显存
+        只在 encoder_q 上启用，因为 encoder_k 不需要梯度反传
         """
         self.encoder_q.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
-        # encoder_k 通常不需要梯度，但为了保持一致性也启用
-        self.encoder_k.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
     
     def gradient_checkpointing_disable(self):
         """
         禁用 Gradient Checkpointing
         """
         self.encoder_q.gradient_checkpointing_disable()
-        self.encoder_k.gradient_checkpointing_disable()
 
     def forward(self, view1: Dict, view2: Dict):
         """
