@@ -3,8 +3,9 @@ from transformers import PreTrainedTokenizerFast, DataCollatorForLanguageModelin
 from transformers import Trainer, TrainingArguments
 from transformers import BertForMaskedLM
 import os
-from .pretrain_model import BinDebertaV2ModelForPretrain
+from .pretrain_model import MoCoPretrainModel
 import pickle
+import torch
 from torch.utils.data import DataLoader
 from Tokenizer.ir_tokenizer import load_tokenizer
 from Model.model_backbone import GraphRoFormerModel
@@ -42,6 +43,7 @@ def debug_cpu(config: PretrainConfig = DEFAULT_CONFIG):
         train_positive_map = pickle.load(f)
     
     train_positive_map_group_ids = compute_group_ids(train_positive_map)
+    
     my_collator = MoCoDataCollator(
         tokenizer=tokenizer, 
         dataset_pool=train_dataset_pool, 
@@ -52,7 +54,7 @@ def debug_cpu(config: PretrainConfig = DEFAULT_CONFIG):
     
     model_config = DEFAULT_CONFIG
     model_config.vocab_size = len(tokenizer.get_vocab())
-    model = BinDebertaV2ModelForPretrain(config=model_config)
+    model = MoCoPretrainModel(config=model_config)
     
     # 将模型设置为评估模式，这会关闭 dropout 等只在训练时使用的层
     model.train()
@@ -80,15 +82,21 @@ def debug_cpu(config: PretrainConfig = DEFAULT_CONFIG):
         one_batch = next(iter(debug_dataloader))
         print("Successfully created one batch.")
     except Exception as e:
+        import traceback
+        traceback.print_exc() # 打印详细的错误堆栈
         print(f"Error creating batch: {e}")
         # 如果数据整理器(collator)有错，这里通常会抛出异常
         return
 
     # 3. 检查批次数据的结构和形状 (非常重要的调试步骤)
     print("\n--- Batch Content (Keys and Shapes) ---")
-    for key, value in one_batch.items():
-        # one_batch 的 value 应该是 tensor
-        print(f"Key: '{key}', Shape: {value.shape}, Dtype: {value.dtype}")
+    for view_name, view_data in one_batch.items():
+        print(f"\n{view_name}:")
+        for key, value in view_data.items():
+            if torch.is_tensor(value):
+                print(f"  Key: '{key}', Shape: {value.shape}, Dtype: {value.dtype}")
+            else:
+                print(f"  Key: '{key}', Type: {type(value)}")
         
     # 4. 在 CPU 上运行模型的前向传播
     #    模型默认是在CPU上初始化的，所以不需要 .to('cpu')
@@ -143,17 +151,20 @@ def debug_gpu(config: PretrainConfig = DEFAULT_CONFIG):
     
     with open(config.train_dataset_map_path, 'rb') as f:
         train_positive_map = pickle.load(f)
+        
+    group_id_mapping = compute_group_ids(train_positive_map)
     
     my_collator = MoCoDataCollator(
         tokenizer=tokenizer, 
         dataset_pool=train_dataset_pool, 
         map_file=train_positive_map,
+        group_id_mapping=group_id_mapping,
         config=config
     )
     
     model_config = DEFAULT_CONFIG
     model_config.vocab_size = len(tokenizer.get_vocab())
-    model = BinDebertaV2ModelForPretrain(config=model_config)
+    model = MoCoPretrainModel(config=model_config)
     
     # 将模型移动到GPU并启用bf16
     model = model.to(device)
@@ -189,11 +200,13 @@ def debug_gpu(config: PretrainConfig = DEFAULT_CONFIG):
     print("\n--- Moving batch to GPU ---")
     try:
         one_batch_gpu = {}
-        for key, value in one_batch.items():
-            if torch.is_tensor(value):
-                one_batch_gpu[key] = value.to(device)
-            else:
-                one_batch_gpu[key] = value
+        for view_name, view_data in one_batch.items():
+            one_batch_gpu[view_name] = {}
+            for key, value in view_data.items():
+                if torch.is_tensor(value):
+                    one_batch_gpu[view_name][key] = value.to(device)
+                else:
+                    one_batch_gpu[view_name][key] = value
         print("Batch successfully moved to GPU")
     except Exception as e:
         print(f"Error moving batch to GPU: {e}")
@@ -201,11 +214,13 @@ def debug_gpu(config: PretrainConfig = DEFAULT_CONFIG):
 
     # 检查批次数据的结构和形状
     print("\n--- Batch Content (Keys and Shapes) ---")
-    for key, value in one_batch_gpu.items():
-        if torch.is_tensor(value):
-            print(f"Key: '{key}', Shape: {value.shape}, Dtype: {value.dtype}, Device: {value.device}")
-        else:
-            print(f"Key: '{key}', Type: {type(value)}")
+    for view_name, view_data in one_batch_gpu.items():
+        print(f"\n{view_name}:")
+        for key, value in view_data.items():
+            if torch.is_tensor(value):
+                print(f"  Key: '{key}', Shape: {value.shape}, Dtype: {value.dtype}, Device: {value.device}")
+            else:
+                print(f"  Key: '{key}', Type: {type(value)}")
         
     # 在 GPU 上运行模型的前向传播 (使用bf16)
     print("\n--- Running Model Forward Pass on GPU with BF16 ---")
@@ -269,7 +284,7 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
     with open(config.train_dataset_map_path, 'rb') as f:
         train_positive_map = pickle.load(f)
     
-
+    group_id_mapping = compute_group_ids(train_positive_map)
     
     # dataset = dataset.remove_columns({
     #     "cfg_graph": "cfg_adj_list",
@@ -279,12 +294,13 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         tokenizer=tokenizer, 
         dataset_pool=train_dataset_pool, 
         map_file=train_positive_map,
+        group_id_mapping=group_id_mapping,
         config=config
     )
 
     model_config = DEFAULT_CONFIG
     model_config.vocab_size = len(tokenizer.get_vocab())
-    model = BinDebertaV2ModelForPretrain(config=model_config)
+    model = MoCoPretrainModel(config=model_config)
     
     train_args = TrainingArguments(
         output_dir=config.output_dir,

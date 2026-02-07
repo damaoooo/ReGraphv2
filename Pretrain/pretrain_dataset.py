@@ -255,6 +255,14 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
             ddg_tensor = torch.tensor(padded_ddg, dtype=torch.long)
             
             # 2. CFG 处理 (Padding -> SVD)
+            if len(cfg_list) == 0 or len(cfg_list[0]) == 0:
+                # 处理极端情况：如果没有任何边，直接返回全零的 U 和 V
+                batch_size = len(cfg_list)
+                current_max_len = seq_len_tensor.shape[1]
+                u_empty = torch.zeros((batch_size, current_max_len, self.config.svd_rank), dtype=torch.float32)
+                v_empty = torch.zeros((batch_size, current_max_len, self.config.svd_rank), dtype=torch.float32)
+                return ddg_tensor, u_empty, v_empty
+            
             padded_cfg = self.pad_graph(cfg_list, feature_length=5)
             
             # 这里的 seq_len 取决于当前 batch text padding 后的实际长度

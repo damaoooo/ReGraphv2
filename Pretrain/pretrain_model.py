@@ -34,7 +34,7 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
         cfg_u: torch.FloatTensor,
         cfg_v: torch.FloatTensor,
         ddg_edges: torch.LongTensor,
-        labels: torch.LongTensor,
+        labels: Optional[torch.LongTensor] = None,
         return_dict: Optional[bool] = None,
         **kwargs
     ) -> Union[Tuple, Dict[str, torch.Tensor]]:
@@ -209,6 +209,21 @@ class MoCoPretrainModel(nn.Module):
         ptr = (ptr + batch_size) % self.moco_buffer_size
         self.queue_ptr[0] = ptr
 
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """
+        启用 Gradient Checkpointing 以节省显存
+        """
+        self.encoder_q.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+        # encoder_k 通常不需要梯度，但为了保持一致性也启用
+        self.encoder_k.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+    
+    def gradient_checkpointing_disable(self):
+        """
+        禁用 Gradient Checkpointing
+        """
+        self.encoder_q.gradient_checkpointing_disable()
+        self.encoder_k.gradient_checkpointing_disable()
+
     def forward(self, view1: Dict, view2: Dict):
         """
         view1: Query Input Dict (含 input_ids, mask, cfg, ddg, group_ids)
@@ -280,10 +295,11 @@ class MoCoPretrainModel(nn.Module):
 
         return {
             "loss": total_loss,
-            "mlm_loss": mlm_loss,
-            "contrastive_loss": contrastive_loss,
-            "logits": logits # 可选返回
+            "mlm_loss": mlm_loss.item() if mlm_loss is not None else None,
+            "contrastive_loss": contrastive_loss.item() if contrastive_loss is not None else None,
         }
+        
+        
 if __name__ == '__main__':
     print("\n" + "="*50)
     print("🚀 开始测试 MoCoPretrainModel (Dual-Encoder + Queue)")
@@ -376,19 +392,10 @@ if __name__ == '__main__':
     loss = outputs['loss']
     mlm_loss = outputs['mlm_loss']
     ctr_loss = outputs['contrastive_loss']
-    logits = outputs['logits']
 
     print(f"   -> Total Loss: {loss.item():.4f}")
     print(f"   -> MLM Loss:   {mlm_loss.item():.4f}")
     print(f"   -> MoCo Loss:  {ctr_loss.item():.4f}")
-    
-    # 验证 Logits 形状: [Batch, 1 + K]
-    # 1 是正样本，K 是负样本队列
-    expected_shape = (BATCH_SIZE, 1 + config.moco_buffer_size)
-    if logits.shape == expected_shape:
-        print(f"✅ Logits 形状正确: {logits.shape}")
-    else:
-        print(f"❌ Logits 形状错误: {logits.shape}, 预期: {expected_shape}")
 
     # 7. 验证队列更新机制
     print(f"\n[Step 5] 验证队列更新机制...")
