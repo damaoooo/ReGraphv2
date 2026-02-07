@@ -52,7 +52,7 @@ def debug_cpu(config: PretrainConfig = DEFAULT_CONFIG):
         config=config
     )
     
-    model_config = PretrainConfig()
+    model_config = PretrainConfig(max_seq_length=seq_len)
     model_config.vocab_size = len(tokenizer.get_vocab())
     model = MoCoPretrainModel(config=model_config)
     
@@ -270,7 +270,115 @@ def debug_gpu(config: PretrainConfig = DEFAULT_CONFIG):
         torch.cuda.empty_cache()
         print("GPU cache cleared")
 
-    print("\n--- GPU Debug mode finished ---")
+
+def profile_extreme_seq_len_memory(
+    config: PretrainConfig = DEFAULT_CONFIG,
+    batch_sizes: List[int] = None,
+    seq_len: int = None,
+    ddg_edges_per_sample: int = 64,
+    run_backward: bool = True,
+):
+    print("--- Profiling GPU memory at max seq len ---")
+
+    import torch
+
+    if not torch.cuda.is_available():
+        print("CUDA is not available. Cannot profile GPU memory.")
+        return
+
+    device = torch.device("cuda")
+    print(f"Using device: {device}")
+    print(f"GPU device name: {torch.cuda.get_device_name(0)}")
+    print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+
+    if batch_sizes is None:
+        batch_sizes = [1, 2, 4, 8, 16]
+    if seq_len is None:
+        seq_len = config.max_seq_length
+
+    tokenizer = load_tokenizer(config.tokenizer_path)
+
+    model_config = PretrainConfig()
+    model_config.vocab_size = len(tokenizer.get_vocab())
+    model = MoCoPretrainModel(config=model_config)
+    model = model.to(device)
+    if config.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    model.train()
+
+    if config.bf16:
+        autocast_dtype = torch.bfloat16
+    elif config.fp16:
+        autocast_dtype = torch.float16
+    else:
+        autocast_dtype = None
+
+    def build_dummy_view(batch_size: int, use_labels: bool) -> Dict[str, Any]:
+        vocab_size = model_config.vocab_size
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+        attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.long)
+        labels = None
+        if use_labels:
+            labels = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+
+        cfg_u = torch.randn(batch_size, seq_len, model_config.svd_rank, device=device)
+        cfg_v = torch.randn(batch_size, seq_len, model_config.svd_rank, device=device)
+
+        max_edges = min(ddg_edges_per_sample, seq_len)
+        ddg_edges = torch.full((batch_size, max_edges, 4), -1, device=device, dtype=torch.long)
+        if max_edges > 0:
+            src = torch.arange(max_edges, device=device)
+            dst = (src + 1) % seq_len
+            # Use valid in-range indices and pad the rest with -1
+            ddg_edges[:, :, 0] = src
+            ddg_edges[:, :, 1] = src
+            ddg_edges[:, :, 2] = dst
+            ddg_edges[:, :, 3] = dst
+
+        group_ids = torch.arange(batch_size, device=device, dtype=torch.long)
+
+        view = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "cfg_u": cfg_u,
+            "cfg_v": cfg_v,
+            "ddg_edges": ddg_edges,
+            "group_ids": group_ids,
+        }
+        if labels is not None:
+            view["labels"] = labels
+        return view
+
+    for batch_size in batch_sizes:
+        print(f"\n[Batch Size = {batch_size}] seq_len={seq_len}")
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        try:
+            view1 = build_dummy_view(batch_size, use_labels=True)
+            view2 = build_dummy_view(batch_size, use_labels=False)
+
+            if autocast_dtype is not None:
+                with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+                    outputs = model(view1, view2)
+            else:
+                outputs = model(view1, view2)
+
+            if run_backward:
+                outputs["loss"].backward()
+
+            max_allocated = torch.cuda.max_memory_allocated() / 1024**2
+            max_reserved = torch.cuda.max_memory_reserved() / 1024**2
+            print(f"Peak allocated: {max_allocated:.2f} MB")
+            print(f"Peak reserved:  {max_reserved:.2f} MB")
+
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                print("OOM at this batch size.")
+            else:
+                print(f"Runtime error: {e}")
+            torch.cuda.empty_cache()
+
 
 
 def main(config: PretrainConfig = DEFAULT_CONFIG):
@@ -376,12 +484,15 @@ if __name__ == "__main__":
             debug_cpu()
         elif mode == "debug_gpu":
             debug_gpu()
+        elif mode == "profile_gpu_mem":
+            profile_extreme_seq_len_memory()
         elif mode == "train":
             main()
         else:
-            print("Usage: python run_pretrain.py [debug_cpu|debug_gpu|train]")
+            print("Usage: python run_pretrain.py [debug_cpu|debug_gpu|profile_gpu_mem|train]")
             print("  debug_cpu  - Run CPU debugging")
             print("  debug_gpu  - Run GPU debugging")
+            print("  profile_gpu_mem  - Profile GPU memory with full seq length dummy data")
             print("  train      - Start training")
     else:
         # 默认运行CPU调试

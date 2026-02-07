@@ -20,7 +20,7 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data.dataloader import DataLoader
 from transformers import DataCollatorWithPadding
 import torch.nn.functional as F
-from Pretrain.pretrain_model import BinDebertaV2ModelForPretrain
+from Pretrain.pretrain_model import MoCoPretrainModel
 import torch
 
 # --- 设置 Rich 和 Typer ---
@@ -104,7 +104,7 @@ class FunctionDataCollator:
         return padded_graphs
     
 def get_model(model_path):
-    model = BinDebertaV2ModelForPretrain.from_pretrained(model_path, trust_remote_code=True)
+    model = MoCoPretrainModel.from_pretrained(model_path, trust_remote_code=True)
     return model
 
 def get_dataloader(dataset_path: Path, tokenizer, batch_size: int = 64, max_length: int = 2048) -> DataLoader:
@@ -153,7 +153,7 @@ def generate_embeddings_with_model(dataset_path: Path, batch_size: int, tokenize
         try:
             with torch.no_grad():
                 # 使用模型生成嵌入
-                outputs = model.bindeberta(
+                outputs = model(
                     input_ids=input_ids, 
                     attention_mask=attention_mask, 
                     cfg_adj_list=cfg_graphs if len(cfg_graphs.shape) > 2 else None,
