@@ -24,9 +24,9 @@ class PretrainConfig(RoFormerConfig):
         use_flash_attn: bool = True,
         svd_rank: int = 32,
         # === 训练配置 ===
-        num_train_epochs: int = 3,
+        num_train_epochs: int = 1,
         max_steps: int = 300000,
-        per_device_train_batch_size: int = 4,
+        per_device_train_batch_size: int = 8,
         fp16: bool = False,
         bf16: bool = True,
         gradient_checkpointing: bool = True,
