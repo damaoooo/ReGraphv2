@@ -313,6 +313,23 @@ def profile_extreme_seq_len_memory(
     else:
         autocast_dtype = None
 
+    scaler = None
+    if config.fp16:
+        scaler = torch.cuda.amp.GradScaler()
+
+    def build_optimizer():
+        optim_name = (config.optim or "").lower()
+        if optim_name in {"paged_adamw_8bit", "adamw_8bit"}:
+            try:
+                import bitsandbytes as bnb
+            except Exception as exc:
+                print(f"bitsandbytes not available ({exc}); falling back to torch AdamW")
+                return torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+            return bnb.optim.AdamW8bit(model.parameters(), lr=config.learning_rate)
+        return torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+
+    optimizer = build_optimizer()
+
     def build_dummy_view(batch_size: int, use_labels: bool) -> Dict[str, Any]:
         vocab_size = model_config.vocab_size
         input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
@@ -365,7 +382,14 @@ def profile_extreme_seq_len_memory(
                 outputs = model(view1, view2)
 
             if run_backward:
-                outputs["loss"].backward()
+                if scaler is not None:
+                    scaler.scale(outputs["loss"]).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    outputs["loss"].backward()
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             max_allocated = torch.cuda.max_memory_allocated() / 1024**2
             max_reserved = torch.cuda.max_memory_reserved() / 1024**2
