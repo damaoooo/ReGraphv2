@@ -1,4 +1,4 @@
-from Pretrain.pretrain_dataset import MyFinalDataCollator, load_dataset
+from Pretrain.pretrain_dataset import MoCoDataCollator, load_dataset
 from transformers import PreTrainedTokenizerFast, DataCollatorForLanguageModeling
 from transformers import Trainer, TrainingArguments
 from transformers import BertForMaskedLM
@@ -7,9 +7,27 @@ from .pretrain_model import BinDebertaV2ModelForPretrain
 import pickle
 from torch.utils.data import DataLoader
 from Tokenizer.ir_tokenizer import load_tokenizer
-from Model.model_backbone import BinDebertaV2Model, create_deberta_v3_config_from_pretrain_config
+from Model.model_backbone import GraphRoFormerModel
 from .pretrain_config import PretrainConfig, DEFAULT_CONFIG
+from typing import Dict, List, Any
 
+def compute_group_ids(data: Dict[int, List[int]]) -> Dict[int, int]:
+    key_to_group_id = {}
+    for anchor_key, positive_keys in data.items():
+        if anchor_key in key_to_group_id:
+            continue
+
+        if positive_keys:
+            min_positive = min(positive_keys)
+            if anchor_key < min_positive:
+                group_id = anchor_key
+                key_to_group_id[anchor_key] = group_id
+                for member in positive_keys:
+                    key_to_group_id[member] = group_id
+        else:
+            key_to_group_id[anchor_key] = anchor_key
+            
+    return key_to_group_id
 
 def debug_cpu(config: PretrainConfig = DEFAULT_CONFIG):
     print("--- Running in debug mode ---")
@@ -23,17 +41,17 @@ def debug_cpu(config: PretrainConfig = DEFAULT_CONFIG):
     with open(config.train_dataset_map_path, 'rb') as f:
         train_positive_map = pickle.load(f)
     
-    my_collator = MyFinalDataCollator(
+    train_positive_map_group_ids = compute_group_ids(train_positive_map)
+    my_collator = MoCoDataCollator(
         tokenizer=tokenizer, 
         dataset_pool=train_dataset_pool, 
         map_file=train_positive_map,
+        group_id_mapping=train_positive_map_group_ids,
         config=config
     )
     
-    model_config = create_deberta_v3_config_from_pretrain_config(
-        vocab_size=len(tokenizer.get_vocab()),
-        pretrain_config=config
-    )
+    model_config = DEFAULT_CONFIG
+    model_config.vocab_size = len(tokenizer.get_vocab())
     model = BinDebertaV2ModelForPretrain(config=model_config)
     
     # 将模型设置为评估模式，这会关闭 dropout 等只在训练时使用的层
@@ -126,7 +144,7 @@ def debug_gpu(config: PretrainConfig = DEFAULT_CONFIG):
     with open(config.train_dataset_map_path, 'rb') as f:
         train_positive_map = pickle.load(f)
     
-    my_collator = MyFinalDataCollator(
+    my_collator = MoCoDataCollator(
         tokenizer=tokenizer, 
         dataset_pool=train_dataset_pool, 
         map_file=train_positive_map,
@@ -259,7 +277,7 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
     #     "cfg_graph": "cfg_adj_list",
     #     "ddg_graph": "ddg_adj_list",
     # })
-    my_collator = MyFinalDataCollator(
+    my_collator = MoCoDataCollator(
         tokenizer=tokenizer, 
         dataset_pool=train_dataset_pool, 
         map_file=train_positive_map,

@@ -1,405 +1,250 @@
-
-from transformers import (
-    PreTrainedTokenizerFast,
-    DebertaV2Config,
-    DebertaV2ForMaskedLM,
-    Trainer,
-    TrainingArguments,
-    DataCollatorForLanguageModeling,
-)
-
-from collections.abc import Sequence
-
-from transformers.utils import auto_docstring
-
-from transformers.models.deberta_v2 import (
-    DebertaV2ForMaskedLM,
-    DebertaV2ForTokenClassification
-)
-
-from transformers.modeling_outputs import BaseModelOutput
-
+# file: graph_roformer.py
 import torch
 import torch.nn as nn
-from typing import Optional, Union
-from transformers.models.deberta_v2.modeling_deberta_v2 import (
-    DisentangledSelfAttention,
-    DebertaV2Attention,
-    DebertaV2Layer,
-    DebertaV2Encoder,
-    DebertaV2Model
-)
+import torch.nn.functional as F
+from typing import Optional, Tuple, Dict, Any
+from transformers import RoFormerPreTrainedModel, RoFormerModel, RoFormerConfig
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
+from transformers.models.roformer.modeling_roformer import RoFormerEncoder, RoFormerLayer
+from transformers.models.roformer.modeling_roformer import RoFormerSinusoidalPositionalEmbedding
+from transformers.pytorch_utils import apply_chunking_to_forward
 
-import xformers.ops as xops
-
-@torch.jit.script
-def scaled_size_sqrt(query_layer: torch.Tensor, scale_factor: int):
-    return torch.sqrt(torch.tensor(query_layer.size(-1), dtype=torch.float) * scale_factor)
-
-def create_deberta_v3_config(vocab_size: int, max_seq_len: int = 4096, 
-                             hidden_size: int = 768, num_hidden_layers: int = 12,
-                             num_attention_heads: int = 12, intermediate_size: int = 3072,
-                             relative_attention: bool = True, pos_att_type: str = "p2c|c2p",
-                             torch_dtype: str = "bfloat16", use_flash_attn: bool = True) -> DebertaV2Config:
-    """
-    Create a new DeBERTa V3 model config with the given vocab size and max sequence length.
-    
-    Args:
-        vocab_size (int): Vocabulary size, must match the tokenizer.
-        max_seq_len (int): Maximum sequence length supported by the model.
-        hidden_size (int): Hidden size of the model.
-        num_hidden_layers (int): Number of hidden layers.
-        num_attention_heads (int): Number of attention heads.
-        intermediate_size (int): Intermediate size in feed-forward layers.
-        relative_attention (bool): Whether to use relative attention.
-        pos_att_type (str): Position attention type.
-        torch_dtype (str): Torch data type.
-        use_flash_attn (bool): Whether to use Flash Attention.
-
-    Returns:
-        DebertaV2Config: Configuration object for DeBERTa V3.
-    """
-    print(f"Creating DeBERTa V3 config: Vocab Size={vocab_size}, Max Length={max_seq_len}")
-    
-    # These parameters are for the "base" model; adjust as needed for your resources
-    config = DebertaV2Config(
-        vocab_size=vocab_size,
-        max_position_embeddings=max_seq_len,
-        hidden_size=hidden_size,
-        num_hidden_layers=num_hidden_layers,
-        num_attention_heads=num_attention_heads,
-        intermediate_size=intermediate_size,
-        relative_attention=relative_attention,
-        pos_att_type=pos_att_type,
-        torch_dtype=torch_dtype,
-        use_flash_attn=use_flash_attn,
-    )
-    return config
-
-
-def create_deberta_v3_config_from_pretrain_config(vocab_size: int, pretrain_config) -> DebertaV2Config:
-    """
-    从PretrainConfig创建DeBERTa V3模型配置
-    
-    Args:
-        vocab_size (int): 词汇表大小，必须与tokenizer匹配
-        pretrain_config: PretrainConfig实例
+# 1. 魔改 Attention 层：这是唯一需要动大手术的地方
+class GraphFlashRoFormerSelfAttention(nn.Module):
+    def __init__(self, config: RoFormerConfig):
+        super().__init__()
+        if config.hidden_size % config.num_attention_heads != 0:
+            raise ValueError(
+                f"hidden_size ({config.hidden_size}) must be divisible by num_attention_heads ({config.num_attention_heads})"
+            )
         
-    Returns:
-        DebertaV2Config: DeBERTa V3的配置对象
-    """
-    return create_deberta_v3_config(
-        vocab_size=vocab_size,
-        max_seq_len=pretrain_config.max_seq_length,
-        hidden_size=pretrain_config.hidden_size,
-        num_hidden_layers=pretrain_config.num_hidden_layers,
-        num_attention_heads=pretrain_config.num_attention_heads,
-        intermediate_size=pretrain_config.intermediate_size,
-        relative_attention=pretrain_config.relative_attention,
-        pos_att_type=pretrain_config.pos_att_type,
-        torch_dtype=pretrain_config.torch_dtype,
-        use_flash_attn=pretrain_config.use_flash_attn,
-    )
+        self.num_heads: int = config.num_attention_heads
+        self.head_dim: int = int(config.hidden_size / config.num_attention_heads)
+        self.query = nn.Linear(config.hidden_size, config.hidden_size)
+        self.key = nn.Linear(config.hidden_size, config.hidden_size)
+        self.value = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        
+        # 使用 RoFormer 的正弦位置编码来生成 RoPE
+        # 安全地获取 rotary_value 配置，默认为 False
+        self.rotary_value: bool = getattr(config, 'rotary_value', False)
+        self.embed_positions = RoFormerSinusoidalPositionalEmbedding(
+            config.max_position_embeddings, self.head_dim
+        )
 
+    def forward(
+        self, 
+        hidden_states: torch.Tensor, 
+        cfg_u: torch.Tensor, # Shape: [B, S, Rank]
+        cfg_v: torch.Tensor, # Shape: [B, S, Rank]
+        ddg_edges: torch.Tensor,
+        **kwargs
+    ) -> torch.Tensor:
+        # input: [batch, seq, dim]
+        B, L, _ = hidden_states.shape
+        
+        # 处理DDG
+        ddg_src = ddg_edges[:, :, 0:2]
+        ddg_dst = ddg_edges[:, :, 2:4]
+        edge_mask = (ddg_edges != -1).all(dim=-1)  # Shape: [B, max_edges]
 
-def get_model(vocab_size: int, max_seq_len: int = 4096) -> DebertaV2ForMaskedLM:
-    config = create_deberta_v3_config(vocab_size, max_seq_len)
-    model = DebertaV2ForMaskedLM(config=config)
+        # X <- X + Avg(Parents)  (用 start 位置作为节点代表)
+        src_pos = ddg_src[:, :, 0].clamp(min=0)  # Shape: [B, max_edges]
+        dst_pos = ddg_dst[:, :, 0].clamp(min=0)  # Shape: [B, max_edges]
 
-class BinDebertaDisentangleV2Attention(DisentangledSelfAttention):
-    def __init__(self, config: DebertaV2Config):
+        parent_feat = hidden_states.gather(
+            1, src_pos.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
+        )
+        parent_feat = parent_feat * edge_mask.unsqueeze(-1)
+
+        agg = torch.zeros_like(hidden_states)
+        agg.scatter_add_(
+            1, dst_pos.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1)), parent_feat
+        )
+
+        deg = torch.zeros(B, L, device=hidden_states.device, dtype=hidden_states.dtype)
+        deg.scatter_add_(1, dst_pos, edge_mask.to(hidden_states.dtype))
+        deg = deg.clamp_min(1.0)
+
+        hidden_states = hidden_states + agg / deg.unsqueeze(-1)
+
+        q: torch.Tensor = self.query(hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2) # Shape: [B, num_heads, S, head_dim]
+        k: torch.Tensor = self.key(hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        v: torch.Tensor = self.value(hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # 应用 RoPE (处理序列位置)
+        # 生成位置编码
+        sinusoidal_pos: torch.Tensor = self.embed_positions(hidden_states.shape[:2])[None, None, :, :]
+        
+        # 应用旋转位置编码到 q 和 k (标准RoPE实现)
+        # sinusoidal_pos: [1, 1, L, head_dim] -> sin/cos: [1, 1, L, head_dim/2]
+        sin = sinusoidal_pos[..., 0::2]
+        cos = sinusoidal_pos[..., 1::2]
+
+        # RoPE 应用公式 - 支持 fp16 和 bf16
+        if q.dtype in (torch.float16, torch.bfloat16):
+            sin = sin.to(q.dtype)
+            cos = cos.to(q.dtype)
+
+        def apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
+            x1 = x[..., 0::2]
+            x2 = x[..., 1::2]
+            x_rot = torch.empty_like(x)
+            x_rot[..., 0::2] = x1 * cos - x2 * sin
+            x_rot[..., 1::2] = x1 * sin + x2 * cos
+            return x_rot
+
+        q_rot = apply_rope(q, sin, cos)  # Shape: [B, num_heads, S, head_dim]
+        k_rot = apply_rope(k, sin, cos)  # Shape: [B, num_heads, S, head_dim]
+
+        if self.rotary_value:
+            v = apply_rope(v, sin, cos)
+        
+        
+        # put CFG
+        d = self.head_dim
+        q_rot /= d ** 0.25
+        k_rot /= d ** 0.25
+        q_rot = torch.concat([q_rot, cfg_u.unsqueeze(1).expand(-1, self.num_heads, -1, -1)], dim=-1)
+        k_rot = torch.concat([k_rot, cfg_v.unsqueeze(1).expand(-1, self.num_heads, -1, -1)], dim=-1)
+
+        # --- 核心：Flash Attention + Graph Bias ---
+        # 注意：attn_mask 在 SDPA 里通常是加法 mask (0 是保留，-inf 是遮蔽/bias)
+        
+        # Pad V to match Q/K size after adding CFG
+        pad_size = q_rot.size(-1) - v.size(-1)
+        if pad_size > 0:
+            v = F.pad(v, (0, pad_size), value=0.0)
+            
+        
+        # PyTorch 2.0+ 神器：自动选择 FlashAttention, xFormers 或 CuDNN
+        attn_output = F.scaled_dot_product_attention(
+            q_rot, k_rot, v,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            scale=1.0,
+            is_causal=False  # 双向 Attention
+        )
+        if pad_size > 0:
+            attn_output = attn_output[..., :self.head_dim]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, -1)
+        
+        return attn_output
+    
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        """旋转输入张量的一半隐藏维度"""
+        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+# 2. 组装 Layer
+class GraphRoFormerLayer(RoFormerLayer):
+    def __init__(self, config: RoFormerConfig):
         super().__init__(config)
-        
-        self.ddg_bias_embedding = nn.Embedding(2, 1)
-        self.num_cfg_buckets = 16
-        self.cfg_bias_embedding = nn.Embedding(self.num_cfg_buckets + 1, 1)
+        # 替换掉原本慢吞吞的 SelfAttention，换成咱们的 Flash 版
+        self.attention.self = GraphFlashRoFormerSelfAttention(config)
 
     def forward(
         self,
         hidden_states,
-        attention_mask,
-        ddg_adj_matrix=None,
-        cfg_adj_matrix=None,
+        attention_mask=None,
+        sinusoidal_pos=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        past_key_value=None,
         output_attentions=False,
-        query_states=None,
-        relative_pos=None,
-        rel_embeddings=None
+        cfg_u: Optional[torch.Tensor] = None,
+        cfg_v: Optional[torch.Tensor] = None,
+        ddg_edges: Optional[torch.Tensor] = None,
     ):
-        if query_states is None:
-            query_states = hidden_states
-        
-        query_layer = self.transpose_for_scores(self.query_proj(query_states), self.num_attention_heads)
-        key_layer = self.transpose_for_scores(self.key_proj(hidden_states), self.num_attention_heads)
-        value_layer = self.transpose_for_scores(self.value_proj(hidden_states), self.num_attention_heads)
+        if self.is_decoder:
+            raise NotImplementedError("GraphRoFormerLayer does not support decoder mode.")
+        if cfg_u is None or cfg_v is None or ddg_edges is None:
+            raise ValueError("cfg_u, cfg_v, and ddg_edges are required for GraphRoFormerLayer.")
 
-        rel_att = None
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        scale_factor = 1
-        if "c2p" in self.pos_att_type:
-            scale_factor += 1
-        if "p2c" in self.pos_att_type:
-            scale_factor += 1
-        scale = scaled_size_sqrt(query_layer, scale_factor)
-        attention_scores = torch.bmm(query_layer, key_layer.transpose(-1, -2) / scale.to(dtype=query_layer.dtype))
-        if self.relative_attention:
-            rel_embeddings = self.pos_dropout(rel_embeddings)
-            rel_att = self.disentangled_attention_bias(
-                query_layer, key_layer, relative_pos, rel_embeddings, scale_factor
-            )
-
-        batch_size, seq_len, _ = hidden_states.shape
-        qkv_shape = (batch_size, self.num_attention_heads, seq_len, self.attention_head_size)
-        query_layer_x = query_layer.view(qkv_shape).permute(0, 2, 1, 3)
-        key_layer_x = key_layer.view(qkv_shape).permute(0, 2, 1, 3)
-        value_layer_x = value_layer.view(qkv_shape).permute(0, 2, 1, 3)
-
-
-        # 2. 将 rel_att 从 [B*H, S, S] 变形成 [B, H, S, S]
-        if rel_att is not None:
-            rel_att = rel_att.view(batch_size, self.num_attention_heads, seq_len, seq_len)
-        
-        total_bias = rel_att if rel_att is not None else torch.zeros(
-            batch_size, self.num_attention_heads, seq_len, seq_len, device=hidden_states.device, dtype=hidden_states.dtype
-        )
-
-        attention_scores = attention_scores
-        attention_scores = attention_scores.view(
-            -1, self.num_attention_heads, attention_scores.size(-2), attention_scores.size(-1)
-        )
-        # My Own logic
-        if cfg_adj_matrix is not None:
-            bucket_indices = torch.zeros_like(cfg_adj_matrix, dtype=torch.long)
-            no_edge_mask = cfg_adj_matrix == 0
-            edge_mask = ~no_edge_mask
-            edge_bucket_values = (cfg_adj_matrix[edge_mask] * (self.num_cfg_buckets - 1)).round().long() + 1
-            bucket_indices[edge_mask] = edge_bucket_values
-            cfg_bias = self.cfg_bias_embedding(bucket_indices).squeeze(-1).unsqueeze(1)
-            total_bias += cfg_bias
-
-        if ddg_adj_matrix is not None:
-            ddg_bias = self.ddg_bias_embedding(ddg_adj_matrix.long()).squeeze(-1).unsqueeze(1)
-            total_bias += ddg_bias
-
-        if attention_mask is not None:
-            total_bias = total_bias.masked_fill(
-                attention_mask == 0, # [B,1,1,S] -> [B,1,S,S]
-                torch.finfo(total_bias.dtype).min
-            )
-
-        context_layer_x = xops.memory_efficient_attention(
-            query_layer_x, # [B, S, H, D]
-            key_layer_x,   # [B, S, H, D]
-            value_layer_x,   # [B, S, H, D]
-            attn_bias=total_bias, # [B, H, S, S]
-            p=self.dropout.p if self.training else 0.0,
-        )
-        context_layer = context_layer_x.view(batch_size, seq_len, -1)
-        return (context_layer, None) if not output_attentions else (context_layer, None)
-    
-
-class BinDebertaV2Attention(DebertaV2Attention):
-    def __init__(self, config: DebertaV2Config):
-        super().__init__(config)
-        self.self = BinDebertaDisentangleV2Attention(config)
-
-    def forward(
-        self,
-        hidden_states,
-        attention_mask,
-        cfg_adj_matrix=None,
-        ddg_adj_matrix=None,
-        output_attentions: bool = False,
-        query_states=None,
-        relative_pos=None,
-        rel_embeddings=None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        self_output, att_matrix = self.self(
+        self_attention_output = self.attention.self(
             hidden_states,
-            attention_mask,
-            output_attentions=output_attentions,
-            cfg_adj_matrix=cfg_adj_matrix,
-            ddg_adj_matrix=ddg_adj_matrix,
-            query_states=query_states,
-            relative_pos=relative_pos,
-            rel_embeddings=rel_embeddings,
+            cfg_u=cfg_u,
+            cfg_v=cfg_v,
+            ddg_edges=ddg_edges,
         )
-        if query_states is None:
-            query_states = hidden_states
-        attention_output = self.output(self_output, query_states)
+        attention_output = self.attention.output(self_attention_output, hidden_states)
 
+        layer_output = apply_chunking_to_forward(
+            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
+        )
+
+        outputs = (layer_output,)
         if output_attentions:
-            return (attention_output, att_matrix)
-        else:
-            return (attention_output, None)
+            outputs = outputs + (None,)
+        return outputs
 
-
-class BinDebertaLV2Layer(DebertaV2Layer):
-    def __init__(self, config: DebertaV2Config):
-        super().__init__(config)
-        self.attention = BinDebertaV2Attention(config)
-
-    def forward(
-        self,
-        hidden_states,
-        attention_mask,
-        cfg_adj_matrix=None,
-        ddg_adj_matrix=None,
-        query_states=None,
-        relative_pos=None,
-        rel_embeddings=None,
-        output_attentions: bool = False,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        
-        attention_output, att_matrix = self.attention(
-            hidden_states,
-            attention_mask,
-            cfg_adj_matrix=cfg_adj_matrix,
-            ddg_adj_matrix=ddg_adj_matrix,
-            output_attentions=output_attentions,
-            query_states=query_states,
-            relative_pos=relative_pos,
-            rel_embeddings=rel_embeddings,
-        )
+    def feed_forward_chunk(self, attention_output):
         intermediate_output = self.intermediate(attention_output)
         layer_output = self.output(intermediate_output, attention_output)
+        return layer_output
 
-        if output_attentions:
-            return (layer_output, att_matrix)
-        else:
-            return (layer_output, None)
 
-class BinDebertaV2Encoder(DebertaV2Encoder):
-    def __init__(self, config: DebertaV2Config):
+# 3. 组装 Model
+class GraphRoFormerModel(RoFormerPreTrainedModel):
+    def __init__(self, config: RoFormerConfig):
         super().__init__(config)
-        self.layer = nn.ModuleList([BinDebertaLV2Layer(config) for _ in range(config.num_hidden_layers)])
-
-    def forward(
-        self,
-        hidden_states,
-        attention_mask,
-        cfg_adj_matrix=None,
-        ddg_adj_matrix=None,
-        output_hidden_states=True,
-        output_attentions=False,
-        query_states=None,
-        relative_pos=None,
-        return_dict=True,
-    ):
-        if attention_mask.dim() <= 2:
-            input_mask = attention_mask
-        else:
-            input_mask = attention_mask.sum(-2) > 0
-        attention_mask = self.get_attention_mask(attention_mask)
-        relative_pos = self.get_rel_pos(hidden_states, query_states, relative_pos)
-
-        all_hidden_states: Optional[tuple[torch.Tensor]] = (hidden_states,) if output_hidden_states else None
-        all_attentions = () if output_attentions else None
-
-        next_kv = hidden_states
-        rel_embeddings = self.get_rel_embedding()
-        for i, layer_module in enumerate(self.layer):
-            output_states, attn_weights = layer_module(
-                next_kv,
-                attention_mask,
-                cfg_adj_matrix=cfg_adj_matrix,
-                ddg_adj_matrix=ddg_adj_matrix,
-                query_states=query_states,
-                relative_pos=relative_pos,
-                rel_embeddings=rel_embeddings,
-                output_attentions=output_attentions,
-            )
-
-            if output_attentions:
-                all_attentions = all_attentions + (attn_weights,)
-
-            if i == 0 and self.conv is not None:
-                output_states = self.conv(hidden_states, output_states, input_mask)
-
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (output_states,)
-
-            if query_states is not None:
-                query_states = output_states
-                if isinstance(hidden_states, Sequence):
-                    next_kv = hidden_states[i + 1] if i + 1 < len(self.layer) else None
-            else:
-                next_kv = output_states
-
-        if not return_dict:
-            return tuple(v for v in [output_states, all_hidden_states, all_attentions] if v is not None)
-        return BaseModelOutput(
-            last_hidden_state=output_states, hidden_states=all_hidden_states, attentions=all_attentions
-        )
-
-
-
-class BinDebertaV2Model(DebertaV2Model):
-    def __init__(self, config: DebertaV2Config):
-        super().__init__(config)
-        self.encoder = BinDebertaV2Encoder(config)
+        self.config = config
+        
+        # 验证配置参数
+        if not hasattr(config, 'num_hidden_layers') or config.num_hidden_layers <= 0:
+            raise ValueError(f"Invalid num_hidden_layers: {getattr(config, 'num_hidden_layers', None)}")
+        if not hasattr(config, 'hidden_size') or config.hidden_size <= 0:
+            raise ValueError(f"Invalid hidden_size: {getattr(config, 'hidden_size', None)}")
+        if not hasattr(config, 'num_attention_heads') or config.num_attention_heads <= 0:
+            raise ValueError(f"Invalid num_attention_heads: {getattr(config, 'num_attention_heads', None)}")
+        
+        self.embeddings = RoFormerModel(config).embeddings # 复用 Embedding 层
+        
+        # 堆叠我们的魔改 Layer
+        self.layers = nn.ModuleList([
+            GraphRoFormerLayer(config) for _ in range(config.num_hidden_layers)
+        ])
         self.post_init()
 
-    def _rasterize_graph(self, edge_list_tensor, batch_size, seq_len, device):
-        adj_matrix = torch.zeros(batch_size, seq_len, seq_len, device=device)
-        for batch in range(batch_size):
-            for edge in edge_list_tensor[batch]:
-                if len(edge) == 0:
-                    continue
-                if edge[0] == -1:
-                    continue
-                prob = 1
-                if len(edge) == 4:
-                    s_start, s_end, d_start, d_end = edge
-                else:
-                    assert len(edge) == 5
-                    s_start, s_end, d_start, d_end, prob = edge
-                adj_matrix[batch, int(s_start):int(s_end), int(d_start):int(d_end)] = prob
-        return adj_matrix
-
-    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        cfg_adj_list: Optional[torch.Tensor] = None,
-        ddg_adj_list: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[tuple, BaseModelOutput]:
-        """
-        
-        My New forward method for BinDebertaV2Model.
+        cfg_u: Optional[torch.Tensor] = None,
+        cfg_v: Optional[torch.Tensor] = None,
+        ddg_edges: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> BaseModelOutputWithPastAndCrossAttentions:
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("You must provide input_ids or inputs_embeds.")
+        if cfg_u is None or cfg_v is None or ddg_edges is None:
+            raise ValueError("cfg_u, cfg_v, and ddg_edges are required for GraphRoFormerModel.")
 
-        This method processes the input data through the model, handling both
-        input_ids and inputs_embeds, and applies attention mechanisms with
-        optional graph adjacency matrices for CFG and DDG.
-
-        Args:
-            cfg_adj_list (Optional[torch.Tensor]): List of CFG adjacency matrices for each batch.
-            ddg_adj_list (Optional[torch.Tensor]): List of DDG adjacency matrices for each batch.
-
-        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        elif input_ids is not None:
-            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
+        if input_ids is not None:
             input_shape = input_ids.size()
-        elif inputs_embeds is not None:
-            input_shape = inputs_embeds.size()[:-1]
+            device = input_ids.device
         else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
-
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
+            input_shape = inputs_embeds.size()[:-1]
+            device = inputs_embeds.device
 
         if attention_mask is None:
             attention_mask = torch.ones(input_shape, device=device)
@@ -409,297 +254,126 @@ class BinDebertaV2Model(DebertaV2Model):
         embedding_output = self.embeddings(
             input_ids=input_ids,
             token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            mask=attention_mask,
             inputs_embeds=inputs_embeds,
         )
 
-        if cfg_adj_list is not None:
-            cfg_adj_matrix = self._rasterize_graph(cfg_adj_list, input_shape[0], input_shape[1], device)
-        else:
-            cfg_adj_matrix = None
+        hidden_states = embedding_output
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attentions = () if output_attentions else None
 
-        if ddg_adj_list is not None:
-            ddg_adj_matrix = self._rasterize_graph(ddg_adj_list, input_shape[0], input_shape[1], device)
-        else:
-            ddg_adj_matrix = None
+        for layer_module in self.layers:
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
 
-        encoder_outputs = self.encoder(
-            embedding_output,
-            attention_mask,
-            cfg_adj_matrix=cfg_adj_matrix,
-            ddg_adj_matrix=ddg_adj_matrix,
-            output_hidden_states=True,
-            output_attentions=output_attentions,
-            return_dict=return_dict,
-        )
-        encoded_layers = encoder_outputs[1]
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                past_key_value=None,
+                output_attentions=output_attentions,
+                cfg_u=cfg_u,
+                cfg_v=cfg_v,
+                ddg_edges=ddg_edges,
+            )
 
-        if self.z_steps > 1:
-            hidden_states = encoded_layers[-2]
-            layers = [self.encoder.layer[-1] for _ in range(self.z_steps)]
-            query_states = encoded_layers[-1]
-            rel_embeddings = self.encoder.get_rel_embedding()
-            attention_mask = self.encoder.get_attention_mask(attention_mask)
-            rel_pos = self.encoder.get_rel_pos(embedding_output)
-            for layer in layers[1:]:
-                query_states = layer(
-                    hidden_states,
-                    attention_mask,
-                    output_attentions=False,
-                    query_states=query_states,
-                    relative_pos=rel_pos,
-                    rel_embeddings=rel_embeddings,
-                )
-                encoded_layers.append(query_states)
+            hidden_states = layer_outputs[0]
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (layer_outputs[1],)
 
-        sequence_output = encoded_layers[-1]
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            return (sequence_output,) + encoder_outputs[(1 if output_hidden_states else 2) :]
+            output = (hidden_states, None, all_hidden_states, all_self_attentions, None)
+            return tuple(v for v in output if v is not None)
 
-        return BaseModelOutput(
-            last_hidden_state=sequence_output,
-            hidden_states=encoder_outputs.hidden_states if output_hidden_states else None,
-            attentions=encoder_outputs.attentions,
+        return BaseModelOutputWithPastAndCrossAttentions(
+            last_hidden_state=hidden_states,
+            past_key_values=None,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+            cross_attentions=None,
         )
+    
+    
 if __name__ == "__main__":
-    import time
-    import gc
+    import torch
+    from torch.profiler import profile, record_function, ProfilerActivity
     
-    # Small test to ensure the model can be created
-    vocab_size = 65535
-    model = BinDebertaV2Model(create_deberta_v3_config(vocab_size))
+    # ==========================================
+    # 1. 准备阶段
+    # ==========================================
+    device = 'cuda'
+    print(f"正在使用设备: {device}")
+
+    # 你的新配置
+    hidden_layers = 24
+    max_position_embeddings = 4096
+    rank = 32
+    sequence_length = 4096
+    attention_heads = 12
+    batch_size = 8
+    hidden_size = 768  # head_dim = 1024/16 = 64
     
-    # Performance testing function
-    def benchmark_model(model, device='cpu', batch_sizes=[1, 2, 4, 8], seq_len=128, num_warmup=5, num_iterations=20):
-        """
-        Benchmark the model with different batch sizes
-        
-        Args:
-            model: The model to benchmark
-            device: Device to run on ('cpu' or 'cuda')
-            batch_sizes: List of batch sizes to test
-            seq_len: Sequence length
-            num_warmup: Number of warmup iterations
-            num_iterations: Number of benchmark iterations
-        """
-        model = model.to(device)
-        model.eval()  # Set to evaluation mode
-        
-        print(f"\n{'='*60}")
-        print(f"Benchmarking on {device.upper()}")
-        print(f"{'='*60}")
-        print(f"{'Batch Size':<12} {'Latency (ms)':<15} {'Throughput (samples/s)':<20} {'Memory (MB)':<12}")
-        print(f"{'-'*60}")
-        
-        for batch_size in batch_sizes:
-            try:
-                # Generate dummy data
-                input_ids = torch.randint(0, vocab_size, (batch_size, seq_len)).to(device)
-                attention_mask = torch.ones((batch_size, seq_len), dtype=torch.bool).to(device)
-                
-                # Generate dummy adjacency lists
-                ddg_adj_list = [
-                    torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]]).to(device) 
-                    for _ in range(batch_size)
-                ]
-                cfg_adj_list = [
-                    torch.tensor([[0, 1, 2, 3, 0.5], [1, 2, 3, 4, 0.8]]).to(device) 
-                    for _ in range(batch_size)
-                ]
-                
-                # Warmup
-                with torch.no_grad():
-                    for _ in range(num_warmup):
-                        _ = model(
-                            input_ids=input_ids,
-                            ddg_adj_list=ddg_adj_list,
-                            cfg_adj_list=cfg_adj_list,
-                            attention_mask=attention_mask
-                        )
-                
-                # Clear cache if using GPU
-                if device == 'cuda':
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                
-                # Benchmark
-                start_time = time.time()
-                
-                with torch.no_grad():
-                    for _ in range(num_iterations):
-                        if device == 'cuda':
-                            torch.cuda.synchronize()
-                        
-
-                        _ = model(
-                            input_ids=input_ids,
-                            ddg_adj_list=ddg_adj_list,
-                            cfg_adj_list=cfg_adj_list,
-                            attention_mask=attention_mask
-                        )
-                        
-                        if device == 'cuda':
-                            torch.cuda.synchronize()
-                
-                end_time = time.time()
-                
-                # Calculate metrics
-                total_time = end_time - start_time
-                avg_latency = (total_time / num_iterations) * 1000  # Convert to ms
-                throughput = (batch_size * num_iterations) / total_time  # samples per second
-                
-                # Memory usage
-                if device == 'cuda':
-                    memory_used = torch.cuda.max_memory_allocated() / 1024 / 1024  # Convert to MB
-                    torch.cuda.reset_peak_memory_stats()
-                else:
-                    memory_used = 0  # Hard to measure CPU memory accurately
-                
-                print(f"{batch_size:<12} {avg_latency:<15.2f} {throughput:<20.2f} {memory_used:<12.1f}")
-                
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    print(f"{batch_size:<12} {'OOM':<15} {'OOM':<20} {'OOM':<12}")
-                    if device == 'cuda':
-                        torch.cuda.empty_cache()
-                    break
-                else:
-                    raise e
-    
-    # Test model creation and basic functionality
-    print("Testing model creation and basic functionality...")
-    
-    # Generate dummy input
-    input_ids = torch.randint(0, vocab_size, (2, 128))
-
-    # Generate dummy ddg_adj_list and cfg_adj_list
-    ddg_adj_list = [
-        torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]]),  # Batch 0
-        torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])   # Batch 1
-    ]
-
-    cfg_adj_list = [
-        torch.tensor([[0, 1, 2, 3, 0.5], [1, 2, 3, 4, 0.8]]),  # Batch 0
-        torch.tensor([[0, 1, 2, 3, 0.6], [1, 2, 3, 4, 0.9]])   # Batch 1
-    ]
-
-    model_output = model(
-        input_ids=input_ids,
-        ddg_adj_list=ddg_adj_list,
-        cfg_adj_list=cfg_adj_list,
-        attention_mask=torch.ones((2, 128), dtype=torch.bool)
+    config = RoFormerConfig(
+        hidden_size=hidden_size,
+        num_attention_heads=attention_heads,
+        num_hidden_layers=hidden_layers,
+        max_position_embeddings=max_position_embeddings,
+        rotary_value=True
     )
+    
+    # 实例化模型 (GraphRoFormerModel)
+    model = GraphRoFormerModel(config).to(device).to(torch.bfloat16)
+    model = torch.compile(model)  # PyTorch 2.0+ 编译模型以提升性能
+    # 构造数据
+    input_ids = torch.randint(0, 1000, (batch_size, sequence_length), device=device)
+    cfg_u = torch.randn(batch_size, sequence_length, rank, dtype=torch.bfloat16).to(device)
+    cfg_v = torch.randn(batch_size, sequence_length, rank, dtype=torch.bfloat16).to(device)
+    
+    # 构造简单的 DDG
+    ddg_edges = torch.full((batch_size, 50, 4), -1, dtype=torch.long).to(device)
+    # 随便填点数据防止报错
+    ddg_edges[:, :30, :] = 1 
 
-    print("✓ Model output shape:", model_output.last_hidden_state.shape)
+    # ==========================================
+    # 2. Warmup (预热)
+    # ==========================================
+    print("正在预热 CUDA Kernels...")
+    with torch.no_grad():
+        _ = model(input_ids=input_ids, cfg_u=cfg_u, cfg_v=cfg_v, ddg_edges=ddg_edges)
+    torch.cuda.synchronize()
+
+    # ==========================================
+    # 3. 开始 Profile (开启显存记录!)
+    # ==========================================
+    print("开始 Profile (包含显存分析)...")
     
+    # 【宏观视角】先重置一下显存峰值统计
+    torch.cuda.reset_peak_memory_stats()
+    start_mem = torch.cuda.memory_allocated()
     
-    # Try it on GPU if available
-    if torch.cuda.is_available():
-        print(f"\nCUDA is available. GPU: {torch.cuda.get_device_name()}")
-        
-        # Test basic GPU functionality
-        model_gpu = model.to('cuda')
-        input_ids_gpu = input_ids.to('cuda')
-        ddg_adj_list_gpu = [adj.to('cuda') for adj in ddg_adj_list]
-        cfg_adj_list_gpu = [adj.to('cuda') for adj in cfg_adj_list]
-        
-        model_output_gpu = model_gpu(
-            input_ids=input_ids_gpu,
-            ddg_adj_list=ddg_adj_list_gpu,
-            cfg_adj_list=cfg_adj_list_gpu,
-            attention_mask=torch.ones((2, 128), dtype=torch.bool).to('cuda')
-        )
-        
-        print("✓ Model output shape on GPU:", model_output_gpu.last_hidden_state.shape)
-        
-        # Benchmark on GPU
-        benchmark_model(model_gpu, device='cuda', batch_sizes=[1, 2, 4, 8, 16], seq_len=128)
-        
-        # Additional GPU-specific metrics
-        print(f"\nGPU Memory Summary:")
-        print(f"Total GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-        print(f"Current GPU Memory Usage: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-        print(f"Peak GPU Memory Usage: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
-        
-    else:
-        print("\nCUDA is not available, skipping GPU benchmarks.")
-    
-    # Test with different sequence lengths
-    print(f"\n{'='*60}")
-    print("Testing different sequence lengths (batch_size=2)")
-    print(f"{'='*60}")
-    print(f"{'Seq Length':<12} {'Latency (ms)':<15} {'Throughput (tok/s)':<20}")
-    print(f"{'-'*50}")
-    
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = model.to(device)
-    
-    for seq_len in [512, 1024, 2048, 4096]:
-        try:
-            batch_size = 2
-            input_ids = torch.randint(0, vocab_size, (batch_size, seq_len)).to(device)
-            attention_mask = torch.ones((batch_size, seq_len), dtype=torch.bool).to(device)
-            
-            # Adjust adjacency lists for different sequence lengths
-            ddg_adj_list = [
-                torch.tensor([[0, 1, min(seq_len-2, 2), min(seq_len-1, 3)]]).to(device) 
-                for _ in range(batch_size)
-            ]
-            cfg_adj_list = [
-                torch.tensor([[0, 1, min(seq_len-2, 2), min(seq_len-1, 3), 0.5]]).to(device) 
-                for _ in range(batch_size)
-            ]
-            
-            # Warmup
-            with torch.no_grad():
-                for _ in range(3):
-                    _ = model(
-                        input_ids=input_ids,
-                        ddg_adj_list=ddg_adj_list,
-                        cfg_adj_list=cfg_adj_list,
-                        attention_mask=attention_mask
-                    )
-            
-            if device == 'cuda':
-                torch.cuda.synchronize()
-            
-            # Benchmark
-            start_time = time.time()
-            num_iterations = 10
-            
-            with torch.no_grad():
-                for _ in range(num_iterations):
-                    _ = model(
-                        input_ids=input_ids,
-                        ddg_adj_list=ddg_adj_list,
-                        cfg_adj_list=cfg_adj_list,
-                        attention_mask=attention_mask
-                    )
-            
-            if device == 'cuda':
-                torch.cuda.synchronize()
-            
-            end_time = time.time()
-            
-            total_time = end_time - start_time
-            avg_latency = (total_time / num_iterations) * 1000
-            tokens_per_second = (batch_size * seq_len * num_iterations) / total_time
-            
-            print(f"{seq_len:<12} {avg_latency:<15.2f} {tokens_per_second:<20.2f}")
-            
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print(f"{seq_len:<12} {'OOM':<15} {'OOM':<20}")
-                if device == 'cuda':
-                    torch.cuda.empty_cache()
-                break
-            else:
-                raise e
-    
-    print(f"\n{'='*60}")
-    print("Benchmark completed!")
-    print(f"{'='*60}")
+
+    outputs = model(input_ids=input_ids, cfg_u=cfg_u, cfg_v=cfg_v, ddg_edges=ddg_edges)
 
 
+    torch.cuda.synchronize()
+    end_mem = torch.cuda.memory_allocated()
+    peak_mem = torch.cuda.max_memory_allocated()
+
+    # ==========================================
+    # 4. 打印结果
+    # ==========================================
+    print("-" * 60)
+    print(f"GraphRoFormerModel output shape: {outputs.last_hidden_state.shape}")
+    print(f"Model is running on device: {device} with dtype: {outputs.last_hidden_state.dtype}")
+    print("-" * 60)
+    
+    # 1. 宏观显存统计 (最直观)
+    print(f"【宏观显存统计】")
+    print(f"运行前显存占用: {start_mem / 1024**2:.2f} MB")
+    print(f"运行后显存占用: {end_mem / 1024**2:.2f} MB")
+    print(f"过程峰值显存 (Peak): {peak_mem / 1024**2:.2f} MB (这是你需要关注的极限)")
+    print("-" * 60)

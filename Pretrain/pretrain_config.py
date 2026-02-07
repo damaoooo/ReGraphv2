@@ -3,71 +3,121 @@
 包含所有预训练相关的硬编码配置项
 """
 
-from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any, Dict
+from transformers import RoFormerConfig
 
-@dataclass
-class PretrainConfig:
-    # === 序列长度配置 ===
-    max_seq_length: int = 2048
-    
-    # === 路径配置 ===
-    tokenizer_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json"
-    train_dataset_pool_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_dataset_pool"
-    train_dataset_idx_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_task_dataset"
-    train_dataset_map_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_positive_map.pkl"
-    output_dir: str = "./output"
-    final_model_dir: str = "./db1_model"
-    logging_dir: str = "./logs"
-    
-    # === 模型配置 ===
-    hidden_size: int = 768
-    num_hidden_layers: int = 12
-    num_attention_heads: int = 12
-    intermediate_size: int = 3072
-    relative_attention: bool = True
-    pos_att_type: str = "p2c|c2p"
-    torch_dtype: str = "bfloat16"
-    use_flash_attn: bool = True
-    
-    # === 训练配置 ===
-    num_train_epochs: int = 3  # 保留以防兼容性需要，但将被 max_steps 覆盖
-    max_steps: int = 300000  # 最大训练步数，设置后将忽略 num_train_epochs
-    per_device_train_batch_size: int = 3
-    fp16: bool = False
-    bf16: bool = True
-    gradient_checkpointing: bool = True
-    learning_rate: float = 5e-5
-    warmup_steps: int = 1000
-    weight_decay: float = 0.01
-    optim: str = "paged_adamw_8bit"
-    
-    # === 保存配置 ===
-    save_strategy: str = "steps"
-    save_steps: int = 1000  # 每1000步保存一次检查点
-    save_total_limit: int = 3
-    
-    # === 日志配置 ===
-    logging_strategy: str = "steps"
-    logging_steps: int = 100
-    report_to: str = "tensorboard"
-    
-    # === 数据处理配置 ===
-    dataloader_num_workers: Optional[int] = None  # 将在运行时根据CPU核心数自动设置
-    remove_unused_columns: bool = False
-    torch_compile: bool = False
-    
-    # === MLM配置 ===
-    mlm: bool = True
-    mlm_probability: float = 0.15
-    edge_pad_value: int = -1
-    pad_to_multiple_of: int = 8
-    
-    def __post_init__(self):
-        """初始化后的处理"""
-        if self.dataloader_num_workers is None:
+
+class PretrainConfig(RoFormerConfig):
+    def __init__(
+        self,
+        # === 序列长度配置 ===
+        max_seq_length: int = 2048,
+        # === 路径配置 ===
+        tokenizer_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json",
+        train_dataset_pool_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_dataset_pool",
+        train_dataset_idx_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_task_dataset",
+        train_dataset_map_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_positive_map.pkl",
+        output_dir: str = "./output",
+        final_model_dir: str = "./db1_model",
+        logging_dir: str = "./logs",
+        # === 模型扩展配置 ===
+        use_flash_attn: bool = True,
+        svd_rank: int = 32,
+        # === 训练配置 ===
+        num_train_epochs: int = 3,
+        max_steps: int = 300000,
+        per_device_train_batch_size: int = 3,
+        fp16: bool = False,
+        bf16: bool = True,
+        gradient_checkpointing: bool = True,
+        learning_rate: float = 5e-5,
+        warmup_steps: int = 1000,
+        weight_decay: float = 0.01,
+        optim: str = "paged_adamw_8bit",
+        # === 保存配置 ===
+        save_strategy: str = "steps",
+        save_steps: int = 1000,
+        save_total_limit: int = 3,
+        # === 日志配置 ===
+        logging_strategy: str = "steps",
+        logging_steps: int = 100,
+        report_to: str = "tensorboard",
+        # === 数据处理配置 ===
+        dataloader_num_workers: Optional[int] = None,
+        remove_unused_columns: bool = False,
+        torch_compile: bool = False,
+        # === MLM配置 ===
+        mlm: bool = True,
+        mlm_probability: float = 0.15,
+        edge_pad_value: int = -1,
+        pad_to_multiple_of: int = 8,
+        **kwargs: Any,
+    ):
+        model_defaults: Dict[str, Any] = {
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+            "relative_attention": True,
+            "pos_att_type": "p2c|c2p",
+            "torch_dtype": "bfloat16",
+            "max_position_embeddings": max_seq_length,
+        }
+        model_defaults.update(kwargs)
+        super().__init__(**model_defaults)
+
+        # === 序列长度配置 ===
+        self.max_seq_length = max_seq_length
+
+        # === 路径配置 ===
+        self.tokenizer_path = tokenizer_path
+        self.train_dataset_pool_path = train_dataset_pool_path
+        self.train_dataset_idx_path = train_dataset_idx_path
+        self.train_dataset_map_path = train_dataset_map_path
+        self.output_dir = output_dir
+        self.final_model_dir = final_model_dir
+        self.logging_dir = logging_dir
+
+        # === 模型扩展配置 ===
+        self.use_flash_attn = use_flash_attn
+        self.svd_rank = svd_rank
+
+        # === 训练配置 ===
+        self.num_train_epochs = num_train_epochs
+        self.max_steps = max_steps
+        self.per_device_train_batch_size = per_device_train_batch_size
+        self.fp16 = fp16
+        self.bf16 = bf16
+        self.gradient_checkpointing = gradient_checkpointing
+        self.learning_rate = learning_rate
+        self.warmup_steps = warmup_steps
+        self.weight_decay = weight_decay
+        self.optim = optim
+
+        # === 保存配置 ===
+        self.save_strategy = save_strategy
+        self.save_steps = save_steps
+        self.save_total_limit = save_total_limit
+
+        # === 日志配置 ===
+        self.logging_strategy = logging_strategy
+        self.logging_steps = logging_steps
+        self.report_to = report_to
+
+        # === 数据处理配置 ===
+        if dataloader_num_workers is None:
             import os
-            self.dataloader_num_workers = max(4, os.cpu_count() // 2)
+            dataloader_num_workers = max(4, os.cpu_count() // 2)
+        self.dataloader_num_workers = dataloader_num_workers
+        self.remove_unused_columns = remove_unused_columns
+        self.torch_compile = torch_compile
+
+        # === MLM配置 ===
+        self.mlm = mlm
+        self.mlm_probability = mlm_probability
+        self.edge_pad_value = edge_pad_value
+        self.pad_to_multiple_of = pad_to_multiple_of
+
 
 # 默认配置实例
 DEFAULT_CONFIG = PretrainConfig()
