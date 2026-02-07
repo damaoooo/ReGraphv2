@@ -52,7 +52,7 @@ def debug_cpu(config: PretrainConfig = DEFAULT_CONFIG):
         config=config
     )
     
-    model_config = PretrainConfig(max_seq_length=seq_len)
+    model_config = PretrainConfig(max_seq_length=config.max_seq_length)
     model_config.vocab_size = len(tokenizer.get_vocab())
     model = MoCoPretrainModel(config=model_config)
     
