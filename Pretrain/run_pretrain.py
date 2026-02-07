@@ -151,10 +151,8 @@ def debug_gpu(config: PretrainConfig = DEFAULT_CONFIG):
         config=config
     )
     
-    model_config = create_deberta_v3_config_from_pretrain_config(
-        vocab_size=len(tokenizer.get_vocab()),
-        pretrain_config=config
-    )
+    model_config = DEFAULT_CONFIG
+    model_config.vocab_size = len(tokenizer.get_vocab())
     model = BinDebertaV2ModelForPretrain(config=model_config)
     
     # 将模型移动到GPU并启用bf16
@@ -284,10 +282,8 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         config=config
     )
 
-    model_config = create_deberta_v3_config_from_pretrain_config(
-        vocab_size=len(tokenizer.get_vocab()),
-        pretrain_config=config
-    )
+    model_config = DEFAULT_CONFIG
+    model_config.vocab_size = len(tokenizer.get_vocab())
     model = BinDebertaV2ModelForPretrain(config=model_config)
     
     train_args = TrainingArguments(

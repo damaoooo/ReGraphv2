@@ -146,6 +146,9 @@ class GraphRoFormerLayer(RoFormerLayer):
     def forward(
         self,
         hidden_states,
+        cfg_u: torch.Tensor,
+        cfg_v: torch.Tensor,
+        ddg_edges: torch.Tensor,
         attention_mask=None,
         sinusoidal_pos=None,
         head_mask=None,
@@ -153,9 +156,7 @@ class GraphRoFormerLayer(RoFormerLayer):
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
-        cfg_u: Optional[torch.Tensor] = None,
-        cfg_v: Optional[torch.Tensor] = None,
-        ddg_edges: Optional[torch.Tensor] = None,
+        **kwargs
     ):
         if self.is_decoder:
             raise NotImplementedError("GraphRoFormerLayer does not support decoder mode.")
@@ -209,7 +210,10 @@ class GraphRoFormerModel(RoFormerPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor,
+        cfg_u: torch.Tensor,
+        cfg_v: torch.Tensor,
+        ddg_edges: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
@@ -222,9 +226,6 @@ class GraphRoFormerModel(RoFormerPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cfg_u: Optional[torch.Tensor] = None,
-        cfg_v: Optional[torch.Tensor] = None,
-        ddg_edges: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> BaseModelOutputWithPastAndCrossAttentions:
@@ -276,6 +277,7 @@ class GraphRoFormerModel(RoFormerPreTrainedModel):
                 cfg_u=cfg_u,
                 cfg_v=cfg_v,
                 ddg_edges=ddg_edges,
+                return_dict=return_dict,
             )
 
             hidden_states = layer_outputs[0]

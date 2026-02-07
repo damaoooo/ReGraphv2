@@ -34,6 +34,9 @@ class PretrainConfig(RoFormerConfig):
         warmup_steps: int = 1000,
         weight_decay: float = 0.01,
         optim: str = "paged_adamw_8bit",
+        moco_buffer_size: int = 65536,
+        moco_momentum: float = 0.999,
+        moco_temperature: float = 0.07,
         # === 保存配置 ===
         save_strategy: str = "steps",
         save_steps: int = 1000,
@@ -93,6 +96,11 @@ class PretrainConfig(RoFormerConfig):
         self.warmup_steps = warmup_steps
         self.weight_decay = weight_decay
         self.optim = optim
+        
+        # === MoCo 配置 ===
+        self.moco_buffer_size = moco_buffer_size
+        self.moco_momentum = moco_momentum
+        self.moco_temperature = moco_temperature
 
         # === 保存配置 ===
         self.save_strategy = save_strategy

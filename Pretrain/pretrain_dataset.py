@@ -291,7 +291,7 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
                 "labels": batch_q["labels"], # 只有 Query 有 MLM label
                 "cfg_u": u_q,
                 "cfg_v": v_q,
-                "ddg_graph": ddg_q,
+                "ddg_edges": ddg_q,
                 "group_ids": batch_group_ids_tensor # 传入 Ground Truth ID
             },
             "view2": {
@@ -300,7 +300,7 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
                 # Key 不需要 labels
                 "cfg_u": u_k,
                 "cfg_v": v_k,
-                "ddg_graph": ddg_k,
+                "ddg_edges": ddg_k,
                 "group_ids": batch_group_ids_tensor # Key 共享同一个 ID
             }
         }
