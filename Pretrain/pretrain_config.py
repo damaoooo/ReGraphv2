@@ -45,6 +45,12 @@ class PretrainConfig(RoFormerConfig):
         logging_strategy: str = "steps",
         logging_steps: int = 100,
         report_to: str = "tensorboard",
+        # === 断点续训配置 ===
+        resume_from_checkpoint: bool = True,
+        resume_checkpoint_path: Optional[str] = None,
+        # === 异常样本跳过配置 ===
+        skip_bad_batch: bool = True,
+        bad_batch_log_path: Optional[str] = None,
         # === 数据处理配置 ===
         dataloader_num_workers: Optional[int] = None,
         remove_unused_columns: bool = False,
@@ -111,6 +117,14 @@ class PretrainConfig(RoFormerConfig):
         self.logging_strategy = logging_strategy
         self.logging_steps = logging_steps
         self.report_to = report_to
+
+        # === 断点续训配置 ===
+        self.resume_from_checkpoint = resume_from_checkpoint
+        self.resume_checkpoint_path = resume_checkpoint_path
+
+        # === 异常样本跳过配置 ===
+        self.skip_bad_batch = skip_bad_batch
+        self.bad_batch_log_path = bad_batch_log_path
 
         # === 数据处理配置 ===
         if dataloader_num_workers is None:

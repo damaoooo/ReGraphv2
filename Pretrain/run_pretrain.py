@@ -1,6 +1,8 @@
 from Pretrain.pretrain_dataset import MoCoDataCollator, load_dataset
 from transformers import PreTrainedTokenizerFast, DataCollatorForLanguageModeling
 from transformers import Trainer, TrainingArguments
+from transformers.trainer_utils import get_last_checkpoint
+import traceback
 from transformers import BertForMaskedLM
 import os
 from .pretrain_model import MoCoPretrainModel
@@ -430,6 +432,38 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         config=config
     )
 
+    bad_batch_log_path = None
+    if config.skip_bad_batch:
+        if config.bad_batch_log_path:
+            bad_batch_log_path = config.bad_batch_log_path
+        else:
+            os.makedirs(config.output_dir, exist_ok=True)
+            bad_batch_log_path = os.path.join(config.output_dir, "bad_batches.log")
+
+        class SafeDataCollator:
+            def __init__(self, collator, log_path):
+                self.collator = collator
+                self.log_path = log_path
+
+            def __call__(self, examples):
+                try:
+                    return self.collator(examples)
+                except Exception as exc:
+                    if isinstance(examples, dict):
+                        anchor_indices = examples.get("anchor_idx", [])
+                    else:
+                        anchor_indices = [ex.get("anchor_idx") for ex in examples]
+                    msg = f"[BAD BATCH] anchor_idx={anchor_indices} error={exc}"
+                    print(msg)
+                    traceback.print_exc()
+                    if self.log_path:
+                        with open(self.log_path, "a") as f:
+                            f.write(msg + "\n")
+                            traceback.print_exc(file=f)
+                    return None
+
+        my_collator = SafeDataCollator(my_collator, bad_batch_log_path)
+
     model_config = PretrainConfig()
     model_config.vocab_size = len(tokenizer.get_vocab())
     model = MoCoPretrainModel(config=model_config)
@@ -457,32 +491,53 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         report_to=config.report_to,
     )
     model.gradient_checkpointing_enable()
-    trainer = Trainer(
+    class SafeTrainer(Trainer):
+        def __init__(self, *args, **kwargs):
+            self.bad_batch_log_path = kwargs.pop("bad_batch_log_path", None)
+            super().__init__(*args, **kwargs)
+            self.skipped_steps = 0
+
+        def training_step(self, model, inputs, num_items_in_batch=None):
+            if inputs is None:
+                self.skipped_steps += 1
+                return torch.tensor(0.0, device=self.args.device)
+            try:
+                return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+            except Exception as exc:
+                self.skipped_steps += 1
+                self.model.zero_grad(set_to_none=True)
+                msg = f"[SKIP STEP] step={self.state.global_step} error={exc}"
+                print(msg)
+                traceback.print_exc()
+                if self.bad_batch_log_path:
+                    with open(self.bad_batch_log_path, "a") as f:
+                        f.write(msg + "\n")
+                        traceback.print_exc(file=f)
+                return torch.tensor(0.0, device=self.args.device)
+
+    trainer_class = SafeTrainer if config.skip_bad_batch else Trainer
+    trainer = trainer_class(
         model=model,
         args=train_args,
         train_dataset=train_dataset_idx,
         data_collator=my_collator,
+        bad_batch_log_path=bad_batch_log_path,
     )
     
-    # 检查输出目录中是否存在检查点
-    # last_checkpoint = None
-    # if os.path.isdir(training_args.output_dir):
-    #     # 寻找最新的检查点文件夹
-    #     checkpoints = [d for d in os.listdir(training_args.output_dir) if d.startswith("checkpoint-")]
-    #     if checkpoints:
-    #         last_checkpoint = os.path.join(training_args.output_dir, max(checkpoints, key=lambda x: int(x.split('-')[-1])))
+    # 根据配置决定是否从检查点恢复
+    last_checkpoint = None
+    if config.resume_from_checkpoint:
+        if config.resume_checkpoint_path:
+            last_checkpoint = config.resume_checkpoint_path
+        elif os.path.isdir(train_args.output_dir):
+            last_checkpoint = get_last_checkpoint(train_args.output_dir)
 
-    # 方式一：自动从最新的检查点恢复
-    # 如果 output_dir 存在检查点，Trainer会自动从那里恢复
-    # 如果你想确保是这样，可以传入 resume_from_checkpoint=True
-    # train_result = trainer.train(resume_from_checkpoint=True)
-
-    # 方式二：从指定的检查点恢复
-    # train_result = trainer.train(resume_from_checkpoint=last_checkpoint)
-
-    # 如果是从头开始训练
-    print("Starting training...")
-    train_result = trainer.train()
+    if last_checkpoint:
+        print(f"Resuming from checkpoint: {last_checkpoint}")
+        train_result = trainer.train(resume_from_checkpoint=last_checkpoint)
+    else:
+        print("Starting training from scratch...")
+        train_result = trainer.train()
     print("Training finished.")
 
     # --- 训练完成后 ---

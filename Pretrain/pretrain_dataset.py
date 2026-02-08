@@ -315,6 +315,10 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
 
     def pad_graph(self, graph, feature_length: int = 4):
         max_edges = max(len(g) for g in graph)
+        if max_edges == 0:
+            # Keep a 3D shape [B, 1, feature_length] filled with -1
+            # so downstream indexing always sees a 3D tensor.
+            max_edges = 1
         padded_graphs = []
         for g in graph:
             padding_needed = max_edges - len(g)
