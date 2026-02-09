@@ -494,7 +494,6 @@ def main(
     gpu_batch_size: int = typer.Option(512, "--gpu-batch-size", help="GPU批量处理的锚点数量。"),
     tokenizer_path: Path = typer.Option(None, "--tokenizer-path", help="Tokenizer文件路径，如果与模型路径不同。"),
     svd_rank: int = typer.Option(32, "--svd-rank", help="CFG图SVD分解的秩（rank），需要与训练时保持一致。"),
-    embedding_size: int = typer.Option(768, "--embedding-size", help="对比学习嵌入向量维度，通常等于hidden_size。"),
     use_bf16: bool = typer.Option(False, "--bf16", help="将嵌入以BF16加载到GPU，减少显存与带宽开销。"),
 ):
     """
