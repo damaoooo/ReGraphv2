@@ -5,7 +5,7 @@ from transformers.trainer_utils import get_last_checkpoint
 import traceback
 from transformers import BertForMaskedLM
 import os
-from .pretrain_model import MoCoPretrainModel
+from .pretrain_model import MoCoPretrainModel, ReFormerPretrainModel
 import pickle
 import torch
 from torch.utils.data import DataLoader
@@ -279,6 +279,7 @@ def profile_extreme_seq_len_memory(
     seq_len: int = None,
     ddg_edges_per_sample: int = 64,
     run_backward: bool = True,
+    mem_probe: bool = False,
 ):
     print("--- Profiling GPU memory at max seq len ---")
 
@@ -294,7 +295,7 @@ def profile_extreme_seq_len_memory(
     print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
 
     if batch_sizes is None:
-        batch_sizes = [1, 2, 4, 8, 16]
+        batch_sizes = [1, 2, 4, 8, 16, 32, 64]
     if seq_len is None:
         seq_len = config.max_seq_length
 
@@ -302,11 +303,17 @@ def profile_extreme_seq_len_memory(
 
     model_config = PretrainConfig()
     model_config.vocab_size = len(tokenizer.get_vocab())
-    model = MoCoPretrainModel(config=model_config)
+    if run_backward:
+        model = MoCoPretrainModel(config=model_config)
+    else:
+        model = ReFormerPretrainModel(config=model_config)
     model = model.to(device)
-    if config.gradient_checkpointing:
+    if config.gradient_checkpointing and run_backward:
         model.gradient_checkpointing_enable()
-    model.train()
+    if run_backward:
+        model.train()
+    else:
+        model.eval()
 
     if config.bf16:
         autocast_dtype = torch.bfloat16
@@ -316,21 +323,23 @@ def profile_extreme_seq_len_memory(
         autocast_dtype = None
 
     scaler = None
-    if config.fp16:
-        scaler = torch.cuda.amp.GradScaler()
+    optimizer = None
+    if run_backward:
+        if config.fp16:
+            scaler = torch.cuda.amp.GradScaler()
 
-    def build_optimizer():
-        optim_name = (config.optim or "").lower()
-        if optim_name in {"paged_adamw_8bit", "adamw_8bit"}:
-            try:
-                import bitsandbytes as bnb
-            except Exception as exc:
-                print(f"bitsandbytes not available ({exc}); falling back to torch AdamW")
-                return torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-            return bnb.optim.AdamW8bit(model.parameters(), lr=config.learning_rate)
-        return torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+        def build_optimizer():
+            optim_name = (config.optim or "").lower()
+            if optim_name in {"paged_adamw_8bit", "adamw_8bit"}:
+                try:
+                    import bitsandbytes as bnb
+                except Exception as exc:
+                    print(f"bitsandbytes not available ({exc}); falling back to torch AdamW")
+                    return torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+                return bnb.optim.AdamW8bit(model.parameters(), lr=config.learning_rate)
+            return torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
 
-    optimizer = build_optimizer()
+        optimizer = build_optimizer()
 
     def build_dummy_view(batch_size: int, use_labels: bool) -> Dict[str, Any]:
         vocab_size = model_config.vocab_size
@@ -354,16 +363,16 @@ def profile_extreme_seq_len_memory(
             ddg_edges[:, :, 2] = dst
             ddg_edges[:, :, 3] = dst
 
-        group_ids = torch.arange(batch_size, device=device, dtype=torch.long)
-
         view = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "cfg_u": cfg_u,
             "cfg_v": cfg_v,
             "ddg_edges": ddg_edges,
-            "group_ids": group_ids,
         }
+        if run_backward:
+            group_ids = torch.arange(batch_size, device=device, dtype=torch.long)
+            view["group_ids"] = group_ids
         if labels is not None:
             view["labels"] = labels
         return view
@@ -374,14 +383,36 @@ def profile_extreme_seq_len_memory(
         torch.cuda.reset_peak_memory_stats()
 
         try:
-            view1 = build_dummy_view(batch_size, use_labels=True)
-            view2 = build_dummy_view(batch_size, use_labels=False)
+            if run_backward:
+                view1 = build_dummy_view(batch_size, use_labels=True)
+                view2 = build_dummy_view(batch_size, use_labels=False)
+            else:
+                view1 = build_dummy_view(batch_size, use_labels=False)
+                view2 = None
 
-            if autocast_dtype is not None:
-                with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+            if mem_probe:
+                mem_before_alloc = torch.cuda.memory_allocated() / 1024**2
+                mem_before_reserved = torch.cuda.memory_reserved() / 1024**2
+                print(f"Memory before forward: {mem_before_alloc:.2f} MB allocated, {mem_before_reserved:.2f} MB reserved")
+
+            if run_backward:
+                if autocast_dtype is not None:
+                    with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+                        outputs = model(view1, view2)
+                else:
                     outputs = model(view1, view2)
             else:
-                outputs = model(view1, view2)
+                with torch.inference_mode():
+                    if autocast_dtype is not None:
+                        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+                            outputs = model(**view1)
+                    else:
+                        outputs = model(**view1)
+
+            if mem_probe:
+                mem_after_alloc = torch.cuda.memory_allocated() / 1024**2
+                mem_after_reserved = torch.cuda.memory_reserved() / 1024**2
+                print(f"Memory after forward: {mem_after_alloc:.2f} MB allocated, {mem_after_reserved:.2f} MB reserved")
 
             if run_backward:
                 if scaler is not None:
@@ -392,6 +423,15 @@ def profile_extreme_seq_len_memory(
                     outputs["loss"].backward()
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+
+                if mem_probe:
+                    mem_after_backward_alloc = torch.cuda.memory_allocated() / 1024**2
+                    mem_after_backward_reserved = torch.cuda.memory_reserved() / 1024**2
+                    print(
+                        "Memory after backward: "
+                        f"{mem_after_backward_alloc:.2f} MB allocated, "
+                        f"{mem_after_backward_reserved:.2f} MB reserved"
+                    )
 
             max_allocated = torch.cuda.max_memory_allocated() / 1024**2
             max_reserved = torch.cuda.max_memory_reserved() / 1024**2
@@ -564,7 +604,12 @@ if __name__ == "__main__":
         elif mode == "debug_gpu":
             debug_gpu()
         elif mode == "profile_gpu_mem":
-            profile_extreme_seq_len_memory()
+            forward_only = "--forward-only" in sys.argv[2:]
+            mem_probe = "--mem-probe" in sys.argv[2:]
+            profile_extreme_seq_len_memory(
+                run_backward=not forward_only,
+                mem_probe=mem_probe,
+            )
         elif mode == "train":
             main()
         else:
@@ -572,6 +617,8 @@ if __name__ == "__main__":
             print("  debug_cpu  - Run CPU debugging")
             print("  debug_gpu  - Run GPU debugging")
             print("  profile_gpu_mem  - Profile GPU memory with full seq length dummy data")
+            print("    --forward-only  - Only run forward (inference) to measure memory")
+            print("    --mem-probe     - Print allocated/reserved memory before/after forward")
             print("  train      - Start training")
     else:
         # 默认运行CPU调试

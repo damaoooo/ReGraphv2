@@ -44,6 +44,12 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
         B, L, _ = hidden_states.shape
         
         # 处理DDG
+        
+        # If DDG is empty, skip the graph aggregation step
+        if len(ddg_edges.shape) == 2:
+            # If means DDG is empty, we can skip the graph aggregation step
+            ddg_edges = torch.full((B, 0, 4), -1, dtype=torch.long, device=hidden_states.device)
+        
         ddg_src = ddg_edges[:, :, 0:2]
         ddg_dst = ddg_edges[:, :, 2:4]
         edge_mask = (ddg_edges != -1).all(dim=-1)  # Shape: [B, max_edges]

@@ -5,23 +5,24 @@ from pathlib import Path
 from typing import List
 
 import numpy as np
-import requests
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.progress import track
 from rich.table import Table
-# --- 核心修正：引入 AutoTokenizer ---
-from transformers import AutoTokenizer, set_seed, AutoModel
+from transformers import set_seed
 from datasets import load_from_disk
 from Tokenizer.ir_tokenizer import load_tokenizer
 
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.dataloader import DataLoader
 from transformers import DataCollatorWithPadding
-import torch.nn.functional as F
-from Pretrain.pretrain_model import BinDebertaV2ModelForPretrain
+from Pretrain.pretrain_model import MoCoPretrainModel
+from Pretrain.pretrain_dataset import factorize_cfg_to_uv_batch
+from Pretrain.pretrain_config import PretrainConfig
 import torch
+from numba import njit, prange, types
+from numba.typed import Dict as NumbaDict
 
 # --- 设置 Rich 和 Typer ---
 logging.basicConfig(
@@ -34,30 +35,93 @@ app = typer.Typer(pretty_exceptions_show_locals=False)
 console = Console()
 
 # --- GPU加速支持 ---
-try:
-    import cupy as cp
-    GPU_AVAILABLE = True
-    console.print("[green]✓ GPU加速已启用 (CuPy)[/green]")
-except ImportError:
-    GPU_AVAILABLE = False
-    console.print("[yellow]⚠ 未安装CuPy，将使用CPU计算[/yellow]")
-    
-    
-class FunctioNDataset(Dataset):
-    def __init__(self, data):
-        self.data = data
+GPU_AVAILABLE = torch.cuda.is_available()
+if GPU_AVAILABLE:
+    console.print("[green]✓ GPU加速已启用 (PyTorch)[/green]")
+else:
+    console.print("[yellow]⚠ 未检测到可用GPU，将使用CPU计算[/yellow]")
 
-    def __len__(self):
-        return len(self.data)
 
-    def __getitem__(self, idx):
-        return self.data[idx]
+@njit
+def _floyd_sample(pop_size: int, sample_size: int) -> np.ndarray:
+    """Floyd算法：在O(k)时间内均匀采样k个不重复整数。"""
+    selected = NumbaDict.empty(key_type=types.int64, value_type=types.boolean)
+    for j in range(pop_size - sample_size, pop_size):
+        t = np.random.randint(0, j + 1)
+        if t in selected:
+            selected[j] = True
+        else:
+            selected[t] = True
+    out = np.empty(sample_size, dtype=np.int64)
+    idx = 0
+    for key in selected.keys():
+        out[idx] = key
+        idx += 1
+    return out
+
+
+@njit
+def _map_exclusions(compressed: np.ndarray, exclude_arr: np.ndarray) -> np.ndarray:
+    """把压缩空间索引映射回真实索引，保证排除表不被选中。"""
+    mapped = compressed.copy()
+    while True:
+        shift = np.searchsorted(exclude_arr, mapped, side="right")
+        new_mapped = compressed + shift
+        if np.all(new_mapped == mapped):
+            return new_mapped
+        mapped = new_mapped
+
+
+@njit
+def _sample_excluding(total_size: int, exclude_arr: np.ndarray, sample_size: int) -> np.ndarray:
+    """在排除表之外做均匀无放回采样，返回真实索引。"""
+    eligible_size = total_size - exclude_arr.size
+    if eligible_size < sample_size:
+        return np.empty(0, dtype=np.int64)
+    compressed = _floyd_sample(eligible_size, sample_size)
+    return _map_exclusions(compressed, exclude_arr)
+
+
+@njit(parallel=True)
+def _build_pools_parallel(anchor_batch: np.ndarray, pos_flat: np.ndarray, pos_offsets: np.ndarray, total_size: int, pool_size: int) -> np.ndarray:
+    """并行构建每个锚点的采样池（CPU多核）。"""
+    batch_size = anchor_batch.size
+    pools = np.full((batch_size, pool_size + 1), -1, dtype=np.int64)
+    for i in prange(batch_size):
+        anchor_idx = anchor_batch[i]
+        start = pos_offsets[anchor_idx]
+        end = pos_offsets[anchor_idx + 1]
+        pos_len = end - start
+        if pos_len <= 0:
+            # 没有正样本，跳过该样本
+            continue
+        else:
+            rand_idx = np.random.randint(start, end)
+            positive_anchor_idx = pos_flat[rand_idx]
+            exclude_arr = np.empty(pos_len + 1, dtype=np.int64)
+            exclude_arr[:pos_len] = pos_flat[start:end]
+            exclude_arr[pos_len] = anchor_idx
+            exclude_arr.sort()
+
+        mapped = _sample_excluding(total_size, exclude_arr, pool_size)
+        if mapped.size != pool_size:
+            # 候选池不足时，跳过该样本
+            continue
+
+        pools[i, 0] = positive_anchor_idx
+        pools[i, 1:] = mapped
+
+    return pools
+
+
+    
     
 class FunctionDataCollator:
     
-    def __init__(self, tokenizer, max_length=2048):
+    def __init__(self, tokenizer, max_length=2048, svd_rank=32):
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.svd_rank = svd_rank
         
     def __call__(self, batch: List):
         pad_collator = DataCollatorWithPadding(tokenizer=self.tokenizer, padding=True, pad_to_multiple_of=8)
@@ -80,18 +144,33 @@ class FunctionDataCollator:
         cfg_graphs = [batch_item['cfg_graph'] for batch_item in batch]
         ddg_graphs = [batch_item['ddg_graph'] for batch_item in batch]
         
-        # Pad graphs
-        cfg_graphs = self.pad_graph(cfg_graphs, feature_length=5)
-        ddg_graphs = self.pad_graph(ddg_graphs)
-        
-        cfg_graphs = torch.tensor(cfg_graphs, dtype=torch.long)
+        # Pad DDG graphs
+        ddg_graphs = self.pad_graph(ddg_graphs, feature_length=4)
         ddg_graphs = torch.tensor(ddg_graphs, dtype=torch.long)
+        
+        # Process CFG graphs: pad then apply UV decomposition
+        cfg_graphs_padded = self.pad_graph(cfg_graphs, feature_length=5)
+        cfg_tensor = torch.tensor(cfg_graphs_padded, dtype=torch.long)
+        
+        # If CFG graphs is empty, create a dummy tensor to avoid errors in UV decomposition
+        if cfg_tensor.shape[1] == 0:
+            cfg_tensor = torch.zeros((len(batch), 1, 5), dtype=torch.long)
+        
+        # Apply CFG UV decomposition
+        current_max_len = input_ids.shape[1]
+        cfg_u, cfg_v = factorize_cfg_to_uv_batch(
+            cfg_tensor,
+            rank=self.svd_rank,
+            total_seq_len=current_max_len,
+            device='cpu'
+        )
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "cfg_graphs": cfg_graphs,
-            "ddg_graphs": ddg_graphs,
+            "cfg_u": cfg_u,
+            "cfg_v": cfg_v,
+            "ddg_edges": ddg_graphs,
         }
 
     def pad_graph(self, graph, feature_length: int = 4):
@@ -103,48 +182,111 @@ class FunctionDataCollator:
             padded_graphs.append(padded_graph)
         return padded_graphs
     
-def get_model(model_path):
-    model = BinDebertaV2ModelForPretrain.from_pretrained(model_path, trust_remote_code=True)
-    return model
+def get_model(model_path, svd_rank=32, max_seq_length=4096, embedding_size=768):
+    """加载MoCo模型并返回encoder_q用于推理
+    
+    Args:
+        model_path: checkpoint目录路径
+        svd_rank: CFG图SVD分解的秩
+        max_seq_length: 最大序列长度
+        embedding_size: 对比学习嵌入向量维度（通常等于hidden_size）
+    
+    Returns:
+        encoder_q: 用于推理的query encoder
+    """
+    import os
+    
+    # 1. 创建配置（需要与训练时保持一致）
+    config = PretrainConfig(
+        max_seq_length=max_seq_length,
+        svd_rank=svd_rank,
+    )
+    
+    # 2. 设置vocab_size（从tokenizer获取）
+    # 这里需要确保与训练时使用的tokenizer一致
+    tokenizer = load_tokenizer(config.tokenizer_path)
+    config.vocab_size = len(tokenizer.get_vocab())
+    
+    # 3. 设置embedding_size（如果config中没有，手动添加）
+    if not hasattr(config, 'embedding_size'):
+        config.embedding_size = embedding_size
+    
+    # 4. 实例化MoCo模型
+    moco_model = MoCoPretrainModel(config)
+    
+    # 5. 加载权重文件
+    checkpoint_path = os.path.join(model_path, "pytorch_model.bin")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    
+    console.print(f"Loading checkpoint from: {checkpoint_path}")
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    moco_model.load_state_dict(state_dict)
+    console.print("[green]✓ Model loaded successfully[/green]")
+    
+    # 6. 在evaluation阶段只使用encoder_q进行推理
+    return moco_model.encoder_q
 
-def get_dataloader(dataset_path: Path, tokenizer, batch_size: int = 64, max_length: int = 2048) -> DataLoader:
+def get_dataloader(dataset_path: Path, tokenizer, batch_size: int = 64, max_length: int = 2048, svd_rank: int = 32) -> DataLoader:
     dataset = load_from_disk(str(dataset_path))
-    collator = FunctionDataCollator(tokenizer, max_length=max_length)
+    collator = FunctionDataCollator(tokenizer, max_length=max_length, svd_rank=svd_rank)
     dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,  # 每次只处理一个样本
+        batch_size=batch_size,
         collate_fn=collator,
+        num_workers=0,  # 禁用多进程避免数据缓冲
+        pin_memory=False,  # 禁用pin_memory减少内存占用
+        persistent_workers=False,
         shuffle=False,
     )
     return dataloader
     
 
 
-def generate_embeddings_with_model(dataset_path: Path, batch_size: int, tokenizer, model_path: str, max_length: int = 2048) -> np.ndarray:
+def generate_embeddings_with_model(dataset_path: Path, batch_size: int, tokenizer, model_path: str, max_length: int = 4096, svd_rank: int = 32, embedding_size: int = 768) -> np.ndarray:
     """
     使用本地模型为整个数据集生成嵌入向量。
     使用CUDA和bf16精度进行推理。
+    使用memmap避免内存爆炸。
     """
+    import psutil
+    import os
+    
     # 检查CUDA是否可用
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     console.print(f"Using device: {device}")
     
-    # 加载和设置模型
-    model = get_model(model_path=model_path)
+    # 加载和设置模型（encoder_q用于推理）
+    model = get_model(model_path=model_path, svd_rank=svd_rank, max_seq_length=max_length, embedding_size=embedding_size)
     model = model.to(device)
-    if device.type == "cuda":
-        model = model.to(torch.bfloat16)
+    model.eval()  # 设置为评估模式
     
-    console.print(f"Model device: {next(model.parameters()).device}")
-    console.print(f"Model dtype: {next(model.parameters()).dtype}")
+    # 使用bfloat16精度 - 不手动转换模型，而是使用autocast
+    use_bf16 = device.type == "cuda"
     
     # 创建DataLoader
-    dataloader = get_dataloader(dataset_path, tokenizer, batch_size=batch_size, max_length=max_length)
+    dataloader = get_dataloader(dataset_path, tokenizer, batch_size=batch_size, max_length=max_length, svd_rank=svd_rank)
 
-    all_embeddings = []
+    # 计算总样本数和embedding维度，提前创建memmap
+    total_samples = len(dataloader.dataset)
+    embedding_dim = embedding_size
+    
+    # 使用memmap替代list，避免内存峰值翻倍
+    import tempfile
+    temp_memmap = tempfile.NamedTemporaryFile(delete=False, suffix='.npy')
+    temp_memmap_path = temp_memmap.name
+    temp_memmap.close()
+    
+    all_embeddings = np.memmap(temp_memmap_path, dtype=np.float32, mode='w+', shape=(total_samples, embedding_dim))
+    failed_batches = []  # 记录失败的batch信息
     
     from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
     import time
+    
+    def get_memory_usage():
+        """获取当前进程的内存占用(MB)"""
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 * 1024)
     
     with Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -153,52 +295,112 @@ def generate_embeddings_with_model(dataset_path: Path, batch_size: int, tokenize
         TaskProgressColumn(),
         TextColumn("•"),
         TextColumn("[cyan]{task.fields[speed]:.1f} 函数/秒"),
+        TextColumn("[yellow]{task.fields[memory]:.0f}MB"),
         TimeRemainingColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("正在生成嵌入向量...", total=len(dataloader.dataset), speed=0.0)
+        task = progress.add_task("正在生成嵌入向量...", total=total_samples, speed=0.0, memory=0.0)
         
         start_time = time.time()
         processed_count = 0
+        batch_idx = 0
+        current_idx = 0  # 当前memmap写入位置
         
         for batch in dataloader:
+            batch_idx += 1
             # 将所有输入数据移动到CUDA
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            cfg_graphs = batch['cfg_graphs'].to(device)
-            ddg_graphs = batch['ddg_graphs'].to(device)
+            cfg_u = batch['cfg_u'].to(device)
+            cfg_v = batch['cfg_v'].to(device)
+            ddg_edges = batch['ddg_edges'].to(device)
             
             try:
-                with torch.no_grad():
-                    # 使用模型生成嵌入
-                    outputs = model.bindeberta(
-                        input_ids=input_ids, 
-                        attention_mask=attention_mask, 
-                        cfg_adj_list=cfg_graphs if len(cfg_graphs.shape) > 2 else None,
-                        ddg_adj_list=ddg_graphs if len(ddg_graphs.shape) > 2 else None,
-                    ).last_hidden_state[:, 0, :]  # 取CLS token的输出
-                    
-                    # L2归一化
-                    embeddings = F.normalize(outputs, p=2, dim=-1)
+                with torch.inference_mode():
+                    # 使用autocast自动管理混合精度
+                    if use_bf16:
+                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                            # 使用encoder_q生成嵌入（ReFormerPretrainModel的forward方法）
+                            outputs = model(
+                                input_ids=input_ids, 
+                                attention_mask=attention_mask, 
+                                cfg_u=cfg_u,
+                                cfg_v=cfg_v,
+                                ddg_edges=ddg_edges,
+                                return_dict=True
+                            )
+                            # 获取对比学习的嵌入向量（已经归一化）
+                            embeddings = outputs['embedding']
+                    else:
+                        # CPU模式，不使用autocast
+                        outputs = model(
+                            input_ids=input_ids, 
+                            attention_mask=attention_mask, 
+                            cfg_u=cfg_u,
+                            cfg_v=cfg_v,
+                            ddg_edges=ddg_edges,
+                            return_dict=True
+                        )
+                        embeddings = outputs['embedding']
                     
                     # 转换为CPU numpy数组
                     batch_embeddings = embeddings.cpu().float().numpy()
-                    all_embeddings.append(batch_embeddings)
+                    batch_size_actual = len(batch_embeddings)
+                    
+                    # 直接写入memmap，不保留在内存中
+                    all_embeddings[current_idx:current_idx + batch_size_actual] = batch_embeddings
+                    current_idx += batch_size_actual
                     
                     # 更新进度条和速度统计
-                    processed_count += len(batch_embeddings)
+                    processed_count += batch_size_actual
                     elapsed_time = time.time() - start_time
                     speed = processed_count / elapsed_time if elapsed_time > 0 else 0
-                    progress.update(task, advance=len(batch_embeddings), speed=speed)
+                    memory_usage = get_memory_usage()
+                    progress.update(task, advance=batch_size_actual, speed=speed, memory=memory_usage)
+                    
+                    # 显式删除临时变量
+                    del input_ids, attention_mask, cfg_u, cfg_v, ddg_edges
+                    del outputs, embeddings, batch_embeddings, batch
                     
             except Exception as e:
-                console.print(f"[bold red]错误: 模型推理失败: {e}[/bold red]")
-                raise typer.Exit(code=1)
+                batch_size_current = len(input_ids)
+                failed_batches.append({
+                    'batch_idx': batch_idx,
+                    'batch_size': batch_size_current,
+                    'error': str(e),
+                    'error_type': type(e).__name__
+                })
+                console.print(f"[bold yellow]⚠ Batch {batch_idx} 推理失败，已跳过 ({batch_size_current}个样本)[/bold yellow]")
+                console.print(f"[yellow]  错误类型: {type(e).__name__}[/yellow]")
+                console.print(f"[yellow]  错误信息: {str(e)}[/yellow]")
+                # 清理失败batch的变量
+                del input_ids, attention_mask, cfg_u, cfg_v, ddg_edges, batch
 
-    return np.vstack(all_embeddings)
+    # 输出失败统计信息
+    if failed_batches:
+        console.print(f"\n[bold yellow]⚠ 评估完成！共有 {len(failed_batches)} 个batch推理失败[/bold yellow]")
+        console.print(f"[yellow]失败的样本总数: {sum(b['batch_size'] for b in failed_batches)}[/yellow]")
+        console.print("\n[bold]失败batch详情:[/bold]")
+        for failure in failed_batches:
+            console.print(f"  Batch #{failure['batch_idx']}: {failure['error_type']} - {failure['error'][:100]}")
+    else:
+        console.print(f"\n[bold green]✓ 评估完成！所有batch推理成功[/bold green]")
+    
+    if current_idx == 0:
+        console.print("[bold red]ERROR: 没有成功的batch，无法返回结果[/bold red]")
+        # 清理临时文件
+        os.unlink(temp_memmap_path)
+        raise typer.Exit(code=1)
+    
+    # 将memmap内容转为普通numpy数组并返回（会自动清理临时文件）
+    result = np.array(all_embeddings[:current_idx], dtype=np.float32)
+    del all_embeddings
+    os.unlink(temp_memmap_path)
+    
+    return result
 
 
-def process_anchor_batch_gpu(all_embeddings, anchor_batch, positive_map, pool_sizes, k_values: List[int], use_gpu: bool = True) -> dict:
+def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets, pool_sizes, k_values: List[int], use_gpu: bool = True) -> dict:
     """
     处理锚点批次，计算与所有嵌入向量的相似度，并返回Recall@K结果。
     使用GPU加速计算相似度。
@@ -209,47 +411,50 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, positive_map, pool_si
         for k in k_values:
             recalls[pool_size][k] = [0, 0]  # 每次都创建新的列表
     
-    anchors = all_embeddings[anchor_batch]
     max_pool_size = max(pool_sizes)
     pool_size = max_pool_size - 1
-    pools = []
     batch_size = len(anchor_batch)
-    
-    for i in range(batch_size):
-        anchor_idx = anchor_batch[i]
-        positive = positive_map[anchor_idx]
-        positive_anchor_idx = random.choice(positive)
+    total_size = len(all_embeddings)
+    # 并行构建采样池（CPU多核）
+    anchor_batch_arr = np.asarray(anchor_batch, dtype=np.int64)
+    pools = _build_pools_parallel(anchor_batch_arr, pos_flat, pos_offsets, total_size, pool_size)
+    valid_mask = pools[:, 0] >= 0
+    if not np.any(valid_mask):
+        return recalls
+
+    pools = pools[valid_mask]
+    anchor_batch_arr = anchor_batch_arr[valid_mask]
+
+    if use_gpu:
+        device = all_embeddings.device
+        anchor_idx_tensor = torch.as_tensor(anchor_batch_arr, device=device, dtype=torch.long)
+        anchors = all_embeddings.index_select(0, anchor_idx_tensor)
+    else:
+        anchors = all_embeddings[anchor_batch_arr]
+    if use_gpu:
+        # 将索引放到GPU上，直接在GPU内存中gather，避免CPU->GPU大拷贝
+        pool_idx_tensor = torch.as_tensor(pools, device=device, dtype=torch.long)
+        embedding_pools = all_embeddings[pool_idx_tensor]
+        anchor_emb = anchors.unsqueeze(1)
+        similarities = torch.bmm(anchor_emb, embedding_pools.transpose(1, 2)).squeeze(1)
+    else:
+        embedding_pools = all_embeddings[pools]  # size: (batch_size, pool_size, embedding_dim)
+        anchor_emb = anchors[:, np.newaxis, :]
+        anchor_emb_t = torch.as_tensor(anchor_emb)
+        embedding_pools_t = torch.as_tensor(embedding_pools)
+        similarities = torch.bmm(anchor_emb_t, embedding_pools_t.transpose(1, 2)).squeeze(1)
+
+
         
-        while True:
-            # Sample the random Pool
-            candidate_indices = np.random.choice(len(all_embeddings), size=pool_size, replace=False)
-            candidate_indices_set = set(candidate_indices)
-            if positive_anchor_idx in candidate_indices_set or anchor_idx in candidate_indices_set:
-                continue
-            else:
-                batch_pool = np.concatenate(([positive_anchor_idx], candidate_indices))
-                pools.append(batch_pool)
-                break
-
-    pools = np.array(pools)
-    embedding_pools = all_embeddings[pools] # size: (batch_size, pool_size, embedding_dim)
-    anchor_emb = anchors[:, np.newaxis, :]  # size: (batch_size, 1, embedding_dim)
-    
-
-    anchor_emb_gpu = cp.asarray(anchor_emb)
-    embedding_pools_gpu = cp.asarray(embedding_pools)
-    similarities = cp.einsum('bij,bkj->bik', anchor_emb_gpu, embedding_pools_gpu)
-    similarities = cp.squeeze(similarities, axis=1)  # size: (batch_size, pool_size)
-
-
-        
-    # 计算Recall@K
+    # 计算Recall@K（不做全量排序，直接比较正样本得分排名）
     for pool_size in pool_sizes:
-        top_indices = cp.argsort(cp.argsort(-similarities[:, :pool_size], axis=1), axis=1)[:, 0] + 1
+        sim_slice = similarities[:, :pool_size]
+        pos_scores = sim_slice[:, 0].unsqueeze(1)
+        # 统计比正样本更大的个数，个数 < k 即表示正样本进入Top-K
+        count_greater = (sim_slice > pos_scores).sum(dim=1)
         for k in k_values:
-            success, total = 0, 0
-            success = (top_indices <= k).sum()
-            total = len(top_indices)
+            success = (count_greater < k).sum().item()
+            total = count_greater.numel()
             assert success <= total, f"Success count {success} cannot be greater than total {total}."
             recalls[pool_size][k][0] += success
             recalls[pool_size][k][1] += total
@@ -271,6 +476,9 @@ def main(
     use_gpu: bool = typer.Option(True, "--gpu/--no-gpu", help="是否使用GPU加速计算。"),
     gpu_batch_size: int = typer.Option(512, "--gpu-batch-size", help="GPU批量处理的锚点数量。"),
     tokenizer_path: Path = typer.Option(None, "--tokenizer-path", help="Tokenizer文件路径，如果与模型路径不同。"),
+    svd_rank: int = typer.Option(32, "--svd-rank", help="CFG图SVD分解的秩（rank），需要与训练时保持一致。"),
+    embedding_size: int = typer.Option(768, "--embedding-size", help="对比学习嵌入向量维度，通常等于hidden_size。"),
+    use_bf16: bool = typer.Option(False, "--bf16", help="将嵌入以BF16加载到GPU，减少显存与带宽开销。"),
 ):
     """
     在验证集上评估模型的函数检索性能 (Recall@K)，使用本地模型生成嵌入，GPU加速相似度计算。
@@ -305,7 +513,7 @@ def main(
     # --- 2. 生成或加载所有嵌入向量 ---
     if embeddings_path and embeddings_path.exists():
         logging.info(f"正在从 [cyan]{embeddings_path}[/cyan] 加载已缓存的嵌入向量...")
-        all_embeddings = np.load(embeddings_path)
+        all_embeddings = np.load(embeddings_path, mmap_mode='r')  # 使用mmap_mode避免全部加载到内存
         logging.info(f"嵌入向量加载完毕，形状为: [green]{all_embeddings.shape}[/green]")
     else:
         all_embeddings = generate_embeddings_with_model(
@@ -313,7 +521,8 @@ def main(
             batch_size=batch_size, 
             tokenizer=tokenizer, 
             model_path=str(model_path),
-            max_length=max_length
+            max_length=max_length,
+            svd_rank=svd_rank
         )
         logging.info(f"嵌入向量生成完毕，形状为: [green]{all_embeddings.shape}[/green]")
         
@@ -322,12 +531,20 @@ def main(
             embeddings_path.parent.mkdir(parents=True, exist_ok=True)
             np.save(embeddings_path, all_embeddings)
             logging.info("缓存完成。")
+            # 缓存后重新加载为memmap，释放内存
+            del all_embeddings
+            all_embeddings = np.load(str(embeddings_path) + '.npy', mmap_mode='r')
+            logging.info(f"已将嵌入向量切换为内存映射模式 (mmap)")
 
     # --- 3. GPU内存预处理 ---
     if use_gpu:
         logging.info("正在将嵌入向量转移到GPU...")
-        all_embeddings_gpu = cp.asarray(all_embeddings)
-        logging.info(f"GPU内存使用: {all_embeddings_gpu.nbytes / (1024**3):.2f} GB")
+        # 一次性把全部嵌入加载到GPU，避免每个batch的CPU->GPU拷贝
+        # memmap在mmap_mode='r'下是只读的，先拷贝为可写数组再转成Tensor
+        target_dtype = torch.bfloat16 if use_bf16 else torch.float32
+        all_embeddings_gpu = torch.from_numpy(np.array(all_embeddings, copy=True)).to("cuda", dtype=target_dtype, non_blocking=False)
+        dtype_label = "BF16" if use_bf16 else "FP32"
+        logging.info(f"[green]✓ 已将全部嵌入加载到GPU ({dtype_label}): {all_embeddings_gpu.nbytes / (1024**3):.2f} GB[/green]")
     else:
         all_embeddings_gpu = None
 
@@ -340,6 +557,16 @@ def main(
     max_k = max(k_values)
     results = {}
     
+    total_size = len(all_embeddings)
+    # 预处理正样本映射为扁平数组，便于numba并行访问
+    pos_offsets = np.zeros(total_size + 1, dtype=np.int64)
+    pos_flat_list = []
+    for idx in range(total_size):
+        positives = positive_map.get(idx, [])
+        pos_offsets[idx + 1] = pos_offsets[idx] + len(positives)
+        pos_flat_list.extend(positives)
+    pos_flat = np.asarray(pos_flat_list, dtype=np.int64)
+
     all_possible_anchors = list(positive_map.keys())
     if eval_samples > 0 and eval_samples < len(all_possible_anchors):
         logging.info(f"将从 {len(all_possible_anchors):,} 个可能的锚点中随机采样 [yellow]{eval_samples:,}[/yellow] 个进行评估...")
@@ -362,10 +589,11 @@ def main(
         result = process_anchor_batch_gpu(
             all_embeddings_gpu if use_gpu else all_embeddings,
             anchor_batch,
-            positive_map,
+            pos_flat,
+            pos_offsets,
             pool_sizes,
             k_values,
-            use_gpu=use_gpu
+            use_gpu=use_gpu,
         )
         # 累加结果
         for pool_size in pool_sizes:
