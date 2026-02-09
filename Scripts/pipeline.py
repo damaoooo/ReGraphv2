@@ -29,7 +29,6 @@ def run_task(script_name: str, args: list):
 @app.command()
 def task1(
     input_path: str = typer.Option("", help="Input directory (defaults to DataProcess-1)"),
-    ida_path: str = typer.Option("", help="Path to IDA Pro"),
     output: str = typer.Option(..., help="Output directory"),
     workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
     resume: bool = typer.Option(False, help="Resume from previous run"),
@@ -38,8 +37,6 @@ def task1(
     args = ["--output", output, "--workers", str(workers)]
     if input_path:
         args.extend(["--input-path", input_path])
-    if ida_path:
-        args.extend(["--ida-path", ida_path])
     if resume:
         args.append("--resume")
     
