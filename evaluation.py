@@ -407,9 +407,10 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets
     """
     recalls = {}
     for pool_size in pool_sizes:
-        recalls[pool_size] = {}
-        for k in k_values:
-            recalls[pool_size][k] = [0, 0]  # 每次都创建新的列表
+        recalls[pool_size] = {
+            "recall": {k: [0, 0] for k in k_values},
+        }
+    mrr_stats = {10: [0.0, 0], 30: [0.0, 0]}
     
     max_pool_size = max(pool_sizes)
     pool_size = max_pool_size - 1
@@ -446,6 +447,22 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets
 
 
         
+    # 计算MRR（在最大pool中取排名，超过阈值则记为0）
+    max_pool_size = similarities.shape[1]
+    mrr_sim_slice = similarities[:, :max_pool_size]
+    mrr_pos_scores = mrr_sim_slice[:, 0].unsqueeze(1)
+    mrr_count_greater = (mrr_sim_slice > mrr_pos_scores).sum(dim=1)
+    mrr_ranks = mrr_count_greater + 1
+    for cutoff in (10, 30):
+        mrr_cutoff = min(cutoff, max_pool_size)
+        mrr_scores = torch.where(
+            mrr_ranks <= mrr_cutoff,
+            1.0 / mrr_ranks.float(),
+            torch.zeros_like(mrr_ranks, dtype=torch.float),
+        )
+        mrr_stats[cutoff][0] += mrr_scores.sum().item()
+        mrr_stats[cutoff][1] += mrr_scores.numel()
+
     # 计算Recall@K（不做全量排序，直接比较正样本得分排名）
     for pool_size in pool_sizes:
         sim_slice = similarities[:, :pool_size]
@@ -456,10 +473,10 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets
             success = (count_greater < k).sum().item()
             total = count_greater.numel()
             assert success <= total, f"Success count {success} cannot be greater than total {total}."
-            recalls[pool_size][k][0] += success
-            recalls[pool_size][k][1] += total
+            recalls[pool_size]["recall"][k][0] += success
+            recalls[pool_size]["recall"][k][1] += total
 
-    return recalls
+    return recalls, mrr_stats
 
 
 @app.command()
@@ -581,12 +598,15 @@ def main(
     
     temp_results = {}
     for pool_size in pool_sizes:
-        temp_results[pool_size] = {k: [0, 0] for k in k_values}
+        temp_results[pool_size] = {
+            "recall": {k: [0, 0] for k in k_values},
+        }
+    total_mrr = {10: [0.0, 0], 30: [0.0, 0]}
     
     
     for i in track(range(0, len(anchors_to_evaluate), gpu_batch_size), description="正在评估..."):
         anchor_batch = anchors_to_evaluate[i:i + gpu_batch_size]
-        result = process_anchor_batch_gpu(
+        result, batch_mrr = process_anchor_batch_gpu(
             all_embeddings_gpu if use_gpu else all_embeddings,
             anchor_batch,
             pos_flat,
@@ -598,13 +618,22 @@ def main(
         # 累加结果
         for pool_size in pool_sizes:
             for k in k_values:
-                temp_results[pool_size][k][0] += result[pool_size][k][0]
-                temp_results[pool_size][k][1] += result[pool_size][k][1]
+                temp_results[pool_size]["recall"][k][0] += result[pool_size]["recall"][k][0]
+                temp_results[pool_size]["recall"][k][1] += result[pool_size]["recall"][k][1]
+        for cutoff in (10, 30):
+            total_mrr[cutoff][0] += batch_mrr[cutoff][0]
+            total_mrr[cutoff][1] += batch_mrr[cutoff][1]
                 
     # 将结果转换为百分比
     
     for pool_size in pool_sizes:
-        results[pool_size] = {f"Recall@{k}": temp_results[pool_size][k][0] / temp_results[pool_size][k][1] if temp_results[pool_size][k][1] > 0 else 0 for k in k_values}
+        recalls_result = {
+            f"Recall@{k}": temp_results[pool_size]["recall"][k][0] / temp_results[pool_size]["recall"][k][1]
+            if temp_results[pool_size]["recall"][k][1] > 0
+            else 0
+            for k in k_values
+        }
+        results[pool_size] = recalls_result
 
     # --- 6. 打印结果 ---
     console.rule("[bold green]评估结果[/bold green]")
@@ -618,6 +647,10 @@ def main(
         table.add_row(*row_data)
         
     console.print(table)
+    mrr10 = total_mrr[10][0] / total_mrr[10][1] if total_mrr[10][1] > 0 else 0
+    mrr30 = total_mrr[30][0] / total_mrr[30][1] if total_mrr[30][1] > 0 else 0
+    console.print(f"[bold green]MRR@10: {mrr10:.4f}[/bold green]")
+    console.print(f"[bold green]MRR@30: {mrr30:.4f}[/bold green]")
 
 
 if __name__ == "__main__":
