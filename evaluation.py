@@ -504,7 +504,7 @@ def main(
     
     # GPU可用性检查
     if use_gpu and not GPU_AVAILABLE:
-        console.print("[yellow]⚠ 请求使用GPU但CuPy不可用，将回退到CPU计算[/yellow]")
+        console.print("[yellow]⚠ 请求使用GPU但PyTorch CUDA不可用，将回退到CPU计算[/yellow]")
         use_gpu = False
     
     if use_gpu:
