@@ -213,6 +213,7 @@ def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs:
             console.print(f"[green]Loaded {len(valid_files)} valid files from cache.[/green]")
 
     else:
+        console.print("[yellow]Start to build the file and save to cache...[/yellow]")
         llvm_files = find_llvm_files(input_dir, pattern="**/*_functions/*.ll")
         llvm_files = [os.path.abspath(f) for f in llvm_files]
         

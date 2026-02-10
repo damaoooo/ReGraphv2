@@ -425,6 +425,7 @@ def main(
     if failed_count > 0:
         console.print("[yellow]To retry failed files, run with the same output directory[/yellow]")
         raise typer.Exit(code=1)
+    return True
 
 if __name__ == "__main__":
     app()

@@ -432,6 +432,16 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
         for index in range(mba.qty):
             res.append_basic_block(name = f"@{index}")
 
+        # Map IDA block start addresses to LLVM blocks for jump resolution.
+        res.block_by_ea = {}
+        for index in range(mba.qty):
+            ida_blk = mba.get_mblock(index)
+            blk_ea = getattr(ida_blk, "start_ea", None)
+            if blk_ea is None:
+                blk_ea = getattr(ida_blk, "start", None)
+            if blk_ea is not None:
+                res.block_by_ea[blk_ea] = res.blocks[index]
+
         ida_func_details = ida_typeinf.func_type_data_t()
         tif = lift_type_from_address(ea, pfunc) 
         tif.get_func_details(ida_func_details)
@@ -1204,8 +1214,23 @@ def _handle_conditional_jump(l, r, d, next_blk, cmp_op, builder, ida_insn, signe
         cond = builder.icmp_signed(cmp_op, l, r)
     else:
         cond = builder.icmp_unsigned(cmp_op, l, r)
-    
+
+    target_blk = _resolve_block_target(builder.block.parent, ida_insn.d)
+    if target_blk is not None:
+        d = target_blk
+    elif not isinstance(d, ir.Block) and next_blk is not None:
+        d = next_blk
+
     return builder.cbranch(cond, d, next_blk)
+
+def _resolve_block_target(func, mop):
+    if mop is None:
+        return None
+    if mop.t == ida_hexrays.mop_b:
+        return func.blocks[mop.b]
+    if mop.t == ida_hexrays.mop_v:
+        return getattr(func, "block_by_ea", {}).get(mop.g)
+    return None
 
 def _handle_float_binary_op(l, r, d, op_func, blk, builder, ida_insn):
     """
@@ -1424,7 +1449,19 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
     elif ida_insn.opcode == ida_hexrays.m_setle:  # 0x29,  setle l,  r, d=byte  SF!=OF | ZF=1 Less or Equal
         return _handle_comparison(l, r, d, "<=", blk, builder, ida_insn, signed=True)
     elif ida_insn.opcode == ida_hexrays.m_jcnd:  # 0x2A,  jcnd   l,    d   d is mop_v or mop_b
-        l = typecast(l, ir.IntType(1), builder)
+        # Ensure condition is i1 type for branch
+        if not isinstance(l.type, ir.IntType) or l.type.width != 1:
+            if isinstance(l.type, ir.IntType):
+                l = typecast(l, ir.IntType(1), builder)
+            else:
+                # Convert to int first then to i1
+                l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
+                l = builder.icmp_unsigned('!=', l, ir.Constant(ir.IntType(ida_insn.l.size*8), 0))
+        target_blk = _resolve_block_target(builder.block.parent, ida_insn.d)
+        if target_blk is not None:
+            d = target_blk
+        elif not isinstance(d, ir.Block) and next_blk is not None:
+            d = next_blk
         return builder.cbranch(l, d, next_blk)
     elif ida_insn.opcode == ida_hexrays.m_jnz:  # 0x2B,  jnz    l, r, d   ZF=0Not Equal *F
         return _handle_conditional_jump(l, r, d, next_blk, "!=", builder, ida_insn)
@@ -1459,7 +1496,14 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
     elif ida_insn.opcode == ida_hexrays.m_ijmp:  # 0x36,  ijmp  {r=sel, d=off}  indirect unconditional jump
         return
     elif ida_insn.opcode == ida_hexrays.m_goto:  # 0x37,  goto   l    l是mop_v或mop_b
-        return builder.branch(l)
+        target_blk = _resolve_block_target(builder.block.parent, ida_insn.l)
+        if target_blk is not None:
+            return builder.branch(target_blk)
+        if isinstance(l, ir.Block):
+            return builder.branch(l)
+        if next_blk is not None:
+            return builder.branch(next_blk)
+        return
     elif ida_insn.opcode == ida_hexrays.m_call:  # 0x38,  call   ld   l是mop_v或mop_b或mop_h
         rets, args = d
         if not isinstance(l.type, ir.PointerType) or not isinstance(l.type.pointee, ir.FunctionType):

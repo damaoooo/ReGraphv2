@@ -18,9 +18,7 @@ def main(
     max_seq_length: Annotated[int, typer.Option(help="Maximum sequence length.",rich_help_panel="Custom Arguments")] = 2048,
 ):
     
-    files = glob.glob(os.path.join(dataset_path, "*.parquet"))
-    dataset = datasets.Dataset.from_parquet(files)
-
+    dataset = datasets.load_from_disk(dataset_path)
     tokenizer = load_tokenizer(tokenizer_path)
 
     pad_token_id = tokenizer.pad_token_id

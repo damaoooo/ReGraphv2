@@ -241,8 +241,12 @@ def build_positive_indices(dataset: datasets.Dataset, base_path: str) -> Tuple[d
 
     grouped_by_dir_name = df.groupby('dir_name')
     processed_groups = []
+    if "Dataset-2-IR" in base_path:
+        # Base path add /../
+        base_path = os.path.abspath(os.path.join(base_path, ".."))
     for dir_name, group_content in tqdm(grouped_by_dir_name, desc="Mapping functions to original names"):
         csv_path = os.path.join(base_path, dir_name, 'function_map.csv')
+        # print(f"Processing directory: {dir_name} with base path: {base_path}, csv_path is: {csv_path}")
         try:
             hash_map_df = pd.read_csv(csv_path)
             hash_to_name_map = pd.Series(hash_map_df['OriginalFunctionName'].values, index=hash_map_df['HashedFileName']).to_dict()

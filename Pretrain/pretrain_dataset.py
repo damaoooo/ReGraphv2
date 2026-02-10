@@ -84,7 +84,7 @@ def factorize_cfg_to_uv_batch(edge_tensor, rank, total_seq_len=None, device='cpu
         real_rank = min(rank, num_blocks)
         # 大矩阵时使用近似 SVD 加速
         if num_blocks >= svd_lowrank_threshold and real_rank < num_blocks:
-            U_small, S_vals, V_small = torch.linalg.svd_lowrank(
+            U_small, S_vals, V_small = torch.svd_lowrank(
                 B_tilde, q=real_rank, niter=2
             )
         else:

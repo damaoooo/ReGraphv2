@@ -549,7 +549,7 @@ def main(
             logging.info("缓存完成。")
             # 缓存后重新加载为memmap，释放内存
             del all_embeddings
-            all_embeddings = np.load(str(embeddings_path) + '.npy', mmap_mode='r')
+            all_embeddings = np.load(str(embeddings_path), mmap_mode='r')
             logging.info(f"已将嵌入向量切换为内存映射模式 (mmap)")
 
     # --- 3. GPU内存预处理 ---
