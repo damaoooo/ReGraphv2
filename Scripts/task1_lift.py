@@ -122,6 +122,10 @@ def main(
     output: str = typer.Option(..., help="Output directory"),
     workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
     resume: bool = typer.Option(False, help="Resume from previous run, skip existing files"),
+    start_from_step2: bool = typer.Option(
+        False,
+        help="Start directly from Step 2 (scan .i64 and lift), skip Step 1 .i64 generation",
+    ),
 ):
     """
     Lift binary files to LLVM IR using IDA Pro (Two-step process).
@@ -155,7 +159,7 @@ def main(
     separator = "="*60
     logger.info(separator)
     logger.info(f"Task 1 started at {datetime.now()}")
-    logger.info(f"Workers: {workers}, Resume: {resume}")
+    logger.info(f"Workers: {workers}, Resume: {resume}, StartFromStep2: {start_from_step2}")
     logger.info(separator)
     
     # Determine input path
@@ -184,122 +188,128 @@ def main(
     console.print(f"[green]Log file: {LOG_PATH}[/green]")
     if resume:
         console.print(f"[yellow]Resume mode: skipping existing lifted files[/yellow]")
+    if start_from_step2:
+        console.print(f"[yellow]Start from Step 2: skipping .i64 generation[/yellow]")
     console.print()
     
     logger.info(f"Input path: {db_path}")
     logger.info(f"Output path: {output_path}")
 
-    # Step 1: Generate .i64 files from binaries
-    console.print("[bold blue]Step 1: Scanning for binary files to generate .i64...[/bold blue]")
-    
-    # Clean any failed IDA files first
-    files_to_remove = []
-    for root, dirs, files in os.walk(db_path):
-        for file in files:
-            if file.endswith((".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm")):
-                files_to_remove.append(os.path.join(root, file))
-    for f in files_to_remove:
-        try:
-            os.remove(f)
-            logger.info(f"Removed failed IDA file: {f}")
-        except Exception as e:
-            logger.warning(f"Could not remove {f}: {str(e)}")
-    
-    # Scan for binary files (non-IDA files) that need .i64 generation
-    i64_tasks = []
-    i64_skipped_count = 0
-    
-    for root, dirs, files in os.walk(db_path):
-        for file in files:
-            # Skip IDA database files and other temporary files
-            if file.endswith((".i64", ".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm", ".ll", ".bc")):
-                continue
-            
-            # Skip hidden files and common non-binary files
-            if file.startswith(".") or file.endswith((".txt", ".log", ".md", ".py", ".sh")):
-                continue
-                
-            file_path = os.path.join(root, file)
-            i64_path = file_path + ".i64"
-            
-            # Always skip if .i64 already exists
-            if file_exists_and_not_empty(i64_path):
-                i64_skipped_count += 1
-                continue
-                
-            i64_tasks.append(file_path)
-    
-    if i64_skipped_count > 0:
-        console.print(f"[yellow]Skipping {i64_skipped_count} binaries with existing .i64 files[/yellow]")
-    
-    total_i64_tasks = len(i64_tasks)
-    if total_i64_tasks > 0:
-        console.print(f"[bold blue]Found {total_i64_tasks} binary files to process[/bold blue]")
-        console.print()
+    # Step 1: Generate .i64 files from binaries (optional)
+    if not start_from_step2:
+        console.print("[bold blue]Step 1: Scanning for binary files to generate .i64...[/bold blue]")
         
-        logger.info(f"Found {total_i64_tasks} binary files for .i64 generation")
+        # Clean any failed IDA files first
+        files_to_remove = []
+        for root, dirs, files in os.walk(db_path):
+            for file in files:
+                if file.endswith((".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm")):
+                    files_to_remove.append(os.path.join(root, file))
+        for f in files_to_remove:
+            try:
+                os.remove(f)
+                logger.info(f"Removed failed IDA file: {f}")
+            except Exception as e:
+                logger.warning(f"Could not remove {f}: {str(e)}")
+        
+        # Scan for binary files (non-IDA files) that need .i64 generation
+        i64_tasks = []
+        i64_skipped_count = 0
+        
+        for root, dirs, files in os.walk(db_path):
+            for file in files:
+                # Skip IDA database files and other temporary files
+                if file.endswith((".i64", ".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm", ".ll", ".bc")):
+                    continue
+                
+                # Skip hidden files and common non-binary files
+                if file.startswith(".") or file.endswith((".txt", ".log", ".md", ".py", ".sh")):
+                    continue
+                    
+                file_path = os.path.join(root, file)
+                i64_path = file_path + ".i64"
+                
+                # Always skip if .i64 already exists
+                if file_exists_and_not_empty(i64_path):
+                    i64_skipped_count += 1
+                    continue
+                    
+                i64_tasks.append(file_path)
+        
         if i64_skipped_count > 0:
-            logger.info(f"Skipping {i64_skipped_count} binaries with existing .i64 files")
+            console.print(f"[yellow]Skipping {i64_skipped_count} binaries with existing .i64 files[/yellow]")
         
-        # Generate .i64 files in parallel
-        i64_success_count = 0
-        i64_failed_count = 0
-        i64_failed_files = []
-        
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("[{task.completed}/{task.total}]"),
-            TimeElapsedColumn(),
-            console=console
-        ) as progress:
-            i64_task = progress.add_task(
-                "[cyan]Generating .i64 files using IDA Pro", 
-                total=total_i64_tasks
-            )
+        total_i64_tasks = len(i64_tasks)
+        if total_i64_tasks > 0:
+            console.print(f"[bold blue]Found {total_i64_tasks} binary files to process[/bold blue]")
+            console.print()
             
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                # Submit all i64 generation tasks
-                future_to_binary = {
-                    executor.submit(generate_i64, binary_path): binary_path
-                    for binary_path in i64_tasks
-                }
+            logger.info(f"Found {total_i64_tasks} binary files for .i64 generation")
+            if i64_skipped_count > 0:
+                logger.info(f"Skipping {i64_skipped_count} binaries with existing .i64 files")
             
-                # Process completed tasks as they finish
-                for future in as_completed(future_to_binary):
-                    binary_path = future_to_binary[future]
-                    try:
-                        success, _ = future.result()
-                        if success:
-                            i64_success_count += 1
-                            logger.debug(f"Successfully generated .i64: {binary_path}")
-                        else:
+            # Generate .i64 files in parallel
+            i64_success_count = 0
+            i64_failed_count = 0
+            i64_failed_files = []
+            
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TextColumn("[{task.completed}/{task.total}]"),
+                TimeElapsedColumn(),
+                console=console
+            ) as progress:
+                i64_task = progress.add_task(
+                    "[cyan]Generating .i64 files using IDA Pro", 
+                    total=total_i64_tasks
+                )
+                
+                with ProcessPoolExecutor(max_workers=workers) as executor:
+                    # Submit all i64 generation tasks
+                    future_to_binary = {
+                        executor.submit(generate_i64, binary_path): binary_path
+                        for binary_path in i64_tasks
+                    }
+                
+                    # Process completed tasks as they finish
+                    for future in as_completed(future_to_binary):
+                        binary_path = future_to_binary[future]
+                        try:
+                            success, _ = future.result()
+                            if success:
+                                i64_success_count += 1
+                                logger.debug(f"Successfully generated .i64: {binary_path}")
+                            else:
+                                i64_failed_count += 1
+                                i64_failed_files.append(binary_path)
+                                console.print(f"[red]✗ Failed: {os.path.basename(binary_path)}[/red]")
+                                logger.error(f"Failed to generate .i64: {binary_path}")
+                        except Exception as exc:
                             i64_failed_count += 1
                             i64_failed_files.append(binary_path)
-                            console.print(f"[red]✗ Failed: {os.path.basename(binary_path)}[/red]")
-                            logger.error(f"Failed to generate .i64: {binary_path}")
-                    except Exception as exc:
-                        i64_failed_count += 1
-                        i64_failed_files.append(binary_path)
-                        error_msg = f"Exception for {binary_path}: {str(exc)}"
-                        console.print(f"[red]✗ Exception: {os.path.basename(binary_path)} - {str(exc)[:100]}[/red]")
-                        logger.error(error_msg)
-                        logger.error(f"Traceback:\n{traceback.format_exc()}")
-                    finally:
-                        progress.update(i64_task, advance=1)
-        
-        console.print()
-        console.print(f"[bold cyan]Step 1 Summary:[/bold cyan]")
-        console.print(f"[bold green]✓ .i64 files generated: {i64_success_count}[/bold green]")
-        if i64_failed_count > 0:
-            console.print(f"[bold red]✗ Failed: {i64_failed_count}[/bold red]")
-        console.print()
-        
-        logger.info(f"Step 1 Summary: Success={i64_success_count}, Failed={i64_failed_count}")
+                            error_msg = f"Exception for {binary_path}: {str(exc)}"
+                            console.print(f"[red]✗ Exception: {os.path.basename(binary_path)} - {str(exc)[:100]}[/red]")
+                            logger.error(error_msg)
+                            logger.error(f"Traceback:\n{traceback.format_exc()}")
+                        finally:
+                            progress.update(i64_task, advance=1)
+            
+            console.print()
+            console.print(f"[bold cyan]Step 1 Summary:[/bold cyan]")
+            console.print(f"[bold green]✓ .i64 files generated: {i64_success_count}[/bold green]")
+            if i64_failed_count > 0:
+                console.print(f"[bold red]✗ Failed: {i64_failed_count}[/bold red]")
+            console.print()
+            
+            logger.info(f"Step 1 Summary: Success={i64_success_count}, Failed={i64_failed_count}")
+        else:
+            console.print(f"[yellow]No binary files need .i64 generation (skipped: {i64_skipped_count})[/yellow]")
+            console.print()
     else:
-        console.print(f"[yellow]No binary files need .i64 generation (skipped: {i64_skipped_count})[/yellow]")
+        console.print("[bold blue]Step 1: Skipped .i64 generation[/bold blue]")
         console.print()
 
     console.print("[bold blue]Step 2: Scanning for .i64 files to lift to LLVM IR...[/bold blue]")

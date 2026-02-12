@@ -8,13 +8,13 @@ import os
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Union, Any
 import json
-import argparse
 import csv
 import collections
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import threading
 
+import typer
 from datasets import Dataset, DatasetDict
 from datasets import load_dataset
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
@@ -395,37 +395,30 @@ class LLVMIRCorpusBuilder:
                 self.console.print(f"  [dim]... and {len(self.stats['failed_list']) - 10} more[/dim]")
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Build LLVM IR corpus for BPE tokenization')
-    parser.add_argument('--input_dir', '-i', required=True, 
-                       help='Input directory containing LLVM IR files')
-    parser.add_argument('--output_dir', '-o', default='llvm_corpus',
-                       help='Output directory for corpus')
-    parser.add_argument('--max_files', '-m', type=int, default=None,
-                       help='Maximum number of files to process (for testing)')
-    parser.add_argument('--name', '-n', default='llvm_ir_corpus',
-                       help='Name of the corpus dataset')
-    parser.add_argument('--processes', '-p', type=int, default=None,
-                       help='Number of processes to use (default: CPU count)')
-    
-    args = parser.parse_args()
-    
+def main(
+    input_dir: str = typer.Option(..., "--input-dir", "-i", help="Input directory containing LLVM IR files"),
+    output_dir: str = typer.Option("llvm_corpus", "--output-dir", "-o", help="Output directory for corpus"),
+    max_files: Optional[int] = typer.Option(None, "--max-files", "-m", help="Maximum number of files to process (for testing)"),
+    name: str = typer.Option("llvm_ir_corpus", "--name", "-n", help="Name of the corpus dataset"),
+    processes: Optional[int] = typer.Option(None, "--processes", "-p", help="Number of processes to use (default: CPU count)"),
+):
+    """Build LLVM IR corpus for BPE tokenization"""
     console = Console()
     
     # Create corpus builder
     builder = LLVMIRCorpusBuilder(
-        args.input_dir, 
-        args.output_dir, 
-        num_processes=args.processes
+        input_dir, 
+        output_dir, 
+        num_processes=processes
     )
     
     # Build corpus
     console.print(f"[bold yellow]Building corpus with {builder.num_processes} processes...[/bold yellow]")
-    dataset = builder.build_corpus(max_files=args.max_files)
+    dataset = builder.build_corpus(max_files=max_files)
     
     if dataset:
         # Save corpus
-        builder.save_corpus(dataset, args.name)
+        builder.save_corpus(dataset, name)
         
         # Print statistics
         builder.print_stats()
@@ -441,4 +434,4 @@ def main():
 if __name__ == "__main__":
     # 多进程保护
     mp.set_start_method('spawn', force=True)
-    main()
+    typer.run(main)

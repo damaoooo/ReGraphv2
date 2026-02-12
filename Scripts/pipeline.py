@@ -32,6 +32,10 @@ def task1(
     output: str = typer.Option(..., help="Output directory"),
     workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
     resume: bool = typer.Option(False, help="Resume from previous run"),
+    start_from_step2: bool = typer.Option(
+        False,
+        help="Start directly from Step 2 (scan .i64 and lift), skip Step 1",
+    ),
 ):
     """Run Task 1: Lift binary files to LLVM IR"""
     args = ["--output", output, "--workers", str(workers)]
@@ -39,6 +43,8 @@ def task1(
         args.extend(["--input-path", input_path])
     if resume:
         args.append("--resume")
+    if start_from_step2:
+        args.append("--start-from-step2")
     
     success = run_task("task1_lift.py", args)
     if success:
@@ -92,6 +98,10 @@ def pipeline(
     workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
     resume: bool = typer.Option(False, help="Resume from previous run"),
     start_from: int = typer.Option(1, help="Start from task number (1, 2, or 3)"),
+    task1_start_from_step2: bool = typer.Option(
+        False,
+        help="Task 1: start directly from Step 2 (scan .i64 and lift), skip Step 1",
+    ),
 ):
     """Run the complete pipeline or start from a specific task"""
     
@@ -129,6 +139,8 @@ def pipeline(
             args.extend(["--ida-path", ida_path])
         if resume:
             args.append("--resume")
+        if task1_start_from_step2:
+            args.append("--start-from-step2")
         
         if not run_task("task1_lift.py", args):
             console.print("[bold red]Task 1 failed! Pipeline stopped.[/bold red]")
