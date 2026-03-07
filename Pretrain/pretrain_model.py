@@ -27,14 +27,20 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
         
         # self.lm_head 已经在 super().__init__ 中初始化好了
 
+    def get_input_embeddings(self):
+        return self.roformer.embeddings.word_embeddings
+
+    def set_input_embeddings(self, value):
+        self.roformer.embeddings.word_embeddings = value
+
 
     def forward(
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.FloatTensor,
-        cfg_u: torch.FloatTensor,
-        cfg_v: torch.FloatTensor,
-        ddg_edges: torch.LongTensor,
+        cfg_u: Optional[torch.FloatTensor] = None,
+        cfg_v: Optional[torch.FloatTensor] = None,
+        ddg_edges: Optional[torch.LongTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         return_dict: Optional[bool] = None,
         **kwargs
@@ -43,9 +49,12 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # 图张量不需要梯度，直接 detach
-        cfg_u = cfg_u.detach()
-        cfg_v = cfg_v.detach()
-        ddg_edges = ddg_edges.detach()
+        if cfg_u is not None:
+            cfg_u = cfg_u.detach()
+        if cfg_v is not None:
+            cfg_v = cfg_v.detach()
+        if ddg_edges is not None:
+            ddg_edges = ddg_edges.detach()
 
         # 1. Backbone Forward (融入 CFG/DDG)
         outputs = self.roformer(

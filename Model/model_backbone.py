@@ -31,48 +31,52 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
         self.embed_positions = RoFormerSinusoidalPositionalEmbedding(
             config.max_position_embeddings, self.head_dim
         )
+        graph_mode = getattr(config, "graph_mode", "both")
+        self.use_cfg = graph_mode in {"both", "no_ddg"}
+        self.use_ddg = graph_mode in {"both", "no_cfg"}
 
     def forward(
         self, 
         hidden_states: torch.Tensor, 
-        cfg_u: torch.Tensor, # Shape: [B, S, Rank]
-        cfg_v: torch.Tensor, # Shape: [B, S, Rank]
-        ddg_edges: torch.Tensor,
+        cfg_u: Optional[torch.Tensor] = None, # Shape: [B, S, Rank]
+        cfg_v: Optional[torch.Tensor] = None, # Shape: [B, S, Rank]
+        ddg_edges: Optional[torch.Tensor] = None,
         **kwargs
     ) -> torch.Tensor:
         # input: [batch, seq, dim]
         B, L, _ = hidden_states.shape
         
-        # 处理DDG
-        
-        # If DDG is empty, skip the graph aggregation step
-        if len(ddg_edges.shape) == 2:
-            # If means DDG is empty, we can skip the graph aggregation step
-            ddg_edges = torch.full((B, 0, 4), -1, dtype=torch.long, device=hidden_states.device)
-        
-        ddg_src = ddg_edges[:, :, 0:2]
-        ddg_dst = ddg_edges[:, :, 2:4]
-        edge_mask = (ddg_edges != -1).all(dim=-1)  # Shape: [B, max_edges]
+        if self.use_ddg:
+            if ddg_edges is None:
+                raise ValueError("ddg_edges is required when DDG is enabled.")
 
-        # X <- X + Avg(Parents)  (用 start 位置作为节点代表)
-        src_pos = ddg_src[:, :, 0].clamp(min=0)  # Shape: [B, max_edges]
-        dst_pos = ddg_dst[:, :, 0].clamp(min=0)  # Shape: [B, max_edges]
+            # If DDG is empty, skip the graph aggregation step
+            if len(ddg_edges.shape) == 2:
+                ddg_edges = torch.full((B, 0, 4), -1, dtype=torch.long, device=hidden_states.device)
 
-        parent_feat = hidden_states.gather(
-            1, src_pos.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
-        )
-        parent_feat = parent_feat * edge_mask.unsqueeze(-1)
+            ddg_src = ddg_edges[:, :, 0:2]
+            ddg_dst = ddg_edges[:, :, 2:4]
+            edge_mask = (ddg_edges != -1).all(dim=-1)  # Shape: [B, max_edges]
 
-        agg = torch.zeros_like(hidden_states)
-        agg.scatter_add_(
-            1, dst_pos.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1)), parent_feat
-        )
+            # X <- X + Avg(Parents)  (用 start 位置作为节点代表)
+            src_pos = ddg_src[:, :, 0].clamp(min=0)  # Shape: [B, max_edges]
+            dst_pos = ddg_dst[:, :, 0].clamp(min=0)  # Shape: [B, max_edges]
 
-        deg = torch.zeros(B, L, device=hidden_states.device, dtype=hidden_states.dtype)
-        deg.scatter_add_(1, dst_pos, edge_mask.to(hidden_states.dtype))
-        deg = deg.clamp_min(1.0)
+            parent_feat = hidden_states.gather(
+                1, src_pos.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
+            )
+            parent_feat = parent_feat * edge_mask.unsqueeze(-1)
 
-        hidden_states = hidden_states + agg / deg.unsqueeze(-1)
+            agg = torch.zeros_like(hidden_states)
+            agg.scatter_add_(
+                1, dst_pos.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1)), parent_feat
+            )
+
+            deg = torch.zeros(B, L, device=hidden_states.device, dtype=hidden_states.dtype)
+            deg.scatter_add_(1, dst_pos, edge_mask.to(hidden_states.dtype))
+            deg = deg.clamp_min(1.0)
+
+            hidden_states = hidden_states + agg / deg.unsqueeze(-1)
 
         q: torch.Tensor = self.query(hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2) # Shape: [B, num_heads, S, head_dim]
         k: torch.Tensor = self.key(hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
@@ -107,12 +111,15 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
             v = apply_rope(v, sin, cos)
         
         
-        # put CFG
         d = self.head_dim
         q_rot /= d ** 0.25
         k_rot /= d ** 0.25
-        q_rot = torch.concat([q_rot, cfg_u.unsqueeze(1).expand(-1, self.num_heads, -1, -1)], dim=-1)
-        k_rot = torch.concat([k_rot, cfg_v.unsqueeze(1).expand(-1, self.num_heads, -1, -1)], dim=-1)
+
+        if self.use_cfg:
+            if cfg_u is None or cfg_v is None:
+                raise ValueError("cfg_u and cfg_v are required when CFG is enabled.")
+            q_rot = torch.concat([q_rot, cfg_u.unsqueeze(1).expand(-1, self.num_heads, -1, -1)], dim=-1)
+            k_rot = torch.concat([k_rot, cfg_v.unsqueeze(1).expand(-1, self.num_heads, -1, -1)], dim=-1)
 
         # --- 核心：Flash Attention + Graph Bias ---
         # 注意：attn_mask 在 SDPA 里通常是加法 mask (0 是保留，-inf 是遮蔽/bias)
@@ -148,13 +155,16 @@ class GraphRoFormerLayer(RoFormerLayer):
         super().__init__(config)
         # 替换掉原本慢吞吞的 SelfAttention，换成咱们的 Flash 版
         self.attention.self = GraphFlashRoFormerSelfAttention(config)
+        graph_mode = getattr(config, "graph_mode", "both")
+        self.use_cfg = graph_mode in {"both", "no_ddg"}
+        self.use_ddg = graph_mode in {"both", "no_cfg"}
 
     def forward(
         self,
         hidden_states,
-        cfg_u: torch.Tensor,
-        cfg_v: torch.Tensor,
-        ddg_edges: torch.Tensor,
+        cfg_u: Optional[torch.Tensor] = None,
+        cfg_v: Optional[torch.Tensor] = None,
+        ddg_edges: Optional[torch.Tensor] = None,
         attention_mask=None,
         sinusoidal_pos=None,
         head_mask=None,
@@ -166,8 +176,10 @@ class GraphRoFormerLayer(RoFormerLayer):
     ):
         if self.is_decoder:
             raise NotImplementedError("GraphRoFormerLayer does not support decoder mode.")
-        if cfg_u is None or cfg_v is None or ddg_edges is None:
-            raise ValueError("cfg_u, cfg_v, and ddg_edges are required for GraphRoFormerLayer.")
+        if self.use_cfg and (cfg_u is None or cfg_v is None):
+            raise ValueError("cfg_u and cfg_v are required for GraphRoFormerLayer when CFG is enabled.")
+        if self.use_ddg and ddg_edges is None:
+            raise ValueError("ddg_edges is required for GraphRoFormerLayer when DDG is enabled.")
 
         self_attention_output = self.attention.self(
             hidden_states,
@@ -197,6 +209,9 @@ class GraphRoFormerModel(RoFormerPreTrainedModel):
     def __init__(self, config: RoFormerConfig):
         super().__init__(config)
         self.config = config
+        graph_mode = getattr(config, "graph_mode", "both")
+        self.use_cfg = graph_mode in {"both", "no_ddg"}
+        self.use_ddg = graph_mode in {"both", "no_cfg"}
         
         # 验证配置参数
         if not hasattr(config, 'num_hidden_layers') or config.num_hidden_layers <= 0:
@@ -217,9 +232,9 @@ class GraphRoFormerModel(RoFormerPreTrainedModel):
     def forward(
         self,
         input_ids: torch.Tensor,
-        cfg_u: torch.Tensor,
-        cfg_v: torch.Tensor,
-        ddg_edges: torch.Tensor,
+        cfg_u: Optional[torch.Tensor] = None,
+        cfg_v: Optional[torch.Tensor] = None,
+        ddg_edges: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
@@ -237,8 +252,10 @@ class GraphRoFormerModel(RoFormerPreTrainedModel):
     ) -> BaseModelOutputWithPastAndCrossAttentions:
         if input_ids is None and inputs_embeds is None:
             raise ValueError("You must provide input_ids or inputs_embeds.")
-        if cfg_u is None or cfg_v is None or ddg_edges is None:
-            raise ValueError("cfg_u, cfg_v, and ddg_edges are required for GraphRoFormerModel.")
+        if self.use_cfg and (cfg_u is None or cfg_v is None):
+            raise ValueError("cfg_u and cfg_v are required for GraphRoFormerModel when CFG is enabled.")
+        if self.use_ddg and ddg_edges is None:
+            raise ValueError("ddg_edges is required for GraphRoFormerModel when DDG is enabled.")
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions

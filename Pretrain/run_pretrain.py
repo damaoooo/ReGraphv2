@@ -1,18 +1,173 @@
-from Pretrain.pretrain_dataset import MoCoDataCollator, load_dataset
-from transformers import PreTrainedTokenizerFast, DataCollatorForLanguageModeling
-from transformers import Trainer, TrainingArguments
-from transformers.trainer_utils import get_last_checkpoint
 import traceback
-from transformers import BertForMaskedLM
 import os
+import copy
 from .pretrain_model import MoCoPretrainModel, ReFormerPretrainModel
 import pickle
 import torch
-from torch.utils.data import DataLoader
+import typer
+from transformers import Trainer, TrainingArguments
+from transformers.trainer_utils import get_last_checkpoint
+from Pretrain.pretrain_dataset import MoCoDataCollator, load_dataset
 from Tokenizer.ir_tokenizer import load_tokenizer
-from Model.model_backbone import GraphRoFormerModel
 from .pretrain_config import PretrainConfig, DEFAULT_CONFIG
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Callable
+
+try:
+    import bitsandbytes as bnb  # type: ignore
+except Exception:
+    bnb = None
+
+GRAPH_MODES = ("both", "no_cfg", "no_ddg", "none")
+app = typer.Typer(add_completion=False, no_args_is_help=False)
+
+
+def _clone_model_config(config: PretrainConfig, vocab_size: int) -> PretrainConfig:
+    model_config = copy.deepcopy(config)
+    model_config.vocab_size = vocab_size
+    return model_config
+
+
+def _append_graph_mode_suffix(path: str, graph_mode: str) -> str:
+    if path.endswith(f"_{graph_mode}"):
+        return path
+    return f"{path}_{graph_mode}"
+
+
+def _run_debug_all_modes(config: PretrainConfig, runner: Callable[[PretrainConfig], None], runner_name: str):
+    print(f"--- Running {runner_name} across graph modes: {GRAPH_MODES} ---")
+    results = {}
+
+    for graph_mode in GRAPH_MODES:
+        mode_config = copy.deepcopy(config)
+        mode_config.graph_mode = graph_mode
+        print(f"\n=== [{runner_name}] graph_mode={graph_mode} ===")
+        try:
+            runner(mode_config)
+            results[graph_mode] = "PASS"
+        except Exception as exc:
+            results[graph_mode] = f"FAIL: {exc}"
+            print(f"[{runner_name}] graph_mode={graph_mode} failed: {exc}")
+            traceback.print_exc()
+
+    print(f"\n--- {runner_name} summary ---")
+    for graph_mode in GRAPH_MODES:
+        print(f"{graph_mode}: {results[graph_mode]}")
+
+    failed = [m for m, status in results.items() if not status.startswith("PASS")]
+    if failed:
+        raise RuntimeError(f"{runner_name} failed for modes: {failed}")
+
+
+def _resolve_debug_vocab_size(config: PretrainConfig) -> int:
+    try:
+        tokenizer = load_tokenizer(config.tokenizer_path)
+        return len(tokenizer.get_vocab())
+    except Exception as exc:
+        fallback = int(getattr(config, "vocab_size", 0) or 0)
+        if fallback <= 0:
+            fallback = 32000
+        print(f"Tokenizer load failed in debug mode ({exc}), fallback vocab_size={fallback}")
+        return fallback
+
+
+def _build_dummy_view(
+    batch_size: int,
+    seq_len: int,
+    vocab_size: int,
+    model_config: PretrainConfig,
+    device: torch.device,
+    use_labels: bool,
+    ddg_edges_per_sample: int = 64,
+) -> Dict[str, Any]:
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.long)
+
+    cfg_u = None
+    cfg_v = None
+    ddg_edges = None
+
+    if model_config.use_cfg:
+        cfg_u = torch.randn(batch_size, seq_len, model_config.svd_rank, device=device)
+        cfg_v = torch.randn(batch_size, seq_len, model_config.svd_rank, device=device)
+
+    if model_config.use_ddg:
+        max_edges = min(ddg_edges_per_sample, seq_len)
+        ddg_edges = torch.full((batch_size, max_edges, 4), -1, device=device, dtype=torch.long)
+        if max_edges > 0:
+            src = torch.arange(max_edges, device=device)
+            dst = (src + 1) % seq_len
+            ddg_edges[:, :, 0] = src
+            ddg_edges[:, :, 1] = src
+            ddg_edges[:, :, 2] = dst
+            ddg_edges[:, :, 3] = dst
+
+    view = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "cfg_u": cfg_u,
+        "cfg_v": cfg_v,
+        "ddg_edges": ddg_edges,
+        "group_ids": torch.arange(batch_size, device=device, dtype=torch.long),
+    }
+
+    if use_labels:
+        view["labels"] = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+
+    return view
+
+
+def _debug_with_dummy_batch(config: PretrainConfig, use_gpu: bool):
+    mode_name = "GPU" if use_gpu else "CPU"
+    print(f"--- Running in debug mode ({mode_name}, synthetic batch) ---")
+
+    if use_gpu and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available. Cannot run GPU debug.")
+
+    device = torch.device("cuda" if use_gpu else "cpu")
+    seq_len = min(config.max_seq_length, 512)
+    batch_size = 1 if use_gpu else 2
+
+    vocab_size = _resolve_debug_vocab_size(config)
+    model_config = _clone_model_config(config, vocab_size)
+    model = MoCoPretrainModel(config=model_config).to(device)
+    if config.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    model.train()
+
+    view1 = _build_dummy_view(batch_size, seq_len, vocab_size, model_config, device, use_labels=True)
+    view2 = _build_dummy_view(batch_size, seq_len, vocab_size, model_config, device, use_labels=False)
+
+    print(f"graph_mode={config.graph_mode}, seq_len={seq_len}, batch_size={batch_size}, device={device}")
+
+    if use_gpu and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_allocated() / 1024**2
+        print(f"GPU memory before forward: {before:.2f} MB")
+
+    try:
+        if use_gpu and config.bf16:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                outputs = model(view1, view2)
+        elif use_gpu and config.fp16:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                outputs = model(view1, view2)
+        else:
+            outputs = model(view1, view2)
+
+        print("Forward pass successful")
+        print(f"Loss: {outputs['loss'].item():.6f}")
+
+        outputs["loss"].backward()
+        print("Backward pass successful")
+
+        if use_gpu and torch.cuda.is_available():
+            after = torch.cuda.memory_allocated() / 1024**2
+            print(f"GPU memory after backward: {after:.2f} MB")
+            print(f"GPU memory delta: {after - before:.2f} MB")
+    finally:
+        if use_gpu and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print("GPU cache cleared")
 
 def compute_group_ids(data: Dict[int, List[int]]) -> Dict[int, int]:
     key_to_group_id = {}
@@ -33,244 +188,11 @@ def compute_group_ids(data: Dict[int, List[int]]) -> Dict[int, int]:
     return key_to_group_id
 
 def debug_cpu(config: PretrainConfig = DEFAULT_CONFIG):
-    print("--- Running in debug mode ---")
-    
-    tokenizer = load_tokenizer(config.tokenizer_path)
-    
-    train_dataset_pool = load_dataset(config.train_dataset_pool_path)
-    
-    train_dataset_idx = load_dataset(config.train_dataset_idx_path)
-    
-    with open(config.train_dataset_map_path, 'rb') as f:
-        train_positive_map = pickle.load(f)
-    
-    train_positive_map_group_ids = compute_group_ids(train_positive_map)
-    
-    my_collator = MoCoDataCollator(
-        tokenizer=tokenizer, 
-        dataset_pool=train_dataset_pool, 
-        map_file=train_positive_map,
-        group_id_mapping=train_positive_map_group_ids,
-        config=config
-    )
-    
-    model_config = PretrainConfig(max_seq_length=config.max_seq_length)
-    model_config.vocab_size = len(tokenizer.get_vocab())
-    model = MoCoPretrainModel(config=model_config)
-    
-    # 将模型设置为评估模式，这会关闭 dropout 等只在训练时使用的层
-    model.train()
-    
-    # ---------------------------------------------------------------
-    # 【补全部分】
-    # ---------------------------------------------------------------
-    
-    # 1. 使用 PyTorch 的 DataLoader 来创建数据批次。
-    #    这能很好地模拟 Trainer 内部的工作方式。
-    #    - dataset: 我们用刚刚加载的 train_dataset_idx
-    #    - batch_size: 设置一个小的批次大小，比如 4
-    #    - collate_fn: 这是关键，我们使用自定义的 my_collator
-    debug_dataloader = DataLoader(
-        dataset=train_dataset_idx,
-        batch_size=4,
-        collate_fn=my_collator,
-        shuffle=False # 调试时通常不需要打乱
-    )
-
-    # 2. 从 dataloader 中获取一个批次的数据
-    print("Attempting to create one batch from the dataloader...")
-    try:
-        # 使用 iter 和 next 来安全地获取第一个（也是唯一一个我们需要的）批次
-        one_batch = next(iter(debug_dataloader))
-        print("Successfully created one batch.")
-    except Exception as e:
-        import traceback
-        traceback.print_exc() # 打印详细的错误堆栈
-        print(f"Error creating batch: {e}")
-        # 如果数据整理器(collator)有错，这里通常会抛出异常
-        return
-
-    # 3. 检查批次数据的结构和形状 (非常重要的调试步骤)
-    print("\n--- Batch Content (Keys and Shapes) ---")
-    for view_name, view_data in one_batch.items():
-        print(f"\n{view_name}:")
-        for key, value in view_data.items():
-            if torch.is_tensor(value):
-                print(f"  Key: '{key}', Shape: {value.shape}, Dtype: {value.dtype}")
-            else:
-                print(f"  Key: '{key}', Type: {type(value)}")
-        
-    # 4. 在 CPU 上运行模型的前向传播
-    #    模型默认是在CPU上初始化的，所以不需要 .to('cpu')
-    #    数据批次也应该在CPU上
-    print("\n--- Running Model Forward Pass on CPU ---")
-    try:
-        # 使用 **one_batch 将字典解包为模型的关键字参数
-        # e.g., model(input_ids=..., attention_mask=..., ...)
-        outputs = model(**one_batch)
-        
-        print("Model forward pass successful!")
-        
-        # 5. 检查模型输出
-        print("\n--- Model Output ---")
-        print("Output keys:", outputs.keys())
-        if 'loss' in outputs:
-            print(f"Loss: {outputs['loss'].item()}") # .item() 从 tensor 中提取纯数值
-        if 'logits' in outputs:
-            print(f"Logits shape: {outputs.logits.shape}")
-        outputs['loss'].backward()  # 计算梯度
-        print("Backward pass successful!")
-
-    except Exception as e:
-        print(f"Error during model forward pass: {e}")
-        # 如果模型内部逻辑有问题，例如维度不匹配，这里会报错
-        import traceback
-        traceback.print_exc() # 打印详细的错误堆栈
-
-    print("\n--- Debug mode finished ---")
+    _debug_with_dummy_batch(config, use_gpu=False)
 
 
 def debug_gpu(config: PretrainConfig = DEFAULT_CONFIG):
-    print("--- Running in debug mode (GPU) ---")
-    
-    import torch
-    
-    # 检查GPU是否可用
-    if not torch.cuda.is_available():
-        print("CUDA is not available. Cannot run GPU debug.")
-        return
-    
-    device = torch.device("cuda")
-    print(f"Using device: {device}")
-    print(f"GPU device name: {torch.cuda.get_device_name(0)}")
-    print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-    
-    tokenizer = load_tokenizer(config.tokenizer_path)
-    
-    train_dataset_pool = load_dataset(config.train_dataset_pool_path)
-    
-    train_dataset_idx = load_dataset(config.train_dataset_idx_path)
-    
-    with open(config.train_dataset_map_path, 'rb') as f:
-        train_positive_map = pickle.load(f)
-        
-    group_id_mapping = compute_group_ids(train_positive_map)
-    
-    my_collator = MoCoDataCollator(
-        tokenizer=tokenizer, 
-        dataset_pool=train_dataset_pool, 
-        map_file=train_positive_map,
-        group_id_mapping=group_id_mapping,
-        config=config
-    )
-    
-    model_config = PretrainConfig()
-    model_config.vocab_size = len(tokenizer.get_vocab())
-    model = MoCoPretrainModel(config=model_config)
-    
-    # 将模型移动到GPU并启用bf16
-    model = model.to(device)
-    
-    # 启用gradient checkpointing以节省显存
-    model.gradient_checkpointing_enable()
-    
-    # 启用bf16以节省显存
-    from torch.cuda.amp import autocast
-    model.train()
-    
-    print(f"Model moved to {device}")
-    print("BF16 enabled for memory efficiency")
-    
-    # 使用 PyTorch 的 DataLoader 来创建数据批次
-    debug_dataloader = DataLoader(
-        dataset=train_dataset_idx,
-        batch_size=1,  # 使用bf16后可以稍微增加批次大小
-        collate_fn=my_collator,
-        shuffle=False
-    )
-
-    # 从 dataloader 中获取一个批次的数据
-    print("Attempting to create one batch from the dataloader...")
-    try:
-        one_batch = next(iter(debug_dataloader))
-        print("Successfully created one batch.")
-    except Exception as e:
-        print(f"Error creating batch: {e}")
-        return
-
-    # 将批次数据移动到GPU
-    print("\n--- Moving batch to GPU ---")
-    try:
-        one_batch_gpu = {}
-        for view_name, view_data in one_batch.items():
-            one_batch_gpu[view_name] = {}
-            for key, value in view_data.items():
-                if torch.is_tensor(value):
-                    one_batch_gpu[view_name][key] = value.to(device)
-                else:
-                    one_batch_gpu[view_name][key] = value
-        print("Batch successfully moved to GPU")
-    except Exception as e:
-        print(f"Error moving batch to GPU: {e}")
-        return
-
-    # 检查批次数据的结构和形状
-    print("\n--- Batch Content (Keys and Shapes) ---")
-    for view_name, view_data in one_batch_gpu.items():
-        print(f"\n{view_name}:")
-        for key, value in view_data.items():
-            if torch.is_tensor(value):
-                print(f"  Key: '{key}', Shape: {value.shape}, Dtype: {value.dtype}, Device: {value.device}")
-            else:
-                print(f"  Key: '{key}', Type: {type(value)}")
-        
-    # 在 GPU 上运行模型的前向传播 (使用bf16)
-    print("\n--- Running Model Forward Pass on GPU with BF16 ---")
-    try:
-        # 清空GPU缓存
-        torch.cuda.empty_cache()
-        
-        # 记录GPU内存使用情况
-        if torch.cuda.is_available():
-            memory_before = torch.cuda.memory_allocated() / 1024**2  # MB
-            print(f"GPU memory before forward pass: {memory_before:.2f} MB")
-        
-        # 使用autocast进行bf16计算
-        with autocast(dtype=torch.bfloat16):
-            outputs = model(**one_batch_gpu)
-        
-        print("Model forward pass successful with BF16!")
-        
-        # 检查模型输出
-        print("\n--- Model Output ---")
-        print("Output keys:", outputs.keys())
-        if 'loss' in outputs:
-            print(f"Loss: {outputs['loss'].item()}")
-            print(f"Loss dtype: {outputs['loss'].dtype}")
-        if 'logits' in outputs:
-            print(f"Logits shape: {outputs.logits.shape}")
-            print(f"Logits device: {outputs.logits.device}")
-            print(f"Logits dtype: {outputs.logits.dtype}")
-        
-        # 反向传播 (loss会自动转换回float32进行梯度计算)
-        outputs['loss'].backward()
-        print("Backward pass successful!")
-        
-        # 记录GPU内存使用情况
-        if torch.cuda.is_available():
-            memory_after = torch.cuda.memory_allocated() / 1024**2  # MB
-            print(f"GPU memory after forward+backward pass: {memory_after:.2f} MB")
-            print(f"Memory increase: {memory_after - memory_before:.2f} MB")
-
-    except Exception as e:
-        print(f"Error during model forward pass: {e}")
-        import traceback
-        traceback.print_exc()
-        
-    finally:
-        # 清理GPU内存
-        torch.cuda.empty_cache()
-        print("GPU cache cleared")
+    _debug_with_dummy_batch(config, use_gpu=True)
 
 
 def profile_extreme_seq_len_memory(
@@ -282,8 +204,6 @@ def profile_extreme_seq_len_memory(
     mem_probe: bool = False,
 ):
     print("--- Profiling GPU memory at max seq len ---")
-
-    import torch
 
     if not torch.cuda.is_available():
         print("CUDA is not available. Cannot profile GPU memory.")
@@ -301,8 +221,7 @@ def profile_extreme_seq_len_memory(
 
     tokenizer = load_tokenizer(config.tokenizer_path)
 
-    model_config = PretrainConfig()
-    model_config.vocab_size = len(tokenizer.get_vocab())
+    model_config = _clone_model_config(config, len(tokenizer.get_vocab()))
     if run_backward:
         model = MoCoPretrainModel(config=model_config)
     else:
@@ -331,10 +250,8 @@ def profile_extreme_seq_len_memory(
         def build_optimizer():
             optim_name = (config.optim or "").lower()
             if optim_name in {"paged_adamw_8bit", "adamw_8bit"}:
-                try:
-                    import bitsandbytes as bnb
-                except Exception as exc:
-                    print(f"bitsandbytes not available ({exc}); falling back to torch AdamW")
+                if bnb is None:
+                    print("bitsandbytes not available; falling back to torch AdamW")
                     return torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
                 return bnb.optim.AdamW8bit(model.parameters(), lr=config.learning_rate)
             return torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
@@ -349,19 +266,25 @@ def profile_extreme_seq_len_memory(
         if use_labels:
             labels = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
 
-        cfg_u = torch.randn(batch_size, seq_len, model_config.svd_rank, device=device)
-        cfg_v = torch.randn(batch_size, seq_len, model_config.svd_rank, device=device)
+        cfg_u = None
+        cfg_v = None
+        ddg_edges = None
 
-        max_edges = min(ddg_edges_per_sample, seq_len)
-        ddg_edges = torch.full((batch_size, max_edges, 4), -1, device=device, dtype=torch.long)
-        if max_edges > 0:
-            src = torch.arange(max_edges, device=device)
-            dst = (src + 1) % seq_len
-            # Use valid in-range indices and pad the rest with -1
-            ddg_edges[:, :, 0] = src
-            ddg_edges[:, :, 1] = src
-            ddg_edges[:, :, 2] = dst
-            ddg_edges[:, :, 3] = dst
+        if model_config.use_cfg:
+            cfg_u = torch.randn(batch_size, seq_len, model_config.svd_rank, device=device)
+            cfg_v = torch.randn(batch_size, seq_len, model_config.svd_rank, device=device)
+
+        if model_config.use_ddg:
+            max_edges = min(ddg_edges_per_sample, seq_len)
+            ddg_edges = torch.full((batch_size, max_edges, 4), -1, device=device, dtype=torch.long)
+            if max_edges > 0:
+                src = torch.arange(max_edges, device=device)
+                dst = (src + 1) % seq_len
+                # Use valid in-range indices and pad the rest with -1
+                ddg_edges[:, :, 0] = src
+                ddg_edges[:, :, 1] = src
+                ddg_edges[:, :, 2] = dst
+                ddg_edges[:, :, 3] = dst
 
         view = {
             "input_ids": input_ids,
@@ -448,7 +371,6 @@ def profile_extreme_seq_len_memory(
 
 
 def main(config: PretrainConfig = DEFAULT_CONFIG):
-    
     tokenizer = load_tokenizer(config.tokenizer_path)
     
     train_dataset_pool = load_dataset(config.train_dataset_pool_path)
@@ -472,13 +394,17 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         config=config
     )
 
+    output_dir = _append_graph_mode_suffix(config.output_dir, config.graph_mode)
+    logging_dir = _append_graph_mode_suffix(config.logging_dir, config.graph_mode)
+    final_model_dir = _append_graph_mode_suffix(config.final_model_dir, config.graph_mode)
+
     bad_batch_log_path = None
     if config.skip_bad_batch:
         if config.bad_batch_log_path:
             bad_batch_log_path = config.bad_batch_log_path
         else:
-            os.makedirs(config.output_dir, exist_ok=True)
-            bad_batch_log_path = os.path.join(config.output_dir, "bad_batches.log")
+            os.makedirs(output_dir, exist_ok=True)
+            bad_batch_log_path = os.path.join(output_dir, "bad_batches.log")
 
         class SafeDataCollator:
             def __init__(self, collator, log_path):
@@ -504,12 +430,11 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
 
         my_collator = SafeDataCollator(my_collator, bad_batch_log_path)
 
-    model_config = PretrainConfig()
-    model_config.vocab_size = len(tokenizer.get_vocab())
+    model_config = _clone_model_config(config, len(tokenizer.get_vocab()))
     model = MoCoPretrainModel(config=model_config)
     
     train_args = TrainingArguments(
-        output_dir=config.output_dir,
+        output_dir=output_dir,
         max_steps=config.max_steps,  # 使用 max_steps 而不是 num_train_epochs
         per_device_train_batch_size=config.per_device_train_batch_size,
         fp16=config.fp16,
@@ -517,7 +442,7 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         remove_unused_columns=config.remove_unused_columns,
         dataloader_num_workers=config.dataloader_num_workers,
         torch_compile=config.torch_compile,
-        logging_dir=config.logging_dir,
+        logging_dir=logging_dir,
         learning_rate=config.learning_rate,
         warmup_steps=config.warmup_steps,
         weight_decay=config.weight_decay,
@@ -584,8 +509,8 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
 
     # 保存最终的模型、分词器和配置
     # 这会创建一个干净的、可以被 from_pretrained 加载的最终模型文件夹
-    trainer.save_model(config.final_model_dir)
-    tokenizer.save_pretrained(config.final_model_dir)
+    trainer.save_model(final_model_dir)
+    tokenizer.save_pretrained(final_model_dir)
 
     # 记录训练过程中的一些指标
     metrics = train_result.metrics
@@ -594,32 +519,60 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
     trainer.save_state() # 保存Trainer的状态，包括随机种子等
 
 
-if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1:
-        mode = sys.argv[1].lower()
-        if mode == "debug_cpu":
-            debug_cpu()
-        elif mode == "debug_gpu":
-            debug_gpu()
-        elif mode == "profile_gpu_mem":
-            forward_only = "--forward-only" in sys.argv[2:]
-            mem_probe = "--mem-probe" in sys.argv[2:]
-            profile_extreme_seq_len_memory(
-                run_backward=not forward_only,
-                mem_probe=mem_probe,
-            )
-        elif mode == "train":
-            main()
-        else:
-            print("Usage: python run_pretrain.py [debug_cpu|debug_gpu|profile_gpu_mem|train]")
-            print("  debug_cpu  - Run CPU debugging")
-            print("  debug_gpu  - Run GPU debugging")
-            print("  profile_gpu_mem  - Profile GPU memory with full seq length dummy data")
-            print("    --forward-only  - Only run forward (inference) to measure memory")
-            print("    --mem-probe     - Print allocated/reserved memory before/after forward")
-            print("  train      - Start training")
+@app.callback(invoke_without_command=True)
+def cli(ctx: typer.Context):
+    """Pretrain CLI. Default behavior is `debug cpu all`."""
+    if ctx.invoked_subcommand is None:
+        _run_debug_all_modes(DEFAULT_CONFIG, debug_cpu, "debug_cpu")
+
+
+@app.command("debug")
+def debug_command(
+    device: str = typer.Argument("cpu", help="Run on cpu or gpu."),
+    graph_mode: str = typer.Argument("all", help="all or one of both/no_cfg/no_ddg/none."),
+):
+    device = device.lower()
+    graph_mode = graph_mode.lower()
+
+    if device not in {"cpu", "gpu"}:
+        raise typer.BadParameter("device must be one of: cpu, gpu")
+    if graph_mode != "all" and graph_mode not in GRAPH_MODES:
+        raise typer.BadParameter(f"graph_mode must be all/{'/'.join(GRAPH_MODES)}")
+
+    runner: Callable[[PretrainConfig], None] = debug_cpu if device == "cpu" else debug_gpu
+    runner_name = f"debug_{device}"
+
+    if graph_mode == "all":
+        _run_debug_all_modes(DEFAULT_CONFIG, runner, runner_name)
     else:
-        # 默认运行CPU调试
-        debug_gpu()
+        mode_config = copy.deepcopy(DEFAULT_CONFIG)
+        mode_config.graph_mode = graph_mode
+        runner(mode_config)
+
+
+@app.command("profile-gpu-mem")
+def profile_gpu_mem_command(
+    forward_only: bool = typer.Option(False, "--forward-only", help="Only run forward pass."),
+    mem_probe: bool = typer.Option(False, "--mem-probe", help="Print allocated/reserved memory info."),
+):
+    profile_extreme_seq_len_memory(
+        run_backward=not forward_only,
+        mem_probe=mem_probe,
+    )
+
+
+@app.command("train")
+def train_command(
+    graph_mode: str = typer.Option("both", "--graph-mode", help="both/no_cfg/no_ddg/none"),
+):
+    graph_mode = graph_mode.lower()
+    if graph_mode not in GRAPH_MODES:
+        raise typer.BadParameter(f"graph_mode must be one of: {'/'.join(GRAPH_MODES)}")
+
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config.graph_mode = graph_mode
+    main(config)
+
+
+if __name__ == "__main__":
+    app()

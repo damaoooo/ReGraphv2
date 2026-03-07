@@ -168,6 +168,8 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
             self.mlm_probability = self.config.mlm_probability
         if self.edge_pad_value is None:
             self.edge_pad_value = self.config.edge_pad_value
+        self.use_cfg = self.config.use_cfg
+        self.use_ddg = self.config.use_ddg
 
     def __call__(self, examples: Dict[str, List]) -> Dict[str, Any]:
         # --- 分离自定义列 ---
@@ -245,49 +247,48 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
         batch_k = pad_collator(key_features)
 
         # 6. 处理图结构 (CFG & DDG)
-        cfg_graph_all = batch_cache['cfg_graph']
-        ddg_graph_all = batch_cache['ddg_graph']
+        cfg_graph_all = batch_cache['cfg_graph'] if self.use_cfg else None
+        ddg_graph_all = batch_cache['ddg_graph'] if self.use_ddg else None
         
         # 定义内部函数处理图 (复用逻辑)
         def process_graphs(cfg_list, ddg_list, seq_len_tensor):
-            # 1. DDG 处理 (Padding)
-            padded_ddg = self.pad_graph(ddg_list)
-            ddg_tensor = torch.tensor(padded_ddg, dtype=torch.long)
-            
-            # 2. CFG 处理 (Padding -> SVD)
-            if len(cfg_list) == 0 or len(cfg_list[0]) == 0:
-                # 处理极端情况：如果没有任何边，直接返回全零的 U 和 V
-                batch_size = len(cfg_list)
-                current_max_len = seq_len_tensor.shape[1]
-                u_empty = torch.zeros((batch_size, current_max_len, self.config.svd_rank), dtype=torch.float32)
-                v_empty = torch.zeros((batch_size, current_max_len, self.config.svd_rank), dtype=torch.float32)
-                return ddg_tensor, u_empty, v_empty
-            
-            padded_cfg = self.pad_graph(cfg_list, feature_length=5)
-            
-            # 这里的 seq_len 取决于当前 batch text padding 后的实际长度
-            current_max_len = seq_len_tensor.shape[1] 
-            
-            # 调用你的 SVD 分解函数 (CPU 上运行)
-            U, V = factorize_cfg_to_uv_batch(
-                torch.tensor(padded_cfg, dtype=torch.long), 
-                rank=self.config.svd_rank, 
-                total_seq_len=current_max_len, 
-                device='cpu' 
-            )
-            return ddg_tensor, U, V
+            ddg_tensor = None
+            if self.use_ddg:
+                padded_ddg = self.pad_graph(ddg_list)
+                ddg_tensor = torch.tensor(padded_ddg, dtype=torch.long)
+
+            u_tensor = None
+            v_tensor = None
+            if self.use_cfg:
+                if len(cfg_list) == 0 or len(cfg_list[0]) == 0:
+                    # 没有 CFG 边时，返回零矩阵保持形状一致
+                    local_batch = len(cfg_list)
+                    current_max_len = seq_len_tensor.shape[1]
+                    u_tensor = torch.zeros((local_batch, current_max_len, self.config.svd_rank), dtype=torch.float32)
+                    v_tensor = torch.zeros((local_batch, current_max_len, self.config.svd_rank), dtype=torch.float32)
+                else:
+                    padded_cfg = self.pad_graph(cfg_list, feature_length=5)
+                    current_max_len = seq_len_tensor.shape[1]
+                    u_tensor, v_tensor = factorize_cfg_to_uv_batch(
+                        torch.tensor(padded_cfg, dtype=torch.long),
+                        rank=self.config.svd_rank,
+                        total_seq_len=current_max_len,
+                        device='cpu'
+                    )
+
+            return ddg_tensor, u_tensor, v_tensor
 
         # 处理 Query 的图
         ddg_q, u_q, v_q = process_graphs(
-            cfg_graph_all[:batch_size], 
-            ddg_graph_all[:batch_size], 
+            cfg_graph_all[:batch_size] if self.use_cfg else [],
+            ddg_graph_all[:batch_size] if self.use_ddg else [],
             batch_q['input_ids']
         )
         
         # 处理 Key 的图
         ddg_k, u_k, v_k = process_graphs(
-            cfg_graph_all[batch_size:], 
-            ddg_graph_all[batch_size:], 
+            cfg_graph_all[batch_size:] if self.use_cfg else [],
+            ddg_graph_all[batch_size:] if self.use_ddg else [],
             batch_k['input_ids']
         )
 

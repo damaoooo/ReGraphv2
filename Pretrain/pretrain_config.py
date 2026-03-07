@@ -23,6 +23,7 @@ class PretrainConfig(RoFormerConfig):
         # === 模型扩展配置 ===
         use_flash_attn: bool = True,
         svd_rank: int = 32,
+        graph_mode: str = "both",
         # === 训练配置 ===
         num_train_epochs: int = 1,
         max_steps: int = 300000,
@@ -90,6 +91,14 @@ class PretrainConfig(RoFormerConfig):
         # === 模型扩展配置 ===
         self.use_flash_attn = use_flash_attn
         self.svd_rank = svd_rank
+        self.graph_mode = graph_mode
+
+        valid_graph_modes = {"both", "no_cfg", "no_ddg", "none"}
+        if self.graph_mode not in valid_graph_modes:
+            raise ValueError(
+                f"Invalid graph_mode={self.graph_mode}. "
+                f"Expected one of {sorted(valid_graph_modes)}"
+            )
 
         # === 训练配置 ===
         self.num_train_epochs = num_train_epochs
@@ -139,6 +148,14 @@ class PretrainConfig(RoFormerConfig):
         self.mlm_probability = mlm_probability
         self.edge_pad_value = edge_pad_value
         self.pad_to_multiple_of = pad_to_multiple_of
+
+    @property
+    def use_cfg(self) -> bool:
+        return self.graph_mode in {"both", "no_ddg"}
+
+    @property
+    def use_ddg(self) -> bool:
+        return self.graph_mode in {"both", "no_cfg"}
 
 
 # 默认配置实例
