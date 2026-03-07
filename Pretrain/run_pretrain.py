@@ -1,16 +1,19 @@
 import traceback
 import os
 import copy
+import ast
+import inspect
 from .pretrain_model import MoCoPretrainModel, ReFormerPretrainModel
 import pickle
 import torch
 import typer
 from transformers import Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
+from transformers.trainer import unwrap_model
 from Pretrain.pretrain_dataset import MoCoDataCollator, load_dataset
 from Tokenizer.ir_tokenizer import load_tokenizer
 from .pretrain_config import PretrainConfig, DEFAULT_CONFIG
-from typing import Dict, List, Any, Callable
+from typing import Dict, List, Any, Callable, Optional, Tuple
 
 try:
     import bitsandbytes as bnb  # type: ignore
@@ -19,6 +22,99 @@ except Exception:
 
 GRAPH_MODES = ("both", "no_cfg", "no_ddg", "none")
 app = typer.Typer(add_completion=False, no_args_is_help=False)
+
+
+def _split_override_item(item: str) -> Tuple[str, str]:
+    if "=" not in item:
+        raise typer.BadParameter(f"Invalid --set '{item}', expected key=value")
+    key, raw_value = item.split("=", 1)
+    key = key.strip()
+    raw_value = raw_value.strip()
+    if not key:
+        raise typer.BadParameter(f"Invalid --set '{item}', key cannot be empty")
+    return key, raw_value
+
+
+def _coerce_override_value(raw_value: str, current_value: Any) -> Any:
+    lowered = raw_value.lower()
+
+    if lowered in {"none", "null"}:
+        return None
+
+    if isinstance(current_value, bool):
+        bool_map = {
+            "1": True,
+            "0": False,
+            "true": True,
+            "false": False,
+            "yes": True,
+            "no": False,
+            "on": True,
+            "off": False,
+        }
+        if lowered not in bool_map:
+            raise typer.BadParameter(
+                f"Cannot parse '{raw_value}' as bool. Use true/false/1/0/yes/no/on/off"
+            )
+        return bool_map[lowered]
+
+    if isinstance(current_value, int) and not isinstance(current_value, bool):
+        try:
+            return int(raw_value)
+        except ValueError as exc:
+            raise typer.BadParameter(f"Cannot parse '{raw_value}' as int") from exc
+
+    if isinstance(current_value, float):
+        try:
+            return float(raw_value)
+        except ValueError as exc:
+            raise typer.BadParameter(f"Cannot parse '{raw_value}' as float") from exc
+
+    if isinstance(current_value, (list, tuple, dict, set)):
+        try:
+            return ast.literal_eval(raw_value)
+        except (ValueError, SyntaxError) as exc:
+            raise typer.BadParameter(
+                f"Cannot parse '{raw_value}' as {type(current_value).__name__}; "
+                "please use Python literal syntax"
+            ) from exc
+
+    if isinstance(current_value, str):
+        return raw_value
+
+    # Fallback for unknown attribute types.
+    try:
+        return ast.literal_eval(raw_value)
+    except Exception:
+        return raw_value
+
+
+def _apply_cli_overrides(config: PretrainConfig, overrides: Optional[List[str]]) -> PretrainConfig:
+    if not overrides:
+        return config
+
+    for item in overrides:
+        key, raw_value = _split_override_item(item)
+
+        if not hasattr(config, key):
+            raise typer.BadParameter(f"Unknown config key: '{key}'")
+
+        current_value = getattr(config, key)
+        new_value = _coerce_override_value(raw_value, current_value)
+        setattr(config, key, new_value)
+        print(f"[config override] {key}: {current_value!r} -> {new_value!r}")
+
+    if config.graph_mode not in GRAPH_MODES:
+        raise typer.BadParameter(f"graph_mode must be one of: {'/'.join(GRAPH_MODES)}")
+
+    return config
+
+
+def _build_config(graph_mode: Optional[str] = None, overrides: Optional[List[str]] = None) -> PretrainConfig:
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    if graph_mode is not None:
+        config.graph_mode = graph_mode
+    return _apply_cli_overrides(config, overrides)
 
 
 def _clone_model_config(config: PretrainConfig, vocab_size: int) -> PretrainConfig:
@@ -450,7 +546,7 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         save_strategy=config.save_strategy,
         save_steps=config.save_steps,
         save_total_limit=config.save_total_limit,
-        save_safetensors=False,
+        # save_safetensors=False,
         logging_strategy=config.logging_strategy,
         logging_steps=config.logging_steps,
         report_to=config.report_to,
@@ -462,6 +558,33 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
             super().__init__(*args, **kwargs)
             self.skipped_steps = 0
 
+        def _save(self, output_dir: Optional[str] = None, state_dict=None):
+            """Save with torch bin format to avoid safetensors shared-tensor errors."""
+            output_dir = output_dir if output_dir is not None else self.args.output_dir
+            os.makedirs(output_dir, exist_ok=True)
+
+            model_to_save = unwrap_model(self.model)
+
+            if hasattr(model_to_save, "save_pretrained"):
+                if state_dict is None:
+                    state_dict = model_to_save.state_dict()
+
+                save_kwargs = {"state_dict": state_dict}
+                sig = inspect.signature(model_to_save.save_pretrained)
+                if "safe_serialization" in sig.parameters:
+                    save_kwargs["safe_serialization"] = False
+
+                model_to_save.save_pretrained(output_dir, **save_kwargs)
+            else:
+                if state_dict is None:
+                    state_dict = model_to_save.state_dict()
+                torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+
+            if self.processing_class is not None:
+                self.processing_class.save_pretrained(output_dir)
+
+            torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
         def training_step(self, model, inputs, num_items_in_batch=None):
             if inputs is None:
                 self.skipped_steps += 1
@@ -469,6 +592,8 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
             try:
                 return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
             except Exception as exc:
+                if not config.skip_bad_batch:
+                    raise
                 self.skipped_steps += 1
                 self.model.zero_grad(set_to_none=True)
                 msg = f"[SKIP STEP] step={self.state.global_step} error={exc}"
@@ -480,8 +605,7 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
                         traceback.print_exc(file=f)
                 return torch.tensor(0.0, device=self.args.device)
 
-    trainer_class = SafeTrainer if config.skip_bad_batch else Trainer
-    trainer = trainer_class(
+    trainer = SafeTrainer(
         model=model,
         args=train_args,
         train_dataset=train_dataset_idx,
@@ -530,6 +654,12 @@ def cli(ctx: typer.Context):
 def debug_command(
     device: str = typer.Argument("cpu", help="Run on cpu or gpu."),
     graph_mode: str = typer.Argument("all", help="all or one of both/no_cfg/no_ddg/none."),
+    override: Optional[List[str]] = typer.Option(
+        None,
+        "--set",
+        "-s",
+        help="Override config item, repeatable. Example: --set max_steps=2000 --set bf16=false",
+    ),
 ):
     device = device.lower()
     graph_mode = graph_mode.lower()
@@ -541,11 +671,12 @@ def debug_command(
 
     runner: Callable[[PretrainConfig], None] = debug_cpu if device == "cpu" else debug_gpu
     runner_name = f"debug_{device}"
+    base_config = _build_config(overrides=override)
 
     if graph_mode == "all":
-        _run_debug_all_modes(DEFAULT_CONFIG, runner, runner_name)
+        _run_debug_all_modes(base_config, runner, runner_name)
     else:
-        mode_config = copy.deepcopy(DEFAULT_CONFIG)
+        mode_config = copy.deepcopy(base_config)
         mode_config.graph_mode = graph_mode
         runner(mode_config)
 
@@ -554,8 +685,16 @@ def debug_command(
 def profile_gpu_mem_command(
     forward_only: bool = typer.Option(False, "--forward-only", help="Only run forward pass."),
     mem_probe: bool = typer.Option(False, "--mem-probe", help="Print allocated/reserved memory info."),
+    override: Optional[List[str]] = typer.Option(
+        None,
+        "--set",
+        "-s",
+        help="Override config item, repeatable. Example: --set max_seq_length=2048",
+    ),
 ):
+    config = _build_config(overrides=override)
     profile_extreme_seq_len_memory(
+        config=config,
         run_backward=not forward_only,
         mem_probe=mem_probe,
     )
@@ -564,13 +703,26 @@ def profile_gpu_mem_command(
 @app.command("train")
 def train_command(
     graph_mode: str = typer.Option("both", "--graph-mode", help="both/no_cfg/no_ddg/none"),
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help="Resume training from checkpoint. Default is false (start from scratch).",
+    ),
+    override: Optional[List[str]] = typer.Option(
+        None,
+        "--set",
+        "-s",
+        help="Override config item, repeatable. Example: --set max_steps=5000 --set learning_rate=1e-4",
+    ),
 ):
     graph_mode = graph_mode.lower()
     if graph_mode not in GRAPH_MODES:
         raise typer.BadParameter(f"graph_mode must be one of: {'/'.join(GRAPH_MODES)}")
 
-    config = copy.deepcopy(DEFAULT_CONFIG)
-    config.graph_mode = graph_mode
+    config = _build_config(graph_mode=graph_mode, overrides=override)
+    config.resume_from_checkpoint = resume
+    if not resume:
+        config.resume_checkpoint_path = None
     main(config)
 
 
