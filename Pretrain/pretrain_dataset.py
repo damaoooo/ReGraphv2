@@ -170,6 +170,22 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
             self.edge_pad_value = self.config.edge_pad_value
         self.use_cfg = self.config.use_cfg
         self.use_ddg = self.config.use_ddg
+        self.use_cfg_as_ddg = self.config.use_cfg_as_ddg
+        self.keep_original_ddg = self.config.keep_original_ddg
+
+    def _convert_cfg_edges_to_ddg(self, cfg_edges: List[List[Any]]) -> List[List[int]]:
+        """Convert CFG 5-tuple edges to DDG-compatible 4-tuple edges."""
+        converted: List[List[int]] = []
+        for edge in cfg_edges:
+            if edge is None or len(edge) < 4:
+                continue
+            converted.append([
+                int(edge[0]),
+                int(edge[1]),
+                int(edge[2]),
+                int(edge[3]),
+            ])
+        return converted
 
     def __call__(self, examples: Dict[str, List]) -> Dict[str, Any]:
         # --- 分离自定义列 ---
@@ -247,14 +263,28 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
         batch_k = pad_collator(key_features)
 
         # 6. 处理图结构 (CFG & DDG)
-        cfg_graph_all = batch_cache['cfg_graph'] if self.use_cfg else None
-        ddg_graph_all = batch_cache['ddg_graph'] if self.use_ddg else None
+        need_cfg_graph = self.use_cfg or self.use_cfg_as_ddg
+        need_ddg_graph = self.keep_original_ddg
+        cfg_graph_all = batch_cache['cfg_graph'] if need_cfg_graph else None
+        ddg_graph_all = batch_cache['ddg_graph'] if need_ddg_graph else None
         
         # 定义内部函数处理图 (复用逻辑)
         def process_graphs(cfg_list, ddg_list, seq_len_tensor):
             ddg_tensor = None
             if self.use_ddg:
-                padded_ddg = self.pad_graph(ddg_list)
+                if self.use_cfg_as_ddg:
+                    ddg_inputs = []
+                    for idx, cfg_edges in enumerate(cfg_list):
+                        cfg_as_ddg = self._convert_cfg_edges_to_ddg(cfg_edges)
+                        if self.keep_original_ddg:
+                            original_ddg = ddg_list[idx] if idx < len(ddg_list) else []
+                            ddg_inputs.append(original_ddg + cfg_as_ddg)
+                        else:
+                            ddg_inputs.append(cfg_as_ddg)
+                else:
+                    ddg_inputs = ddg_list
+
+                padded_ddg = self.pad_graph(ddg_inputs)
                 ddg_tensor = torch.tensor(padded_ddg, dtype=torch.long)
 
             u_tensor = None
@@ -280,15 +310,15 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
 
         # 处理 Query 的图
         ddg_q, u_q, v_q = process_graphs(
-            cfg_graph_all[:batch_size] if self.use_cfg else [],
-            ddg_graph_all[:batch_size] if self.use_ddg else [],
+            cfg_graph_all[:batch_size] if need_cfg_graph else [],
+            ddg_graph_all[:batch_size] if need_ddg_graph else [],
             batch_q['input_ids']
         )
         
         # 处理 Key 的图
         ddg_k, u_k, v_k = process_graphs(
-            cfg_graph_all[batch_size:] if self.use_cfg else [],
-            ddg_graph_all[batch_size:] if self.use_ddg else [],
+            cfg_graph_all[batch_size:] if need_cfg_graph else [],
+            ddg_graph_all[batch_size:] if need_ddg_graph else [],
             batch_k['input_ids']
         )
 

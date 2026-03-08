@@ -33,7 +33,7 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
         )
         graph_mode = getattr(config, "graph_mode", "both")
         self.use_cfg = graph_mode in {"both", "no_ddg"}
-        self.use_ddg = graph_mode in {"both", "no_cfg"}
+        self.use_ddg = graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
 
     def forward(
         self, 
@@ -41,6 +41,7 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
         cfg_u: Optional[torch.Tensor] = None, # Shape: [B, S, Rank]
         cfg_v: Optional[torch.Tensor] = None, # Shape: [B, S, Rank]
         ddg_edges: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs
     ) -> torch.Tensor:
         # input: [batch, seq, dim]
@@ -130,9 +131,22 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
             v = F.pad(v, (0, pad_size), value=0.0)
             
         
+        # Build key padding mask for SDPA to prevent attending to PAD tokens.
+        sdpa_mask = None
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                # [B, L] -> [B, 1, 1, L], True means "can attend"
+                sdpa_mask = attention_mask.to(torch.bool).unsqueeze(1).unsqueeze(1)
+            elif attention_mask.dim() == 4:
+                # Already broadcastable mask (e.g. [B, 1, L, L] or [B, 1, 1, L])
+                sdpa_mask = attention_mask.to(torch.bool)
+            else:
+                raise ValueError(f"Unsupported attention_mask shape: {attention_mask.shape}")
+
         # PyTorch 2.0+ 神器：自动选择 FlashAttention, xFormers 或 CuDNN
         attn_output = F.scaled_dot_product_attention(
             q_rot, k_rot, v,
+            attn_mask=sdpa_mask,
             dropout_p=self.dropout.p if self.training else 0.0,
             scale=1.0,
             is_causal=False  # 双向 Attention
@@ -140,6 +154,10 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
         if pad_size > 0:
             attn_output = attn_output[..., :self.head_dim]
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, -1)
+
+        # Zero-out padded query positions to avoid carrying PAD activations forward.
+        if attention_mask is not None and attention_mask.dim() == 2:
+            attn_output = attn_output * attention_mask.unsqueeze(-1).to(attn_output.dtype)
         
         return attn_output
     
@@ -157,7 +175,7 @@ class GraphRoFormerLayer(RoFormerLayer):
         self.attention.self = GraphFlashRoFormerSelfAttention(config)
         graph_mode = getattr(config, "graph_mode", "both")
         self.use_cfg = graph_mode in {"both", "no_ddg"}
-        self.use_ddg = graph_mode in {"both", "no_cfg"}
+        self.use_ddg = graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
 
     def forward(
         self,
@@ -186,6 +204,7 @@ class GraphRoFormerLayer(RoFormerLayer):
             cfg_u=cfg_u,
             cfg_v=cfg_v,
             ddg_edges=ddg_edges,
+            attention_mask=attention_mask,
         )
         attention_output = self.attention.output(self_attention_output, hidden_states)
 
@@ -211,7 +230,7 @@ class GraphRoFormerModel(RoFormerPreTrainedModel):
         self.config = config
         graph_mode = getattr(config, "graph_mode", "both")
         self.use_cfg = graph_mode in {"both", "no_ddg"}
-        self.use_ddg = graph_mode in {"both", "no_cfg"}
+        self.use_ddg = graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
         
         # 验证配置参数
         if not hasattr(config, 'num_hidden_layers') or config.num_hidden_layers <= 0:

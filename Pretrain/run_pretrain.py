@@ -20,7 +20,7 @@ try:
 except Exception:
     bnb = None
 
-GRAPH_MODES = ("both", "no_cfg", "no_ddg", "none")
+GRAPH_MODES = ("both", "no_cfg", "no_ddg", "none", "cfg_as_ddg", "both_cfg_as_ddg")
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 
 
@@ -653,7 +653,10 @@ def cli(ctx: typer.Context):
 @app.command("debug")
 def debug_command(
     device: str = typer.Argument("cpu", help="Run on cpu or gpu."),
-    graph_mode: str = typer.Argument("all", help="all or one of both/no_cfg/no_ddg/none."),
+    graph_mode: str = typer.Argument(
+        "all",
+        help="all or one of both/no_cfg/no_ddg/none/cfg_as_ddg/both_cfg_as_ddg.",
+    ),
     override: Optional[List[str]] = typer.Option(
         None,
         "--set",
@@ -702,7 +705,11 @@ def profile_gpu_mem_command(
 
 @app.command("train")
 def train_command(
-    graph_mode: str = typer.Option("both", "--graph-mode", help="both/no_cfg/no_ddg/none"),
+    graph_mode: str = typer.Option(
+        "both",
+        "--graph-mode",
+        help="both/no_cfg/no_ddg/none/cfg_as_ddg/both_cfg_as_ddg",
+    ),
     resume: bool = typer.Option(
         False,
         "--resume",

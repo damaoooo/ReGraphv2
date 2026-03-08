@@ -8,6 +8,8 @@ output_none
 db1_model_no_cfg
 db1_model_no_ddg
 db1_model_none
+/output_*/
+db1_model_*/
 Tokenizer/output_corpus
 Tokenizer/small_sample_corpus
 

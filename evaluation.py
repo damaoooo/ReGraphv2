@@ -25,7 +25,7 @@ from numba import njit, prange, types
 from numba.typed import Dict as NumbaDict
 
 
-GRAPH_MODES = ("both", "no_cfg", "no_ddg", "none")
+GRAPH_MODES = ("both", "no_cfg", "no_ddg", "none", "cfg_as_ddg", "both_cfg_as_ddg")
 
 # --- 设置 Rich 和 Typer ---
 logging.basicConfig(
@@ -127,7 +127,22 @@ class FunctionDataCollator:
         self.svd_rank = svd_rank
         self.graph_mode = graph_mode
         self.use_cfg = graph_mode in {"both", "no_ddg"}
-        self.use_ddg = graph_mode in {"both", "no_cfg"}
+        self.use_ddg = graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
+        self.use_cfg_as_ddg = graph_mode in {"cfg_as_ddg", "both_cfg_as_ddg"}
+        self.keep_original_ddg = graph_mode in {"both", "no_cfg", "both_cfg_as_ddg"}
+
+    def _convert_cfg_edges_to_ddg(self, cfg_edges):
+        converted = []
+        for edge in cfg_edges:
+            if edge is None or len(edge) < 4:
+                continue
+            converted.append([
+                int(edge[0]),
+                int(edge[1]),
+                int(edge[2]),
+                int(edge[3]),
+            ])
+        return converted
         
     def __call__(self, batch: List):
         pad_collator = DataCollatorWithPadding(tokenizer=self.tokenizer, padding=True, pad_to_multiple_of=8)
@@ -150,14 +165,28 @@ class FunctionDataCollator:
         cfg_u = None
         cfg_v = None
         ddg_graphs = None
+        cfg_graphs_raw = None
+
+        if self.use_cfg or self.use_cfg_as_ddg:
+            cfg_graphs_raw = [batch_item['cfg_graph'] for batch_item in batch]
 
         if self.use_ddg:
-            ddg_graphs_raw = [batch_item['ddg_graph'] for batch_item in batch]
-            ddg_graphs_padded = self.pad_graph(ddg_graphs_raw, feature_length=4)
+            if self.use_cfg_as_ddg:
+                ddg_graphs_input = []
+                for idx, cfg_edges in enumerate(cfg_graphs_raw):
+                    cfg_as_ddg = self._convert_cfg_edges_to_ddg(cfg_edges)
+                    if self.keep_original_ddg:
+                        original_ddg = batch[idx]['ddg_graph']
+                        ddg_graphs_input.append(original_ddg + cfg_as_ddg)
+                    else:
+                        ddg_graphs_input.append(cfg_as_ddg)
+            else:
+                ddg_graphs_input = [batch_item['ddg_graph'] for batch_item in batch]
+
+            ddg_graphs_padded = self.pad_graph(ddg_graphs_input, feature_length=4)
             ddg_graphs = torch.tensor(ddg_graphs_padded, dtype=torch.long)
 
         if self.use_cfg:
-            cfg_graphs_raw = [batch_item['cfg_graph'] for batch_item in batch]
             cfg_graphs_padded = self.pad_graph(cfg_graphs_raw, feature_length=5)
             cfg_tensor = torch.tensor(cfg_graphs_padded, dtype=torch.long)
 
@@ -537,7 +566,11 @@ def main(
     gpu_batch_size: int = typer.Option(512, "--gpu-batch-size", help="GPU批量处理的锚点数量。"),
     tokenizer_path: Path = typer.Option(None, "--tokenizer-path", help="Tokenizer文件路径，如果与模型路径不同。"),
     svd_rank: int = typer.Option(32, "--svd-rank", help="CFG图SVD分解的秩（rank），需要与训练时保持一致。"),
-    graph_mode: str = typer.Option("both", "--graph-mode", help="图模式: both/no_cfg/no_ddg/none。"),
+    graph_mode: str = typer.Option(
+        "both",
+        "--graph-mode",
+        help="图模式: both/no_cfg/no_ddg/none/cfg_as_ddg/both_cfg_as_ddg。",
+    ),
     use_bf16: bool = typer.Option(False, "--bf16", help="将嵌入以BF16加载到GPU，减少显存与带宽开销。"),
 ):
     """
