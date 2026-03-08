@@ -5,6 +5,9 @@ output
 output_no_cfg
 output_no_ddg
 output_none
+db1_model_no_cfg
+db1_model_no_ddg
+db1_model_none
 Tokenizer/output_corpus
 Tokenizer/small_sample_corpus
 

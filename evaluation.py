@@ -24,6 +24,9 @@ import torch
 from numba import njit, prange, types
 from numba.typed import Dict as NumbaDict
 
+
+GRAPH_MODES = ("both", "no_cfg", "no_ddg", "none")
+
 # --- 设置 Rich 和 Typer ---
 logging.basicConfig(
     level="INFO",
@@ -118,10 +121,13 @@ def _build_pools_parallel(anchor_batch: np.ndarray, pos_flat: np.ndarray, pos_of
     
 class FunctionDataCollator:
     
-    def __init__(self, tokenizer, max_length=2048, svd_rank=32):
+    def __init__(self, tokenizer, max_length=2048, svd_rank=32, graph_mode: str = "both"):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.svd_rank = svd_rank
+        self.graph_mode = graph_mode
+        self.use_cfg = graph_mode in {"both", "no_ddg"}
+        self.use_ddg = graph_mode in {"both", "no_cfg"}
         
     def __call__(self, batch: List):
         pad_collator = DataCollatorWithPadding(tokenizer=self.tokenizer, padding=True, pad_to_multiple_of=8)
@@ -141,29 +147,31 @@ class FunctionDataCollator:
         
         input_ids = pad_collator({'input_ids': truncated_input_ids})
         input_ids, attention_mask = input_ids['input_ids'], input_ids['attention_mask']
-        cfg_graphs = [batch_item['cfg_graph'] for batch_item in batch]
-        ddg_graphs = [batch_item['ddg_graph'] for batch_item in batch]
-        
-        # Pad DDG graphs
-        ddg_graphs = self.pad_graph(ddg_graphs, feature_length=4)
-        ddg_graphs = torch.tensor(ddg_graphs, dtype=torch.long)
-        
-        # Process CFG graphs: pad then apply UV decomposition
-        cfg_graphs_padded = self.pad_graph(cfg_graphs, feature_length=5)
-        cfg_tensor = torch.tensor(cfg_graphs_padded, dtype=torch.long)
-        
-        # If CFG graphs is empty, create a dummy tensor to avoid errors in UV decomposition
-        if cfg_tensor.shape[1] == 0:
-            cfg_tensor = torch.zeros((len(batch), 1, 5), dtype=torch.long)
-        
-        # Apply CFG UV decomposition
-        current_max_len = input_ids.shape[1]
-        cfg_u, cfg_v = factorize_cfg_to_uv_batch(
-            cfg_tensor,
-            rank=self.svd_rank,
-            total_seq_len=current_max_len,
-            device='cpu'
-        )
+        cfg_u = None
+        cfg_v = None
+        ddg_graphs = None
+
+        if self.use_ddg:
+            ddg_graphs_raw = [batch_item['ddg_graph'] for batch_item in batch]
+            ddg_graphs_padded = self.pad_graph(ddg_graphs_raw, feature_length=4)
+            ddg_graphs = torch.tensor(ddg_graphs_padded, dtype=torch.long)
+
+        if self.use_cfg:
+            cfg_graphs_raw = [batch_item['cfg_graph'] for batch_item in batch]
+            cfg_graphs_padded = self.pad_graph(cfg_graphs_raw, feature_length=5)
+            cfg_tensor = torch.tensor(cfg_graphs_padded, dtype=torch.long)
+
+            # If CFG graphs is empty, create a dummy tensor to avoid errors in UV decomposition
+            if cfg_tensor.shape[1] == 0:
+                cfg_tensor = torch.zeros((len(batch), 1, 5), dtype=torch.long)
+
+            current_max_len = input_ids.shape[1]
+            cfg_u, cfg_v = factorize_cfg_to_uv_batch(
+                cfg_tensor,
+                rank=self.svd_rank,
+                total_seq_len=current_max_len,
+                device='cpu'
+            )
 
         return {
             "input_ids": input_ids,
@@ -182,7 +190,7 @@ class FunctionDataCollator:
             padded_graphs.append(padded_graph)
         return padded_graphs
     
-def get_model(model_path, svd_rank=32, max_seq_length=4096, embedding_size=768):
+def get_model(model_path, svd_rank=32, max_seq_length=4096, embedding_size=768, graph_mode: str = "both"):
     """加载MoCo模型并返回encoder_q用于推理
     
     Args:
@@ -200,6 +208,7 @@ def get_model(model_path, svd_rank=32, max_seq_length=4096, embedding_size=768):
     config = PretrainConfig(
         max_seq_length=max_seq_length,
         svd_rank=svd_rank,
+        graph_mode=graph_mode,
     )
     
     # 2. 设置vocab_size（从tokenizer获取）
@@ -227,9 +236,21 @@ def get_model(model_path, svd_rank=32, max_seq_length=4096, embedding_size=768):
     # 6. 在evaluation阶段只使用encoder_q进行推理
     return moco_model.encoder_q
 
-def get_dataloader(dataset_path: Path, tokenizer, batch_size: int = 64, max_length: int = 2048, svd_rank: int = 32) -> DataLoader:
+def get_dataloader(
+    dataset_path: Path,
+    tokenizer,
+    batch_size: int = 64,
+    max_length: int = 2048,
+    svd_rank: int = 32,
+    graph_mode: str = "both",
+) -> DataLoader:
     dataset = load_from_disk(str(dataset_path))
-    collator = FunctionDataCollator(tokenizer, max_length=max_length, svd_rank=svd_rank)
+    collator = FunctionDataCollator(
+        tokenizer,
+        max_length=max_length,
+        svd_rank=svd_rank,
+        graph_mode=graph_mode,
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -243,7 +264,16 @@ def get_dataloader(dataset_path: Path, tokenizer, batch_size: int = 64, max_leng
     
 
 
-def generate_embeddings_with_model(dataset_path: Path, batch_size: int, tokenizer, model_path: str, max_length: int = 4096, svd_rank: int = 32, embedding_size: int = 768) -> np.ndarray:
+def generate_embeddings_with_model(
+    dataset_path: Path,
+    batch_size: int,
+    tokenizer,
+    model_path: str,
+    max_length: int = 4096,
+    svd_rank: int = 32,
+    embedding_size: int = 768,
+    graph_mode: str = "both",
+) -> np.ndarray:
     """
     使用本地模型为整个数据集生成嵌入向量。
     使用CUDA和bf16精度进行推理。
@@ -257,7 +287,13 @@ def generate_embeddings_with_model(dataset_path: Path, batch_size: int, tokenize
     console.print(f"Using device: {device}")
     
     # 加载和设置模型（encoder_q用于推理）
-    model = get_model(model_path=model_path, svd_rank=svd_rank, max_seq_length=max_length, embedding_size=embedding_size)
+    model = get_model(
+        model_path=model_path,
+        svd_rank=svd_rank,
+        max_seq_length=max_length,
+        embedding_size=embedding_size,
+        graph_mode=graph_mode,
+    )
     model = model.to(device)
     model.eval()  # 设置为评估模式
     
@@ -265,7 +301,14 @@ def generate_embeddings_with_model(dataset_path: Path, batch_size: int, tokenize
     use_bf16 = device.type == "cuda"
     
     # 创建DataLoader
-    dataloader = get_dataloader(dataset_path, tokenizer, batch_size=batch_size, max_length=max_length, svd_rank=svd_rank)
+    dataloader = get_dataloader(
+        dataset_path,
+        tokenizer,
+        batch_size=batch_size,
+        max_length=max_length,
+        svd_rank=svd_rank,
+        graph_mode=graph_mode,
+    )
 
     # 计算总样本数和embedding维度，提前创建memmap
     total_samples = len(dataloader.dataset)
@@ -311,9 +354,9 @@ def generate_embeddings_with_model(dataset_path: Path, batch_size: int, tokenize
             # 将所有输入数据移动到CUDA
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            cfg_u = batch['cfg_u'].to(device)
-            cfg_v = batch['cfg_v'].to(device)
-            ddg_edges = batch['ddg_edges'].to(device)
+            cfg_u = batch['cfg_u'].to(device) if batch['cfg_u'] is not None else None
+            cfg_v = batch['cfg_v'].to(device) if batch['cfg_v'] is not None else None
+            ddg_edges = batch['ddg_edges'].to(device) if batch['ddg_edges'] is not None else None
             
             try:
                 with torch.inference_mode():
@@ -494,6 +537,7 @@ def main(
     gpu_batch_size: int = typer.Option(512, "--gpu-batch-size", help="GPU批量处理的锚点数量。"),
     tokenizer_path: Path = typer.Option(None, "--tokenizer-path", help="Tokenizer文件路径，如果与模型路径不同。"),
     svd_rank: int = typer.Option(32, "--svd-rank", help="CFG图SVD分解的秩（rank），需要与训练时保持一致。"),
+    graph_mode: str = typer.Option("both", "--graph-mode", help="图模式: both/no_cfg/no_ddg/none。"),
     use_bf16: bool = typer.Option(False, "--bf16", help="将嵌入以BF16加载到GPU，减少显存与带宽开销。"),
 ):
     """
@@ -501,6 +545,10 @@ def main(
     """
     console.rule(f"[bold blue]开始使用本地模型进行评估[/bold blue]")
     set_seed(seed)
+    graph_mode = graph_mode.lower()
+    if graph_mode not in GRAPH_MODES:
+        raise typer.BadParameter(f"graph_mode must be one of: {'/'.join(GRAPH_MODES)}")
+    console.print(f"[blue]Graph mode: {graph_mode}[/blue]")
     
     # GPU可用性检查
     if use_gpu and not GPU_AVAILABLE:
@@ -538,7 +586,8 @@ def main(
             tokenizer=tokenizer, 
             model_path=str(model_path),
             max_length=max_length,
-            svd_rank=svd_rank
+            svd_rank=svd_rank,
+            graph_mode=graph_mode,
         )
         logging.info(f"嵌入向量生成完毕，形状为: [green]{all_embeddings.shape}[/green]")
         
