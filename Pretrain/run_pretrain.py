@@ -20,7 +20,15 @@ try:
 except Exception:
     bnb = None
 
-GRAPH_MODES = ("both", "no_cfg", "no_ddg", "none", "cfg_as_ddg", "both_cfg_as_ddg")
+GRAPH_MODES = (
+    "both",
+    "no_cfg",
+    "no_ddg",
+    "none",
+    "cfg_as_ddg",
+    "cfg_as_ddg_no_ddg",
+    "both_cfg_as_ddg",
+)
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 
 
@@ -655,7 +663,7 @@ def debug_command(
     device: str = typer.Argument("cpu", help="Run on cpu or gpu."),
     graph_mode: str = typer.Argument(
         "all",
-        help="all or one of both/no_cfg/no_ddg/none/cfg_as_ddg/both_cfg_as_ddg.",
+        help="all or one of both/no_cfg/no_ddg/none/cfg_as_ddg/cfg_as_ddg_no_ddg/both_cfg_as_ddg.",
     ),
     override: Optional[List[str]] = typer.Option(
         None,
@@ -708,7 +716,7 @@ def train_command(
     graph_mode: str = typer.Option(
         "both",
         "--graph-mode",
-        help="both/no_cfg/no_ddg/none/cfg_as_ddg/both_cfg_as_ddg",
+        help="both/no_cfg/no_ddg/none/cfg_as_ddg/cfg_as_ddg_no_ddg/both_cfg_as_ddg",
     ),
     resume: bool = typer.Option(
         False,

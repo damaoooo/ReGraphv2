@@ -25,7 +25,15 @@ from numba import njit, prange, types
 from numba.typed import Dict as NumbaDict
 
 
-GRAPH_MODES = ("both", "no_cfg", "no_ddg", "none", "cfg_as_ddg", "both_cfg_as_ddg")
+GRAPH_MODES = (
+    "both",
+    "no_cfg",
+    "no_ddg",
+    "none",
+    "cfg_as_ddg",
+    "cfg_as_ddg_no_ddg",
+    "both_cfg_as_ddg",
+)
 
 # --- 设置 Rich 和 Typer ---
 logging.basicConfig(
@@ -127,9 +135,15 @@ class FunctionDataCollator:
         self.svd_rank = svd_rank
         self.graph_mode = graph_mode
         self.use_cfg = graph_mode in {"both", "no_ddg"}
-        self.use_ddg = graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
-        self.use_cfg_as_ddg = graph_mode in {"cfg_as_ddg", "both_cfg_as_ddg"}
-        self.keep_original_ddg = graph_mode in {"both", "no_cfg", "both_cfg_as_ddg"}
+        self.use_ddg = graph_mode in {
+            "both",
+            "no_cfg",
+            "cfg_as_ddg",
+            "cfg_as_ddg_no_ddg",
+            "both_cfg_as_ddg",
+        }
+        self.use_cfg_as_ddg = graph_mode in {"cfg_as_ddg", "cfg_as_ddg_no_ddg", "both_cfg_as_ddg"}
+        self.keep_original_ddg = graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
 
     def _convert_cfg_edges_to_ddg(self, cfg_edges):
         converted = []
@@ -634,7 +648,7 @@ def main(
     graph_mode: str = typer.Option(
         "both",
         "--graph-mode",
-        help="图模式: both/no_cfg/no_ddg/none/cfg_as_ddg/both_cfg_as_ddg。",
+        help="图模式: both/no_cfg/no_ddg/none/cfg_as_ddg/cfg_as_ddg_no_ddg/both_cfg_as_ddg。",
     ),
     use_bf16: bool = typer.Option(False, "--bf16", help="将嵌入以BF16加载到GPU，减少显存与带宽开销。"),
 ):

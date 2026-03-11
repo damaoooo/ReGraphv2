@@ -99,6 +99,7 @@ class PretrainConfig(RoFormerConfig):
             "no_ddg",
             "none",
             "cfg_as_ddg",
+            "cfg_as_ddg_no_ddg",
             "both_cfg_as_ddg",
         }
         if self.graph_mode not in valid_graph_modes:
@@ -162,15 +163,21 @@ class PretrainConfig(RoFormerConfig):
 
     @property
     def use_ddg(self) -> bool:
-        return self.graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
+        return self.graph_mode in {
+            "both",
+            "no_cfg",
+            "cfg_as_ddg",
+            "cfg_as_ddg_no_ddg",
+            "both_cfg_as_ddg",
+        }
 
     @property
     def use_cfg_as_ddg(self) -> bool:
-        return self.graph_mode in {"cfg_as_ddg", "both_cfg_as_ddg"}
+        return self.graph_mode in {"cfg_as_ddg", "cfg_as_ddg_no_ddg", "both_cfg_as_ddg"}
 
     @property
     def keep_original_ddg(self) -> bool:
-        return self.graph_mode in {"both", "no_cfg", "both_cfg_as_ddg"}
+        return self.graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
 
 
 # 默认配置实例

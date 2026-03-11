@@ -33,7 +33,13 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
         )
         graph_mode = getattr(config, "graph_mode", "both")
         self.use_cfg = graph_mode in {"both", "no_ddg"}
-        self.use_ddg = graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
+        self.use_ddg = graph_mode in {
+            "both",
+            "no_cfg",
+            "cfg_as_ddg",
+            "cfg_as_ddg_no_ddg",
+            "both_cfg_as_ddg",
+        }
 
     def forward(
         self, 
@@ -186,7 +192,13 @@ class GraphRoFormerLayer(RoFormerLayer):
         self.attention.self = GraphFlashRoFormerSelfAttention(config)
         graph_mode = getattr(config, "graph_mode", "both")
         self.use_cfg = graph_mode in {"both", "no_ddg"}
-        self.use_ddg = graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
+        self.use_ddg = graph_mode in {
+            "both",
+            "no_cfg",
+            "cfg_as_ddg",
+            "cfg_as_ddg_no_ddg",
+            "both_cfg_as_ddg",
+        }
 
     def forward(
         self,
@@ -241,7 +253,13 @@ class GraphRoFormerModel(RoFormerPreTrainedModel):
         self.config = config
         graph_mode = getattr(config, "graph_mode", "both")
         self.use_cfg = graph_mode in {"both", "no_ddg"}
-        self.use_ddg = graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
+        self.use_ddg = graph_mode in {
+            "both",
+            "no_cfg",
+            "cfg_as_ddg",
+            "cfg_as_ddg_no_ddg",
+            "both_cfg_as_ddg",
+        }
         
         # 验证配置参数
         if not hasattr(config, 'num_hidden_layers') or config.num_hidden_layers <= 0:
