@@ -55,29 +55,40 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
             if len(ddg_edges.shape) == 2:
                 ddg_edges = torch.full((B, 0, 4), -1, dtype=torch.long, device=hidden_states.device)
 
-            ddg_src = ddg_edges[:, :, 0:2]
-            ddg_dst = ddg_edges[:, :, 2:4]
             edge_mask = (ddg_edges != -1).all(dim=-1)  # Shape: [B, max_edges]
+            if edge_mask.any():
+                agg = torch.zeros_like(hidden_states)
+                deg = torch.zeros(B, L, device=hidden_states.device, dtype=hidden_states.dtype)
 
-            # X <- X + Avg(Parents)  (用 start 位置作为节点代表)
-            src_pos = ddg_src[:, :, 0].clamp(min=0)  # Shape: [B, max_edges]
-            dst_pos = ddg_dst[:, :, 0].clamp(min=0)  # Shape: [B, max_edges]
+                for batch_idx in range(B):
+                    valid_edges = ddg_edges[batch_idx][edge_mask[batch_idx]]
+                    if valid_edges.numel() == 0:
+                        continue
 
-            parent_feat = hidden_states.gather(
-                1, src_pos.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
-            )
-            parent_feat = parent_feat * edge_mask.unsqueeze(-1)
+                    # Prefix sums let us compute span means cheaply for source ranges.
+                    prefix = torch.cat(
+                        [
+                            hidden_states.new_zeros(1, hidden_states.size(-1)),
+                            hidden_states[batch_idx].cumsum(dim=0),
+                        ],
+                        dim=0,
+                    )
 
-            agg = torch.zeros_like(hidden_states)
-            agg.scatter_add_(
-                1, dst_pos.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1)), parent_feat
-            )
+                    for edge in valid_edges.tolist():
+                        src_start, src_end, dst_start, dst_end = edge
+                        src_start = max(0, min(src_start, L - 1))
+                        src_end = max(src_start, min(src_end, L - 1))
+                        dst_start = max(0, min(dst_start, L - 1))
+                        dst_end = max(dst_start, min(dst_end, L - 1))
 
-            deg = torch.zeros(B, L, device=hidden_states.device, dtype=hidden_states.dtype)
-            deg.scatter_add_(1, dst_pos, edge_mask.to(hidden_states.dtype))
-            deg = deg.clamp_min(1.0)
+                        src_len = src_end - src_start + 1
+                        src_sum = prefix[src_end + 1] - prefix[src_start]
+                        parent_feat = src_sum / src_len
 
-            hidden_states = hidden_states + agg / deg.unsqueeze(-1)
+                        agg[batch_idx, dst_start : dst_end + 1] += parent_feat
+                        deg[batch_idx, dst_start : dst_end + 1] += 1.0
+
+                hidden_states = hidden_states + agg / deg.clamp_min(1.0).unsqueeze(-1)
 
         q: torch.Tensor = self.query(hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2) # Shape: [B, num_heads, S, head_dim]
         k: torch.Tensor = self.key(hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)

@@ -56,7 +56,7 @@ def factorize_cfg_to_uv_batch(edge_tensor, rank, total_seq_len=None, device='cpu
         all_ranges = torch.cat([ranges_src, ranges_dst], dim=0)
 
         max_val = torch.max(all_ranges[:, 1])
-        current_seq_len = total_seq_len if total_seq_len is not None else max_val.item()
+        current_seq_len = total_seq_len if total_seq_len is not None else (max_val.item() + 1)
         key_mul = max_val + 1
 
         keys = all_ranges[:, 0] * key_mul + all_ranges[:, 1]
@@ -64,7 +64,8 @@ def factorize_cfg_to_uv_batch(edge_tensor, rank, total_seq_len=None, device='cpu
         unique_starts = unique_keys // key_mul
         unique_ends = unique_keys % key_mul
 
-        block_sizes = (unique_ends - unique_starts).to(torch.float32)
+        # The span indices are inclusive on both ends, so block size must include the end token.
+        block_sizes = (unique_ends - unique_starts + 1).to(torch.float32)
         sqrt_sizes = torch.sqrt(block_sizes)
         num_blocks = unique_keys.numel()
 
@@ -290,21 +291,14 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
             u_tensor = None
             v_tensor = None
             if self.use_cfg:
-                if len(cfg_list) == 0 or len(cfg_list[0]) == 0:
-                    # 没有 CFG 边时，返回零矩阵保持形状一致
-                    local_batch = len(cfg_list)
-                    current_max_len = seq_len_tensor.shape[1]
-                    u_tensor = torch.zeros((local_batch, current_max_len, self.config.svd_rank), dtype=torch.float32)
-                    v_tensor = torch.zeros((local_batch, current_max_len, self.config.svd_rank), dtype=torch.float32)
-                else:
-                    padded_cfg = self.pad_graph(cfg_list, feature_length=5)
-                    current_max_len = seq_len_tensor.shape[1]
-                    u_tensor, v_tensor = factorize_cfg_to_uv_batch(
-                        torch.tensor(padded_cfg, dtype=torch.long),
-                        rank=self.config.svd_rank,
-                        total_seq_len=current_max_len,
-                        device='cpu'
-                    )
+                padded_cfg = self.pad_graph(cfg_list, feature_length=5)
+                current_max_len = seq_len_tensor.shape[1]
+                u_tensor, v_tensor = factorize_cfg_to_uv_batch(
+                    torch.tensor(padded_cfg, dtype=torch.long),
+                    rank=self.config.svd_rank,
+                    total_seq_len=current_max_len,
+                    device='cpu'
+                )
 
             return ddg_tensor, u_tensor, v_tensor
 

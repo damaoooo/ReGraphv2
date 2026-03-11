@@ -2,7 +2,7 @@ import logging
 import pickle
 import random
 from pathlib import Path
-from typing import List
+from typing import List, Union
 
 import numpy as np
 import typer
@@ -11,7 +11,7 @@ from rich.logging import RichHandler
 from rich.progress import track
 from rich.table import Table
 from transformers import set_seed
-from datasets import load_from_disk
+from datasets import Dataset, load_from_disk
 from Tokenizer.ir_tokenizer import load_tokenizer
 
 from torch.utils.data.dataset import Dataset
@@ -148,8 +148,7 @@ class FunctionDataCollator:
         pad_collator = DataCollatorWithPadding(tokenizer=self.tokenizer, padding=True, pad_to_multiple_of=8)
         truncated_input_ids = []
 
-        if len(batch) > 0:
-            has_input_ids = 'input_ids' in batch[0]
+        has_input_ids = len(batch) > 0 and 'input_ids' in batch[0]
         if has_input_ids:
             input_ids = [batch_item['input_ids'] for batch_item in batch]
         else:
@@ -190,10 +189,6 @@ class FunctionDataCollator:
             cfg_graphs_padded = self.pad_graph(cfg_graphs_raw, feature_length=5)
             cfg_tensor = torch.tensor(cfg_graphs_padded, dtype=torch.long)
 
-            # If CFG graphs is empty, create a dummy tensor to avoid errors in UV decomposition
-            if cfg_tensor.shape[1] == 0:
-                cfg_tensor = torch.zeros((len(batch), 1, 5), dtype=torch.long)
-
             current_max_len = input_ids.shape[1]
             cfg_u, cfg_v = factorize_cfg_to_uv_batch(
                 cfg_tensor,
@@ -212,6 +207,8 @@ class FunctionDataCollator:
 
     def pad_graph(self, graph, feature_length: int = 4):
         max_edges = max(len(g) for g in graph)
+        if max_edges == 0:
+            max_edges = 1
         padded_graphs = []
         for g in graph:
             padding_needed = max_edges - len(g)
@@ -265,15 +262,21 @@ def get_model(model_path, svd_rank=32, max_seq_length=4096, embedding_size=768, 
     # 6. 在evaluation阶段只使用encoder_q进行推理
     return moco_model.encoder_q
 
+def _load_dataset(dataset_source: Union[Path, Dataset]) -> Dataset:
+    if isinstance(dataset_source, Dataset):
+        return dataset_source
+    return load_from_disk(str(dataset_source))
+
+
 def get_dataloader(
-    dataset_path: Path,
+    dataset_source: Union[Path, Dataset],
     tokenizer,
     batch_size: int = 64,
     max_length: int = 2048,
     svd_rank: int = 32,
     graph_mode: str = "both",
 ) -> DataLoader:
-    dataset = load_from_disk(str(dataset_path))
+    dataset = _load_dataset(dataset_source)
     collator = FunctionDataCollator(
         tokenizer,
         max_length=max_length,
@@ -294,7 +297,7 @@ def get_dataloader(
 
 
 def generate_embeddings_with_model(
-    dataset_path: Path,
+    dataset_source: Union[Path, Dataset],
     batch_size: int,
     tokenizer,
     model_path: str,
@@ -331,7 +334,7 @@ def generate_embeddings_with_model(
     
     # 创建DataLoader
     dataloader = get_dataloader(
-        dataset_path,
+        dataset_source,
         tokenizer,
         batch_size=batch_size,
         max_length=max_length,
@@ -472,6 +475,67 @@ def generate_embeddings_with_model(
     return result
 
 
+def _build_eval_subset(
+    dataset: Dataset,
+    positive_map: dict,
+    eval_samples: int,
+    pool_samples: int,
+) -> tuple[Dataset, dict, List[int]]:
+    all_possible_anchors = list(positive_map.keys())
+    if not all_possible_anchors:
+        return dataset, positive_map, []
+
+    if eval_samples > 0 and eval_samples < len(all_possible_anchors):
+        anchors_to_evaluate = random.sample(all_possible_anchors, eval_samples)
+    else:
+        anchors_to_evaluate = all_possible_anchors
+
+    if pool_samples <= 0 or pool_samples >= len(dataset):
+        return dataset, positive_map, anchors_to_evaluate
+
+    selected_global_indices = set(anchors_to_evaluate)
+    for anchor_idx in anchors_to_evaluate:
+        positives = positive_map.get(anchor_idx, [])
+        if positives:
+            selected_global_indices.add(random.choice(positives))
+
+    remaining_budget = pool_samples - len(selected_global_indices)
+    if remaining_budget > 0:
+        all_indices = list(range(len(dataset)))
+        excluded = selected_global_indices
+        candidates = [idx for idx in all_indices if idx not in excluded]
+        if remaining_budget < len(candidates):
+            selected_global_indices.update(random.sample(candidates, remaining_budget))
+        else:
+            selected_global_indices.update(candidates)
+
+    selected_indices = sorted(selected_global_indices)
+    subset = dataset.select(selected_indices)
+    old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(selected_indices)}
+
+    subset_positive_map = {}
+    for old_anchor in anchors_to_evaluate:
+        if old_anchor not in old_to_new:
+            continue
+        new_anchor = old_to_new[old_anchor]
+        mapped_positives = [
+            old_to_new[pos_idx]
+            for pos_idx in positive_map.get(old_anchor, [])
+            if pos_idx in old_to_new
+        ]
+        if mapped_positives:
+            subset_positive_map[new_anchor] = mapped_positives
+
+    subset_anchors = []
+    for idx in anchors_to_evaluate:
+        if idx not in old_to_new:
+            continue
+        new_idx = old_to_new[idx]
+        if new_idx in subset_positive_map:
+            subset_anchors.append(new_idx)
+    return subset, subset_positive_map, subset_anchors
+
+
 def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets, pool_sizes, k_values: List[int], use_gpu: bool = True) -> dict:
     """
     处理锚点批次，计算与所有嵌入向量的相似度，并返回Recall@K结果。
@@ -560,6 +624,7 @@ def main(
     batch_size: int = typer.Option(16, "--batch-size", "-b", help="模型推理的批量大小。"),
     max_length: int = typer.Option(2048, "--max-length", help="将'文本'整体截断到的最大token长度。"),
     eval_samples: int = typer.Option(0, "--eval-samples", "-n", help="用于评估的随机锚点样本数量。"),
+    pool_samples: int = typer.Option(0, "--pool-samples", help="快速评估时使用的小检索池大小。0 表示全量检索池。"),
     embeddings_path: Path = typer.Option(None, "--embeddings-path", "-e", help="用于保存/加载嵌入向量Numpy文件的路径。"),
     seed: int = typer.Option(42, "--seed", "-s", help="用于负采样的随机种子。"),
     use_gpu: bool = typer.Option(True, "--gpu/--no-gpu", help="是否使用GPU加速计算。"),
@@ -597,6 +662,7 @@ def main(
     logging.info("正在加载数据和Tokenizer...")
     with open(validation_positive_map_path, 'rb') as f:
         positive_map = pickle.load(f)
+    dataset = load_from_disk(str(validation_dataset_pool_path))
     
     # 加载Tokenizer
     if tokenizer_path:
@@ -607,6 +673,23 @@ def main(
         tokenizer = load_tokenizer(default_tokenizer_path)
 
 
+    dataset_for_eval, positive_map_for_eval, anchors_to_evaluate = _build_eval_subset(
+        dataset=dataset,
+        positive_map=positive_map,
+        eval_samples=eval_samples,
+        pool_samples=pool_samples,
+    )
+
+    if pool_samples > 0:
+        logging.info(
+            f"快速评估模式: 检索池从 {len(dataset):,} 缩小到 {len(dataset_for_eval):,}，"
+            f"锚点数 {len(anchors_to_evaluate):,}"
+        )
+        if embeddings_path:
+            logging.warning("启用了 --pool-samples 时，请确保 embeddings_path 不与全量评估缓存混用。")
+    else:
+        logging.info(f"全量评估模式: 检索池 {len(dataset_for_eval):,}，锚点数 {len(anchors_to_evaluate):,}")
+
     # --- 2. 生成或加载所有嵌入向量 ---
     if embeddings_path and embeddings_path.exists():
         logging.info(f"正在从 [cyan]{embeddings_path}[/cyan] 加载已缓存的嵌入向量...")
@@ -614,7 +697,7 @@ def main(
         logging.info(f"嵌入向量加载完毕，形状为: [green]{all_embeddings.shape}[/green]")
     else:
         all_embeddings = generate_embeddings_with_model(
-            dataset_path=validation_dataset_pool_path, 
+            dataset_source=dataset_for_eval,
             batch_size=batch_size, 
             tokenizer=tokenizer, 
             model_path=str(model_path),
@@ -660,18 +743,10 @@ def main(
     pos_offsets = np.zeros(total_size + 1, dtype=np.int64)
     pos_flat_list = []
     for idx in range(total_size):
-        positives = positive_map.get(idx, [])
+        positives = positive_map_for_eval.get(idx, [])
         pos_offsets[idx + 1] = pos_offsets[idx] + len(positives)
         pos_flat_list.extend(positives)
     pos_flat = np.asarray(pos_flat_list, dtype=np.int64)
-
-    all_possible_anchors = list(positive_map.keys())
-    if eval_samples > 0 and eval_samples < len(all_possible_anchors):
-        logging.info(f"将从 {len(all_possible_anchors):,} 个可能的锚点中随机采样 [yellow]{eval_samples:,}[/yellow] 个进行评估...")
-        anchors_to_evaluate = random.sample(all_possible_anchors, eval_samples)
-    else:
-        logging.info(f"将评估所有 {len(all_possible_anchors):,} 个锚点...")
-        anchors_to_evaluate = all_possible_anchors
 
 
     # --- 5. 对不同的池大小进行评估 ---
