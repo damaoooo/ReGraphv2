@@ -11,10 +11,10 @@ from rich.logging import RichHandler
 from rich.progress import track
 from rich.table import Table
 from transformers import set_seed
-from datasets import Dataset, load_from_disk
+from datasets import Dataset as HFDataset, load_from_disk
 from Tokenizer.ir_tokenizer import load_tokenizer
 
-from torch.utils.data.dataset import Dataset
+from torch.utils.data.dataset import Dataset as TorchDataset
 from torch.utils.data.dataloader import DataLoader
 from transformers import DataCollatorWithPadding
 from Pretrain.pretrain_model import MoCoPretrainModel
@@ -262,14 +262,14 @@ def get_model(model_path, svd_rank=32, max_seq_length=4096, embedding_size=768, 
     # 6. 在evaluation阶段只使用encoder_q进行推理
     return moco_model.encoder_q
 
-def _load_dataset(dataset_source: Union[Path, Dataset]) -> Dataset:
-    if isinstance(dataset_source, Dataset):
+def _load_dataset(dataset_source: Union[Path, HFDataset]) -> HFDataset:
+    if isinstance(dataset_source, HFDataset):
         return dataset_source
     return load_from_disk(str(dataset_source))
 
 
 def get_dataloader(
-    dataset_source: Union[Path, Dataset],
+    dataset_source: Union[Path, HFDataset],
     tokenizer,
     batch_size: int = 64,
     max_length: int = 2048,
@@ -297,7 +297,7 @@ def get_dataloader(
 
 
 def generate_embeddings_with_model(
-    dataset_source: Union[Path, Dataset],
+    dataset_source: Union[Path, HFDataset],
     batch_size: int,
     tokenizer,
     model_path: str,
@@ -476,11 +476,11 @@ def generate_embeddings_with_model(
 
 
 def _build_eval_subset(
-    dataset: Dataset,
+    dataset: HFDataset,
     positive_map: dict,
     eval_samples: int,
     pool_samples: int,
-) -> tuple[Dataset, dict, List[int]]:
+) -> tuple[HFDataset, dict, List[int]]:
     all_possible_anchors = list(positive_map.keys())
     if not all_possible_anchors:
         return dataset, positive_map, []
