@@ -1,6 +1,9 @@
 pandas
 typer
 rich
+fastapi
+uvicorn
+python-multipart
 transformers
 datasets
 networkx

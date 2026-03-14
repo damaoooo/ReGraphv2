@@ -25,7 +25,7 @@ from ida2llvm import lift_binary_to_llvm
 
 # Configuration
 BINARY_PATH = "/home/damaoooo/Downloads/regraphv2/Binaries"
-IDA_PATH = "/home/damaoooo/ida-pro-9.2"  # Update this path to your IDA Pro installation
+IDA_PATH = "/home/damaoooo/ida-pro-9.3"  # Update this path to your IDA Pro installation
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lift_task1_log.txt")
 
 app = typer.Typer()
@@ -219,7 +219,7 @@ def main(
         for root, dirs, files in os.walk(db_path):
             for file in files:
                 # Skip IDA database files and other temporary files
-                if file.endswith((".i64", ".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm", ".ll", ".bc")):
+                if file.endswith((".i64", ".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm", ".ll", ".bc", ".c", ".cpp", ".h", ".hpp")):
                     continue
                 
                 # Skip hidden files and common non-binary files

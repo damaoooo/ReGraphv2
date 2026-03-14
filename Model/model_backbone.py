@@ -41,18 +41,13 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
             "both_cfg_as_ddg",
         }
 
-    def forward(
-        self, 
-        hidden_states: torch.Tensor, 
-        cfg_u: Optional[torch.Tensor] = None, # Shape: [B, S, Rank]
-        cfg_v: Optional[torch.Tensor] = None, # Shape: [B, S, Rank]
-        ddg_edges: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        **kwargs
+    def _apply_ddg_aggregation(
+        self,
+        hidden_states: torch.Tensor,
+        ddg_edges: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        # input: [batch, seq, dim]
         B, L, _ = hidden_states.shape
-        
+
         if self.use_ddg:
             if ddg_edges is None:
                 raise ValueError("ddg_edges is required when DDG is enabled.")
@@ -95,6 +90,16 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
                         deg[batch_idx, dst_start : dst_end + 1] += 1.0
 
                 hidden_states = hidden_states + agg / deg.clamp_min(1.0).unsqueeze(-1)
+
+        return hidden_states
+
+    def _build_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        cfg_u: Optional[torch.Tensor] = None,
+        cfg_v: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, L, _ = hidden_states.shape
 
         q: torch.Tensor = self.query(hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2) # Shape: [B, num_heads, S, head_dim]
         k: torch.Tensor = self.key(hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
@@ -139,16 +144,12 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
             q_rot = torch.concat([q_rot, cfg_u.unsqueeze(1).expand(-1, self.num_heads, -1, -1)], dim=-1)
             k_rot = torch.concat([k_rot, cfg_v.unsqueeze(1).expand(-1, self.num_heads, -1, -1)], dim=-1)
 
-        # --- 核心：Flash Attention + Graph Bias ---
-        # 注意：attn_mask 在 SDPA 里通常是加法 mask (0 是保留，-inf 是遮蔽/bias)
-        
-        # Pad V to match Q/K size after adding CFG
-        pad_size = q_rot.size(-1) - v.size(-1)
-        if pad_size > 0:
-            v = F.pad(v, (0, pad_size), value=0.0)
-            
-        
-        # Build key padding mask for SDPA to prevent attending to PAD tokens.
+        return q_rot, k_rot, v
+
+    def _build_attention_mask(
+        self,
+        attention_mask: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
         sdpa_mask = None
         if attention_mask is not None:
             if attention_mask.dim() == 2:
@@ -159,8 +160,53 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
                 sdpa_mask = attention_mask.to(torch.bool)
             else:
                 raise ValueError(f"Unsupported attention_mask shape: {attention_mask.shape}")
+        return sdpa_mask
 
-        # PyTorch 2.0+ 神器：自动选择 FlashAttention, xFormers 或 CuDNN
+    def compute_attention_weights(
+        self,
+        hidden_states: torch.Tensor,
+        cfg_u: Optional[torch.Tensor] = None,
+        cfg_v: Optional[torch.Tensor] = None,
+        ddg_edges: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        hidden_states = self._apply_ddg_aggregation(hidden_states, ddg_edges)
+        q_rot, k_rot, _ = self._build_qkv(hidden_states, cfg_u=cfg_u, cfg_v=cfg_v)
+        attn_scores = torch.matmul(q_rot, k_rot.transpose(-1, -2))
+        sdpa_mask = self._build_attention_mask(attention_mask)
+        if sdpa_mask is not None:
+            attn_scores = attn_scores.masked_fill(~sdpa_mask, torch.finfo(attn_scores.dtype).min)
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        if attention_mask is not None and attention_mask.dim() == 2:
+            attn_probs = attn_probs * attention_mask[:, None, :, None].to(attn_probs.dtype)
+        return attn_probs.mean(dim=1)
+
+    def forward(
+        self, 
+        hidden_states: torch.Tensor, 
+        cfg_u: Optional[torch.Tensor] = None, # Shape: [B, S, Rank]
+        cfg_v: Optional[torch.Tensor] = None, # Shape: [B, S, Rank]
+        ddg_edges: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # input: [batch, seq, dim]
+        B, L, _ = hidden_states.shape
+        hidden_states = self._apply_ddg_aggregation(hidden_states, ddg_edges)
+
+        # --- 核心：Flash Attention + Graph Bias ---
+        # 注意：attn_mask 在 SDPA 里通常是加法 mask (0 是保留，-inf 是遮蔽/bias)
+
+        q_rot, k_rot, v = self._build_qkv(hidden_states, cfg_u=cfg_u, cfg_v=cfg_v)
+
+        # Pad V to match Q/K size after adding CFG
+        pad_size = q_rot.size(-1) - v.size(-1)
+        if pad_size > 0:
+            v = F.pad(v, (0, pad_size), value=0.0)
+        sdpa_mask = self._build_attention_mask(attention_mask)
+
+        # 始终走优化后的 attention 主路径；调试 attention weights 由额外 probe 负责。
         attn_output = F.scaled_dot_product_attention(
             q_rot, k_rot, v,
             attn_mask=sdpa_mask,
@@ -175,8 +221,8 @@ class GraphFlashRoFormerSelfAttention(nn.Module):
         # Zero-out padded query positions to avoid carrying PAD activations forward.
         if attention_mask is not None and attention_mask.dim() == 2:
             attn_output = attn_output * attention_mask.unsqueeze(-1).to(attn_output.dtype)
-        
-        return attn_output
+
+        return attn_output, None
     
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -222,12 +268,13 @@ class GraphRoFormerLayer(RoFormerLayer):
         if self.use_ddg and ddg_edges is None:
             raise ValueError("ddg_edges is required for GraphRoFormerLayer when DDG is enabled.")
 
-        self_attention_output = self.attention.self(
+        self_attention_output, attn_probs = self.attention.self(
             hidden_states,
             cfg_u=cfg_u,
             cfg_v=cfg_v,
             ddg_edges=ddg_edges,
             attention_mask=attention_mask,
+            output_attentions=output_attentions,
         )
         attention_output = self.attention.output(self_attention_output, hidden_states)
 
@@ -237,7 +284,7 @@ class GraphRoFormerLayer(RoFormerLayer):
 
         outputs = (layer_output,)
         if output_attentions:
-            outputs = outputs + (None,)
+            outputs = outputs + (attn_probs,)
         return outputs
 
     def feed_forward_chunk(self, attention_output):
@@ -331,7 +378,7 @@ class GraphRoFormerModel(RoFormerPreTrainedModel):
 
         hidden_states = embedding_output
         all_hidden_states = () if output_hidden_states else None
-        all_self_attentions = () if output_attentions else None
+        last_self_attention = None
 
         for layer_module in self.layers:
             if output_hidden_states:
@@ -353,21 +400,86 @@ class GraphRoFormerModel(RoFormerPreTrainedModel):
 
             hidden_states = layer_outputs[0]
             if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
+                # 只保留最后一层 attention，避免 verbose 路径把 CPU / RAM 撑爆。
+                last_self_attention = layer_outputs[1]
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            output = (hidden_states, None, all_hidden_states, all_self_attentions, None)
+            attentions_output = (last_self_attention,) if output_attentions and last_self_attention is not None else None
+            output = (hidden_states, None, all_hidden_states, attentions_output, None)
             return tuple(v for v in output if v is not None)
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=None,
             hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
+            attentions=(last_self_attention,) if output_attentions and last_self_attention is not None else None,
             cross_attentions=None,
+        )
+
+    def compute_last_layer_attention_weights(
+        self,
+        input_ids: torch.Tensor,
+        cfg_u: Optional[torch.Tensor] = None,
+        cfg_v: Optional[torch.Tensor] = None,
+        ddg_edges: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("You must provide input_ids or inputs_embeds.")
+        if self.use_cfg and (cfg_u is None or cfg_v is None):
+            raise ValueError("cfg_u and cfg_v are required for GraphRoFormerModel when CFG is enabled.")
+        if self.use_ddg and ddg_edges is None:
+            raise ValueError("ddg_edges is required for GraphRoFormerModel when DDG is enabled.")
+
+        if input_ids is not None:
+            input_shape = input_ids.size()
+            device = input_ids.device
+        else:
+            input_shape = inputs_embeds.size()[:-1]
+            device = inputs_embeds.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones(input_shape, device=device)
+        if token_type_ids is None:
+            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+
+        hidden_states = self.embeddings(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            inputs_embeds=inputs_embeds,
+        )
+
+        if len(self.layers) == 0:
+            raise ValueError("GraphRoFormerModel has no layers.")
+
+        for layer_module in self.layers[:-1]:
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=attention_mask,
+                head_mask=None,
+                encoder_hidden_states=None,
+                encoder_attention_mask=None,
+                past_key_value=None,
+                output_attentions=False,
+                cfg_u=cfg_u,
+                cfg_v=cfg_v,
+                ddg_edges=ddg_edges,
+                return_dict=True,
+            )
+            hidden_states = layer_outputs[0]
+
+        last_layer = self.layers[-1]
+        return last_layer.attention.self.compute_attention_weights(
+            hidden_states,
+            cfg_u=cfg_u,
+            cfg_v=cfg_v,
+            ddg_edges=ddg_edges,
+            attention_mask=attention_mask,
         )
     
     

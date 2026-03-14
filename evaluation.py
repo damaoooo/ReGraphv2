@@ -230,7 +230,14 @@ class FunctionDataCollator:
             padded_graphs.append(padded_graph)
         return padded_graphs
     
-def get_model(model_path, svd_rank=32, max_seq_length=4096, embedding_size=768, graph_mode: str = "both"):
+def get_model(
+    model_path,
+    svd_rank=32,
+    max_seq_length=4096,
+    embedding_size=768,
+    graph_mode: str = "both",
+    tokenizer_path: str = None,
+):
     """加载MoCo模型并返回encoder_q用于推理
     
     Args:
@@ -250,6 +257,8 @@ def get_model(model_path, svd_rank=32, max_seq_length=4096, embedding_size=768, 
         svd_rank=svd_rank,
         graph_mode=graph_mode,
     )
+    if tokenizer_path is not None:
+        config.tokenizer_path = tokenizer_path
     
     # 2. 设置vocab_size（从tokenizer获取）
     # 这里需要确保与训练时使用的tokenizer一致
@@ -265,11 +274,24 @@ def get_model(model_path, svd_rank=32, max_seq_length=4096, embedding_size=768, 
     
     # 5. 加载权重文件
     checkpoint_path = os.path.join(model_path, "pytorch_model.bin")
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
-    
-    console.print(f"Loading checkpoint from: {checkpoint_path}")
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    if os.path.exists(checkpoint_path):
+        console.print(f"Loading checkpoint from: {checkpoint_path}")
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+    else:
+        alt_checkpoint_path = os.path.join(model_path, "model.safetensors")
+        if not os.path.exists(alt_checkpoint_path):
+            raise FileNotFoundError(
+                f"Checkpoint file not found: {checkpoint_path} or {alt_checkpoint_path}"
+            )
+        try:
+            from safetensors.torch import load_file as load_safetensors_file
+        except ImportError as exc:
+            raise ImportError(
+                "Found model.safetensors but safetensors is not installed."
+            ) from exc
+        console.print(f"Loading checkpoint from: {alt_checkpoint_path}")
+        state_dict = load_safetensors_file(alt_checkpoint_path, device="cpu")
+
     moco_model.load_state_dict(state_dict)
     console.print("[green]✓ Model loaded successfully[/green]")
     

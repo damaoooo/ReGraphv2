@@ -47,6 +47,7 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
     ) -> Union[Tuple, Dict[str, torch.Tensor]]:
         
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_attentions = bool(kwargs.pop("output_attentions", False))
 
         # 图张量不需要梯度，直接 detach
         if cfg_u is not None:
@@ -64,6 +65,7 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
             cfg_v=cfg_v,
             ddg_edges=ddg_edges,
             return_dict=True,
+            output_attentions=output_attentions,
             **kwargs
         )
         
@@ -102,10 +104,13 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
             output = (prediction_logits, contrastive_embed)
             return ((mlm_loss,) + output) if mlm_loss is not None else output
 
-        return {
+        result = {
             "loss": mlm_loss,                # MLM Loss (如果没传 labels 则是 None)
             "embedding": contrastive_embed  # 对比学习向量 [B, Emb_Dim]
         }
+        if output_attentions:
+            result["attentions"] = outputs.attentions
+        return result
 
     def mean_pooling(self, token_embeddings, attention_mask):
         """
