@@ -496,6 +496,11 @@ def generate_embeddings_with_model(
             console.print(f"  Batch #{failure['batch_idx']}: {failure['error_type']} - {failure['error'][:100]}")
     else:
         console.print(f"\n[bold green]✓ 评估完成！所有batch推理成功[/bold green]")
+
+    # embedding 生成完成后模型不再使用，显式释放以降低后续阶段显存峰值。
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     
     if current_idx == 0:
         console.print("[bold red]ERROR: 没有成功的batch，无法返回结果[/bold red]")
