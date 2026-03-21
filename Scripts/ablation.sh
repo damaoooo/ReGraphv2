@@ -17,7 +17,8 @@ Options:
 												Default: cfg_as_ddg_no_ddg
 	--steps N             Max training steps.
 												Default: 30000
-	--output_file FILE    Write all script output (stdout/stderr) to FILE.
+	--output_file FILE    Write evaluation output (stdout/stderr) to FILE.
+								Training output stays in terminal.
 												If omitted, defaults to
 												./logs_ablation<steps>_<graph_mode>.log
 	-h, --help            Show this help message and exit.
@@ -78,10 +79,9 @@ if [[ -z "${output_file}" ]]; then
 fi
 
 mkdir -p "$(dirname "${output_file}")"
-exec > >(tee -a "${output_file}") 2>&1
 
 echo "[INFO] graph_mode=${graph_mode}, steps=${steps}"
-echo "[INFO] output_file=${output_file}"
+echo "[INFO] evaluation output_file=${output_file}"
 
 run_tag="ablation${step_tag}_${graph_mode}"
 model_dir="./db1_model_${run_tag}"
@@ -94,11 +94,13 @@ if [[ -f "./db1_${graph_mode}_test.pkl.npy" ]]; then
     rm "./db1_${graph_mode}_test.pkl.npy"
 fi
 
-python evaluation.py /home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_dataset_pool  /home/damaoooo/Downloads/regraphv2/IR/dataset-1/test_final_set/train_positive_map.pkl ${model_dir} --max-length 4096 -e ./db1_${graph_mode}_test.pkl.npy -b 16 --gpu-batch-size 256 --graph-mode ${graph_mode} --fp16
+echo "===== evaluation: dataset-1 =====" | tee -a "${output_file}"
+python evaluation.py /home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_dataset_pool  /home/damaoooo/Downloads/regraphv2/IR/dataset-1/test_final_set/train_positive_map.pkl ${model_dir} --max-length 4096 -e ./db1_${graph_mode}_test.pkl.npy -b 16 --gpu-batch-size 256 --graph-mode ${graph_mode} --fp16 2>&1 | tee >(sed -r 's/\x1B\[[0-9;?]*[ -\/]*[@-~]//g' | tr '\r' '\n' >> "${output_file}")
 
 if [[ -f "./db2_${graph_mode}_test.pkl.npy" ]]; then
     echo "[INFO] Removing existing evaluation results: ./db2_${graph_mode}_test.pkl.npy"
     rm "./db2_${graph_mode}_test.pkl.npy"
 fi
 
-python evaluation.py /home/damaoooo/Downloads/regraphv2/IR/Dataset-2/db2_final_set/train_dataset_pool  /home/damaoooo/Downloads/regraphv2/IR/Dataset-2/db2_final_set/train_positive_map.pkl ${model_dir} --max-length 4096 -e ./db2_${graph_mode}_test.pkl.npy -b 16 --gpu-batch-size 256 --graph-mode ${graph_mode} --fp16
+echo "===== evaluation: dataset-2 =====" | tee -a "${output_file}"
+python evaluation.py /home/damaoooo/Downloads/regraphv2/IR/Dataset-2/db2_final_set/train_dataset_pool  /home/damaoooo/Downloads/regraphv2/IR/Dataset-2/db2_final_set/train_positive_map.pkl ${model_dir} --max-length 4096 -e ./db2_${graph_mode}_test.pkl.npy -b 16 --gpu-batch-size 256 --graph-mode ${graph_mode} --fp16 2>&1 | tee >(sed -r 's/\x1B\[[0-9;?]*[ -\/]*[@-~]//g' | tr '\r' '\n' >> "${output_file}")
