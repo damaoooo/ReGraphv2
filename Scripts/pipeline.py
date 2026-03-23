@@ -90,6 +90,24 @@ def task3(
         raise typer.Exit(code=1)
 
 @app.command()
+def task4(
+    input_path: str = typer.Option(..., help="Input directory containing .bc files"),
+    workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
+    resume: bool = typer.Option(False, help="Resume from previous run"),
+):
+    """Run Task 4: Recompile optimized .bc files to .re artifacts"""
+    args = ["--input-path", input_path, "--workers", str(workers)]
+    if resume:
+        args.append("--resume")
+
+    success = run_task("task4_recompile.py", args)
+    if success:
+        console.print("[bold green]Task 4 completed successfully![/bold green]")
+    else:
+        console.print("[bold red]Task 4 failed![/bold red]")
+        raise typer.Exit(code=1)
+
+@app.command()
 def pipeline(
     db1: bool = typer.Option(False, help="Use DataProcess-1 as input"),
     input_path: str = typer.Option("", help="Custom input directory"),
@@ -97,10 +115,14 @@ def pipeline(
     output: str = typer.Option(..., help="Output directory"),
     workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
     resume: bool = typer.Option(False, help="Resume from previous run"),
-    start_from: int = typer.Option(1, help="Start from task number (1, 2, or 3)"),
+    start_from: int = typer.Option(1, help="Start from task number (1, 2, 3, or 4)"),
     task1_start_from_step2: bool = typer.Option(
         False,
         help="Task 1: start directly from Step 2 (scan .i64 and lift), skip Step 1",
+    ),
+    enable_recompile: bool = typer.Option(
+        False,
+        help="Enable optional Task 4 recompile (.bc -> .re). Disabled by default",
     ),
 ):
     """Run the complete pipeline or start from a specific task"""
@@ -172,6 +194,20 @@ def pipeline(
         
         if not run_task("task3_extract.py", args):
             console.print("[bold red]Task 3 failed! Pipeline stopped.[/bold red]")
+            raise typer.Exit(code=1)
+
+    # Task 4: Recompile .bc files to .re (optional)
+    if enable_recompile and start_from <= 4:
+        console.print("[bold blue]=" * 60 + "[/bold blue]")
+        console.print("[bold blue]TASK 4: Recompiling .bc files to .re[/bold blue]")
+        console.print("[bold blue]=" * 60 + "[/bold blue]")
+
+        args = ["--input-path", final_output_path, "--workers", str(workers)]
+        if resume:
+            args.append("--resume")
+
+        if not run_task("task4_recompile.py", args):
+            console.print("[bold red]Task 4 failed! Pipeline stopped.[/bold red]")
             raise typer.Exit(code=1)
 
     console.print("[bold green]=" * 60 + "[/bold green]")
