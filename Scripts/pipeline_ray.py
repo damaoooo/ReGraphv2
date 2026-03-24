@@ -7,7 +7,7 @@ per-file command semantics:
 1. Generate .i64 files with IDA
 2. Lift .i64 files to .ll with ida2llvm.py
 3. Re-optimize .ll files to .bc with clang
-4. Split .bc files into per-function artifacts
+4. Split .bc files into per-function artifacts (optional)
 5. Recompile optimized .bc files to .re artifacts (optional)
 
 The driver only does scheduling and progress reporting. Real work is
@@ -140,6 +140,7 @@ def validate_runtime_inputs(
     start_from: int,
     task1_start_from_step2: bool,
     enable_recompile: bool,
+    skip_extract: bool,
     ida_bin: str,
     ida2llvm_python: str,
     conda_env: str,
@@ -150,7 +151,7 @@ def validate_runtime_inputs(
     need_task1_step1 = start_from <= 1 and not task1_start_from_step2
     need_task1_step2 = start_from <= 1
     need_task2 = start_from <= 2
-    need_task3 = start_from <= 3
+    need_task3 = start_from <= 3 and not skip_extract
     need_task4 = enable_recompile and start_from <= 4
 
     if need_task1_step1 and not command_exists(ida_bin):
@@ -755,6 +756,10 @@ def main(
         False,
         help="Enable optional Task 4 recompile (.bc -> .re). Disabled by default",
     ),
+    skip_extract: bool = typer.Option(
+        False,
+        help="Skip Task 3 function extraction and keep only lifted/re-optimized/recompiled whole-file artifacts",
+    ),
     ray_mode: str = typer.Option(
         "auto",
         help="Ray bootstrap mode: auto | local | external | slurm",
@@ -828,6 +833,7 @@ def main(
         start_from=start_from,
         task1_start_from_step2=task1_start_from_step2,
         enable_recompile=enable_recompile,
+        skip_extract=skip_extract,
         ida_bin=resolved_ida_bin,
         ida2llvm_python=resolved_ida2llvm_python,
         conda_env=conda_env,
@@ -866,6 +872,8 @@ def main(
         console.print("[yellow]Resume mode enabled[/yellow]")
     if task1_start_from_step2:
         console.print("[yellow]Task 1 starts from Step 2[/yellow]")
+    if skip_extract:
+        console.print("[yellow]Task 3 extraction will be skipped[/yellow]")
     if enable_recompile:
         console.print("[yellow]Task 4 recompile enabled (.bc -> .re)[/yellow]")
 
@@ -985,7 +993,7 @@ def main(
             write_failure_report(log_path, "task2", reopt_summary["failures"])
             all_failures.extend(reopt_summary["failures"])
 
-        if start_from <= 3:
+        if start_from <= 3 and not skip_extract:
             console.print("[bold blue]============================================================[/bold blue]")
             console.print("[bold blue]TASK 3: Extract Functions[/bold blue]")
             console.print("[bold blue]============================================================[/bold blue]")
@@ -1013,6 +1021,8 @@ def main(
             )
             write_failure_report(log_path, "task3", extract_summary["failures"])
             all_failures.extend(extract_summary["failures"])
+        elif start_from <= 3 and skip_extract:
+            console.print("[yellow]Skipping Task 3: function extraction disabled by --skip-extract[/yellow]")
 
         if enable_recompile and start_from <= 4:
             console.print("[bold blue]============================================================[/bold blue]")
