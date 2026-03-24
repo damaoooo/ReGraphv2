@@ -20,6 +20,7 @@ import os
 import sys
 import subprocess
 import shutil
+import socket
 import uuid
 from itertools import islice
 from typing import Dict, Iterator, List, Optional
@@ -208,6 +209,52 @@ def remove_marker(stage: str, item: Dict[str, str], config: Dict[str, object]) -
         os.remove(path)
 
 
+def failure_relative_path_for_item(stage: str, item: Dict[str, str], config: Dict[str, object]) -> str:
+    if stage == "task1_step1":
+        return os.path.relpath(item["input"], str(config["db_path"]))
+    if item.get("output"):
+        return os.path.relpath(item["output"], str(config["final_output_path"]))
+    return os.path.relpath(item["input"], str(config["final_output_path"]))
+
+
+def live_failure_log_path_for_item(stage: str, item: Dict[str, str], config: Dict[str, object]) -> str:
+    live_failure_root = str(config["live_failure_root"])
+    relative_path = failure_relative_path_for_item(stage, item, config)
+    return os.path.join(live_failure_root, stage, relative_path + ".log")
+
+
+def clear_live_failure_log(stage: str, item: Dict[str, str], config: Dict[str, object]) -> None:
+    path = live_failure_log_path_for_item(stage, item, config)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def write_live_failure_log(result: Dict[str, object], config: Dict[str, object]) -> None:
+    stage = str(result["stage"])
+    item = {
+        "input": str(result["input"]),
+        "output": str(result.get("output", "")),
+    }
+    path = live_failure_log_path_for_item(stage, item, config)
+    ensure_directory(os.path.dirname(path))
+
+    hostname = socket.gethostname()
+    pid = os.getpid()
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f"Stage: {stage}\n")
+        handle.write(f"Host: {hostname}\n")
+        handle.write(f"PID: {pid}\n")
+        handle.write(f"Input: {result['input']}\n")
+        if result.get("output"):
+            handle.write(f"Output: {result['output']}\n")
+        if result.get("command"):
+            handle.write(f"Command: {result['command']}\n")
+        handle.write(f"Return code: {result.get('returncode', -1)}\n")
+        if result.get("error"):
+            handle.write("Error:\n")
+            handle.write(f"{result['error']}\n")
+
+
 def temp_file_path(final_path: str) -> str:
     return f"{final_path}.raytmp.{uuid.uuid4().hex}"
 
@@ -302,9 +349,13 @@ def process_stage_item(stage: str, item: Dict[str, str], config: Dict[str, objec
             extra_error = f"Expected output not found: {i64_path}"
         if process_result["success"]:
             write_marker(stage, item, config)
+            clear_live_failure_log(stage, item, config)
         else:
             remove_marker(stage, item, config)
-        return build_result(stage, item, command, process_result, extra_error=extra_error)
+        result = build_result(stage, item, command, process_result, extra_error=extra_error)
+        if not result["success"]:
+            write_live_failure_log(result, config)
+        return result
 
     if stage == "task1_step2":
         final_output = item["output"]
@@ -321,11 +372,15 @@ def process_stage_item(stage: str, item: Dict[str, str], config: Dict[str, objec
             else:
                 os.replace(tmp_output, final_output)
                 write_marker(stage, item, config)
+                clear_live_failure_log(stage, item, config)
         else:
             remove_marker(stage, item, config)
         if os.path.exists(tmp_output):
             remove_path_if_exists(tmp_output)
-        return build_result(stage, item, command, process_result, extra_error=extra_error)
+        result = build_result(stage, item, command, process_result, extra_error=extra_error)
+        if not result["success"]:
+            write_live_failure_log(result, config)
+        return result
 
     if stage == "task2":
         final_output = item["output"]
@@ -352,11 +407,15 @@ def process_stage_item(stage: str, item: Dict[str, str], config: Dict[str, objec
             else:
                 os.replace(tmp_output, final_output)
                 write_marker(stage, item, config)
+                clear_live_failure_log(stage, item, config)
         else:
             remove_marker(stage, item, config)
         if os.path.exists(tmp_output):
             remove_path_if_exists(tmp_output)
-        return build_result(stage, item, command, process_result, extra_error=extra_error)
+        result = build_result(stage, item, command, process_result, extra_error=extra_error)
+        if not result["success"]:
+            write_live_failure_log(result, config)
+        return result
 
     if stage == "task3":
         final_output = item["output"]
@@ -376,11 +435,15 @@ def process_stage_item(stage: str, item: Dict[str, str], config: Dict[str, objec
                     remove_path_if_exists(final_output)
                 os.rename(tmp_output, final_output)
                 write_marker(stage, item, config)
+                clear_live_failure_log(stage, item, config)
         else:
             remove_marker(stage, item, config)
         if os.path.exists(tmp_output):
             remove_path_if_exists(tmp_output)
-        return build_result(stage, item, command, process_result, extra_error=extra_error)
+        result = build_result(stage, item, command, process_result, extra_error=extra_error)
+        if not result["success"]:
+            write_live_failure_log(result, config)
+        return result
 
     if stage == "task4":
         final_output = item["output"]
@@ -404,11 +467,15 @@ def process_stage_item(stage: str, item: Dict[str, str], config: Dict[str, objec
             else:
                 os.replace(tmp_output, final_output)
                 write_marker(stage, item, config)
+                clear_live_failure_log(stage, item, config)
         else:
             remove_marker(stage, item, config)
         if os.path.exists(tmp_output):
             remove_path_if_exists(tmp_output)
-        return build_result(stage, item, command, process_result, extra_error=extra_error)
+        result = build_result(stage, item, command, process_result, extra_error=extra_error)
+        if not result["success"]:
+            write_live_failure_log(result, config)
+        return result
 
     raise ValueError(f"Unsupported stage: {stage}")
 
@@ -419,16 +486,18 @@ def process_batch(stage: str, batch: List[Dict[str, str]], config: Dict[str, obj
         try:
             results.append(process_stage_item(stage, item, config))
         except Exception as exc:  # pragma: no cover - defensive guard
+            result = {
+                "stage": stage,
+                "input": item["input"],
+                "output": item.get("output", ""),
+                "success": False,
+                "returncode": -1,
+                "command": "",
+                "error": str(exc),
+            }
+            write_live_failure_log(result, config)
             results.append(
-                {
-                    "stage": stage,
-                    "input": item["input"],
-                    "output": item.get("output", ""),
-                    "success": False,
-                    "returncode": -1,
-                    "command": "",
-                    "error": str(exc),
-                }
+                result
             )
     return results
 
@@ -898,6 +967,7 @@ def main(
         "task4_timeout": task4_timeout,
         "db_path": db_path,
         "final_output_path": final_output_path,
+        "live_failure_root": os.path.join(output_root, ".pipeline_ray_live_failures", db),
         "state_root": os.path.join(output_root, ".pipeline_ray_state", db),
         "resume": resume,
     }
