@@ -201,7 +201,7 @@ class FunctionDataCollator:
 
         if self.use_cfg:
             cfg_graphs_padded = self.pad_graph(cfg_graphs_raw, feature_length=5)
-            cfg_tensor = torch.tensor(cfg_graphs_padded, dtype=torch.long)
+            cfg_tensor = torch.tensor(cfg_graphs_padded, dtype=torch.float)
 
             current_max_len = input_ids.shape[1]
             cfg_u, cfg_v = factorize_cfg_to_uv_batch(

@@ -294,7 +294,7 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
                 padded_cfg = self.pad_graph(cfg_list, feature_length=5)
                 current_max_len = seq_len_tensor.shape[1]
                 u_tensor, v_tensor = factorize_cfg_to_uv_batch(
-                    torch.tensor(padded_cfg, dtype=torch.long),
+                    torch.tensor(padded_cfg, dtype=torch.float),
                     rank=self.config.svd_rank,
                     total_seq_len=current_max_len,
                     device='cpu'
