@@ -84,5 +84,5 @@ async def embed_binary(
 
 if __name__ == "__main__":
     import uvicorn
-    os.environ["REGRAPH_MODEL_PATH"] = "/home/damaoooo/Downloads/regraphv2/db1_model_ablation30k_both"
+    os.environ["REGRAPH_MODEL_PATH"] = "db1_model_ablation30000_no_ddg"
     uvicorn.run(app, host="0.0.0.0", port=8000)

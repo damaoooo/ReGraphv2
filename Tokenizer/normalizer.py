@@ -55,7 +55,8 @@ class LLVMIRNormalizer:
             'bb_ref': re.compile(r'(label\s+%"[^"]*"|%"[^"]*"|\s@"[^"]*")'),
             'function_ref': re.compile(r'@[^\s,\)\]:]+'),
             'line_interger_constants': re.compile(r'(?<!i)(?<!\[)(?<!%\.)(\b\d+\b)(?![*.]|\s*x\s)'),
-            'line_float_constants': re.compile(r'(?<!%\.)\b\d+\.\d+(?:e[+-]?\d+)?\b')
+            'line_float_constants': re.compile(r'(?<!%\.)\b\d+\.\d+(?:e[+-]?\d+)?\b'),
+            'attributes_section': re.compile(r'\nattributes\s+#[0-9]+\s*=\s*{[^}]*}')
         }
     
     def normalize_with_llvmlite(self, ir_code: str) -> str:
@@ -556,8 +557,11 @@ class LLVMIRNormalizer:
     
     def normalize_ir(self, ir_code: str) -> str:
         """Normalize entire LLVM IR code"""
-        # Try LLVMLite first, fall back to regex if needed
         
+        # No matter what method, remove the attributes section at the end of the file, as it can contain non-deterministic content that doesn't affect program semantics
+        ir_code = self.patterns['attributes_section'].sub('', ir_code)
+        
+        # Try LLVMLite first, fall back to regex if needed
         if LLVMLITE_AVAILABLE:
             return self.normalize_with_llvmlite(ir_code)
         else:
