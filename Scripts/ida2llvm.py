@@ -41,12 +41,49 @@ i8ptr = ir.IntType(8).as_pointer()
 ptrsize = 64 if ida_ida.inf_is_64bit() else 32
 ptext = {}  # 缓存反编译的函数: {地址: 反编译结果}
 refreshed_funcs = set()  # 避免重复触发无缓存反编译
+lifting_funcs = set()  # 正在定义函数体的函数，防止递归重入
+lifted_funcs = set()  # 已经完成函数体定义的函数
 
 # 线程局部存储段大小（Windows FS段标准大小）
 FS_SEGMENT_SIZE = 0x10000  # 64KB
 
 # 浮点数提取失败时的默认值
 DEFAULT_FLOAT_VALUE = 1.0
+
+
+def _function_state_key(func_name: str, ea: int):
+    """为函数声明/定义状态生成稳定键值。"""
+    if ea is None or ea == ida_idaapi.BADADDR:
+        return f"name:{func_name}"
+    return f"ea:{ea:#x}"
+
+
+def _sanitize_symbol_name(name: str) -> str:
+    """将 IDA 名称转换为更稳妥的 LLVM 局部名。"""
+    sanitized = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
+    sanitized = sanitized.strip("_")
+    return sanitized or "unnamed"
+
+
+def _get_register_storage(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder):
+    """
+    为 Hex-Rays 的寄存器操作数分配一个稳定的栈槽。
+
+    这里不试图完整模拟物理寄存器别名关系，只提供一个可读可写的 SSA 外存储，
+    避免寄存器型操作数直接返回 None 导致后续算术/位运算崩溃。
+    """
+    func = blk.parent
+    reg_name = f"reg_{_sanitize_symbol_name(mop.dstr())}"
+    reg_width = ptrsize if mop.size <= 0 else mop.size * 8
+
+    if reg_name not in func.lvars:
+        reg_type = ir.IntType(reg_width)
+        with builder.goto_entry_block():
+            reg_ptr = builder.alloca(reg_type, name=reg_name)
+            builder.store(ir.Constant(reg_type, 0), reg_ptr)
+        func.lvars[reg_name] = reg_ptr
+
+    return func.lvars[reg_name]
 
 def lift_tif(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
     """
@@ -790,11 +827,8 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
     with suppress(NotImplementedError):
         return lift_intrinsic_function(module, func_name)
 
-    with suppress(KeyError):
-        return module.get_global(func_name) 
-
     func_ea = ida_name.get_name_ea(ida_idaapi.BADADDR, func_name)
-    if ida_segment.segtype(func_ea) & ida_segment.SEG_XTRN:
+    if func_ea != ida_idaapi.BADADDR and ida_segment.segtype(func_ea) & ida_segment.SEG_XTRN:
         is_declare = True 
 
     if func_ea == ida_idaapi.BADADDR:
@@ -805,12 +839,38 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
         tif = lift_type_from_address(func_ea) 
 
     typ = lift_tif(tif) 
-    if isinstance(typ, ir.PointerType):
-        print()
-    res = ir.Function(module, typ, func_name)
+    state_key = _function_state_key(func_name, func_ea)
+
+    existing = None
+    with suppress(KeyError):
+        existing = module.get_global(func_name)
+
+    if existing is not None:
+        if not isinstance(existing, ir.Function):
+            return existing
+        if (
+            is_declare
+            or not existing.is_declaration
+            or state_key in lifting_funcs
+            or state_key in lifted_funcs
+        ):
+            return existing
+        res = existing
+    else:
+        if isinstance(typ, ir.PointerType):
+            logging.debug(f"Unexpected pointer type for function {func_name}: {typ}")
+        res = ir.Function(module, typ, func_name)
+
     if is_declare:
         return res
-    return lift_from_address(module, func_ea, typ) 
+
+    lifting_funcs.add(state_key)
+    try:
+        res = lift_from_address(module, func_ea, typ)
+        lifted_funcs.add(state_key)
+        return res
+    finally:
+        lifting_funcs.discard(state_key)
 
 def calc_instsize(typ):
     """
@@ -857,13 +917,20 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
     """
     builder.position_at_end(blk)
     if mop.t == ida_hexrays.mop_r: # 寄存器值
-        return None
+        reg_ptr = _get_register_storage(mop, blk, builder)
+        if knowntyp != None:
+            reg_ptr = typecast(reg_ptr, knowntyp, builder)
+        elif mop.size > 0 and calc_instsize(reg_ptr.type.pointee) != mop.size * 8:
+            reg_ptr = typecast(reg_ptr, ir.IntType(mop.size * 8).as_pointer(), builder)
+        return reg_ptr if dest else builder.load(reg_ptr)
     elif mop.t == ida_hexrays.mop_n: # 立即数
         res = ir.Constant(ir.IntType(mop.size * 8), mop.nnn.value)
         res.parent = blk
         return res
     elif mop.t == ida_hexrays.mop_d: # 另一个指令
         d = lift_insn(mop.d, blk, builder)
+        if d is None:
+            return None
         if isinstance(d.type, ir.VoidType):
             pass
         elif mop.size == -1:
@@ -939,7 +1006,9 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
                 # 返回函数声明
                 g = lift_function(blk.parent.parent, name, True, ea, tif)
             else:
-                g = lift_function(blk.parent.parent, name, False, ea, tif)
+                # 这里只需要确保函数符号存在。函数体统一在 insertAllFunctions() 中定义，
+                # 避免在提升调用点时递归进入被调函数体，导致深调用链压垮 Python 栈。
+                g = lift_function(blk.parent.parent, name, True, ea, tif)
             return g
                             
         else:  
@@ -976,12 +1045,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
                 f_arg = blk.parent.parent.declare_intrinsic(arg.helper, fnty=ir.FunctionType(typ, []))
 
             if arg.t == ida_hexrays.mop_r and f_arg == None:
-                name = "fs"
-                func = blk.parent
-                if name not in func.lvars:
-                    with builder.goto_entry_block():                
-                        func.lvars[name] = builder.alloca(ir.IntType(16), name = name)
-                llvm_arg = func.lvars[name]
+                llvm_arg = _get_register_storage(arg, blk, builder)
                 f_arg = llvm_arg if mop.size == -1 else builder.load(llvm_arg)
 
             f_arg = typecast(f_arg, typ, builder)
@@ -1879,6 +1943,8 @@ def lift_binary_to_llvm(
         # Clear global caches to avoid stale entries across multiple binaries.
         ptext.clear()
         refreshed_funcs.clear()
+        lifting_funcs.clear()
+        lifted_funcs.clear()
 
         # 打开 IDA 数据库
         idapro.open_database(input_binary, True)
@@ -1940,6 +2006,11 @@ def main(
         logging.basicConfig(level=logging.INFO)
 
     try:
+        ptext.clear()
+        refreshed_funcs.clear()
+        lifting_funcs.clear()
+        lifted_funcs.clear()
+
         idapro.open_database(file, True)
         ida_auto.auto_wait()
         bin2llvm = BIN2LLVMController(target_mode=target)
@@ -1959,4 +2030,3 @@ def main(
 
 if __name__ == "__main__":
     app()
-
