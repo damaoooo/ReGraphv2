@@ -724,11 +724,6 @@ def profile_gpu_mem_command(
 def train_command(
     use_cfg: bool = typer.Option(True, "--cfg/--no-cfg", help="Enable CFG graph branch."),
     use_ddg: bool = typer.Option(True, "--ddg/--no-ddg", help="Enable DDG graph branch."),
-    graph_mode: Optional[str] = typer.Option(
-        None,
-        "--graph-mode",
-        help="Legacy graph mode (both/no_cfg/no_ddg/none). Prefer --cfg/--no-cfg and --ddg/--no-ddg.",
-    ),
     resume: bool = typer.Option(
         False,
         "--resume",
@@ -742,9 +737,6 @@ def train_command(
     ),
 ):
     config = _build_config(overrides=override)
-
-    if graph_mode is not None:
-        use_cfg, use_ddg = _resolve_graph_flags_from_legacy_mode(graph_mode)
 
     config.use_cfg = use_cfg
     config.use_ddg = use_ddg

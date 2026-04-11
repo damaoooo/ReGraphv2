@@ -8,6 +8,20 @@ from transformers import RoFormerConfig
 
 
 class PretrainConfig(RoFormerConfig):
+    def __setattr__(self, name: str, value: Any):
+        """Keep sequence length fields synchronized.
+
+        The codebase uses `max_seq_length` for data truncation/padding, while
+        RoFormer relies on `max_position_embeddings` internally. Divergence
+        between them can cause hard-to-debug runtime issues.
+        """
+        if name in {"max_seq_length", "max_position_embeddings"}:
+            synced_value = int(value)
+            super().__setattr__("max_seq_length", synced_value)
+            super().__setattr__("max_position_embeddings", synced_value)
+            return
+        super().__setattr__(name, value)
+
     def __init__(
         self,
         # === 序列长度配置 ===
