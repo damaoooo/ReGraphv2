@@ -19,3 +19,4 @@ torchaudio
 
 bitsandbytes
 xformers
+torch-geometric

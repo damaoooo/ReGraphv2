@@ -10,7 +10,8 @@ import typer
 from transformers import Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.trainer import unwrap_model
-from Pretrain.pretrain_dataset import MoCoDataCollator, load_dataset
+from Model.graph_utils import build_batched_span_graph_tensors
+from Pretrain.pretrain_dataset import MoCoDataCollator, load_dataset, compute_group_ids
 from Tokenizer.ir_tokenizer import load_tokenizer
 from .pretrain_config import PretrainConfig, DEFAULT_CONFIG
 from typing import Dict, List, Any, Callable, Optional, Tuple
@@ -20,16 +21,16 @@ try:
 except Exception:
     bnb = None
 
-GRAPH_MODES = (
-    "both",
-    "no_cfg",
-    "no_ddg",
-    "none",
-    "cfg_as_ddg",
-    "cfg_as_ddg_no_ddg",
-    "both_cfg_as_ddg",
-)
 app = typer.Typer(add_completion=False, no_args_is_help=False)
+
+LEGACY_GRAPH_MODE_TO_FLAGS: Dict[str, Tuple[bool, bool]] = {
+    "both": (True, True),
+    "no_cfg": (False, True),
+    "no_ddg": (True, False),
+    "none": (False, False),
+}
+
+REMOVED_GRAPH_MODES = {"cfg_as_ddg", "cfg_as_ddg_no_ddg", "both_cfg_as_ddg"}
 
 
 def _split_override_item(item: str) -> Tuple[str, str]:
@@ -112,17 +113,35 @@ def _apply_cli_overrides(config: PretrainConfig, overrides: Optional[List[str]])
         setattr(config, key, new_value)
         print(f"[config override] {key}: {current_value!r} -> {new_value!r}")
 
-    if config.graph_mode not in GRAPH_MODES:
-        raise typer.BadParameter(f"graph_mode must be one of: {'/'.join(GRAPH_MODES)}")
-
     return config
 
 
-def _build_config(graph_mode: Optional[str] = None, overrides: Optional[List[str]] = None) -> PretrainConfig:
+def _build_config(overrides: Optional[List[str]] = None) -> PretrainConfig:
     config = copy.deepcopy(DEFAULT_CONFIG)
-    if graph_mode is not None:
-        config.graph_mode = graph_mode
     return _apply_cli_overrides(config, overrides)
+
+
+def _resolve_graph_flags_from_legacy_mode(mode: str) -> Tuple[bool, bool]:
+    lowered = mode.strip().lower()
+    if lowered in LEGACY_GRAPH_MODE_TO_FLAGS:
+        return LEGACY_GRAPH_MODE_TO_FLAGS[lowered]
+    if lowered in REMOVED_GRAPH_MODES:
+        raise typer.BadParameter(
+            f"graph_mode={mode!r} is no longer supported. "
+            "Use --cfg/--no-cfg and --ddg/--no-ddg explicitly."
+        )
+    supported = "/".join(sorted(LEGACY_GRAPH_MODE_TO_FLAGS.keys()))
+    raise typer.BadParameter(f"Unknown graph_mode={mode!r}. Supported legacy modes: {supported}")
+
+
+def _run_debug_across_supported_modes(base_config: PretrainConfig, runner: Callable[[PretrainConfig], None]):
+    for mode in ("both", "no_cfg", "no_ddg", "none"):
+        use_cfg, use_ddg = LEGACY_GRAPH_MODE_TO_FLAGS[mode]
+        mode_config = copy.deepcopy(base_config)
+        mode_config.use_cfg = use_cfg
+        mode_config.use_ddg = use_ddg
+        print(f"\n=== debug graph_mode={mode} (cfg={use_cfg}, ddg={use_ddg}) ===")
+        runner(mode_config)
 
 
 def _clone_model_config(config: PretrainConfig, vocab_size: int) -> PretrainConfig:
@@ -131,35 +150,20 @@ def _clone_model_config(config: PretrainConfig, vocab_size: int) -> PretrainConf
     return model_config
 
 
-def _append_graph_mode_suffix(path: str, graph_mode: str) -> str:
-    if path.endswith(f"_{graph_mode}"):
+def _graph_tag(config: PretrainConfig) -> str:
+    if config.use_cfg and config.use_ddg:
+        return "cfg_ddg"
+    if config.use_cfg:
+        return "cfg"
+    if config.use_ddg:
+        return "ddg"
+    return "plain"
+
+
+def _append_graph_suffix(path: str, graph_tag: str) -> str:
+    if path.endswith(f"_{graph_tag}"):
         return path
-    return f"{path}_{graph_mode}"
-
-
-def _run_debug_all_modes(config: PretrainConfig, runner: Callable[[PretrainConfig], None], runner_name: str):
-    print(f"--- Running {runner_name} across graph modes: {GRAPH_MODES} ---")
-    results = {}
-
-    for graph_mode in GRAPH_MODES:
-        mode_config = copy.deepcopy(config)
-        mode_config.graph_mode = graph_mode
-        print(f"\n=== [{runner_name}] graph_mode={graph_mode} ===")
-        try:
-            runner(mode_config)
-            results[graph_mode] = "PASS"
-        except Exception as exc:
-            results[graph_mode] = f"FAIL: {exc}"
-            print(f"[{runner_name}] graph_mode={graph_mode} failed: {exc}")
-            traceback.print_exc()
-
-    print(f"\n--- {runner_name} summary ---")
-    for graph_mode in GRAPH_MODES:
-        print(f"{graph_mode}: {results[graph_mode]}")
-
-    failed = [m for m, status in results.items() if not status.startswith("PASS")]
-    if failed:
-        raise RuntimeError(f"{runner_name} failed for modes: {failed}")
+    return f"{path}_{graph_tag}"
 
 
 def _resolve_debug_vocab_size(config: PretrainConfig) -> int:
@@ -186,31 +190,39 @@ def _build_dummy_view(
     input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
     attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.long)
 
-    cfg_u = None
-    cfg_v = None
-    ddg_edges = None
+    seq_lengths = [seq_len] * batch_size
+    ddg_graphs = []
+    cfg_graphs = []
+    max_edges = min(ddg_edges_per_sample, max(seq_len - 1, 0))
 
-    if model_config.use_cfg:
-        cfg_u = torch.randn(batch_size, seq_len, model_config.svd_rank, device=device)
-        cfg_v = torch.randn(batch_size, seq_len, model_config.svd_rank, device=device)
+    for _ in range(batch_size):
+        if model_config.use_ddg:
+            ddg_graphs.append([[idx, idx, idx + 1, idx + 1] for idx in range(max_edges)])
+        if model_config.use_cfg:
+            split = max(seq_len // 2, 1)
+            cfg_graphs.append([[0, split - 1, split, seq_len - 1, 1.0]] if seq_len > 1 else [])
 
-    if model_config.use_ddg:
-        max_edges = min(ddg_edges_per_sample, seq_len)
-        ddg_edges = torch.full((batch_size, max_edges, 4), -1, device=device, dtype=torch.long)
-        if max_edges > 0:
-            src = torch.arange(max_edges, device=device)
-            dst = (src + 1) % seq_len
-            ddg_edges[:, :, 0] = src
-            ddg_edges[:, :, 1] = src
-            ddg_edges[:, :, 2] = dst
-            ddg_edges[:, :, 3] = dst
+    ddg_tensors = (
+        build_batched_span_graph_tensors(ddg_graphs, seq_lengths, include_edge_attr=False)
+        if model_config.use_ddg
+        else {"node_spans": None, "node_batch": None, "edge_index": None}
+    )
+    cfg_tensors = (
+        build_batched_span_graph_tensors(cfg_graphs, seq_lengths, include_edge_attr=True)
+        if model_config.use_cfg
+        else {"node_spans": None, "node_batch": None, "edge_index": None, "edge_attr": None}
+    )
 
     view = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
-        "cfg_u": cfg_u,
-        "cfg_v": cfg_v,
-        "ddg_edges": ddg_edges,
+        "ddg_node_spans": ddg_tensors["node_spans"].to(device) if ddg_tensors["node_spans"] is not None else None,
+        "ddg_node_batch": ddg_tensors["node_batch"].to(device) if ddg_tensors["node_batch"] is not None else None,
+        "ddg_edge_index": ddg_tensors["edge_index"].to(device) if ddg_tensors["edge_index"] is not None else None,
+        "cfg_node_spans": cfg_tensors["node_spans"].to(device) if cfg_tensors["node_spans"] is not None else None,
+        "cfg_node_batch": cfg_tensors["node_batch"].to(device) if cfg_tensors["node_batch"] is not None else None,
+        "cfg_edge_index": cfg_tensors["edge_index"].to(device) if cfg_tensors["edge_index"] is not None else None,
+        "cfg_edge_attr": cfg_tensors["edge_attr"].to(device) if cfg_tensors["edge_attr"] is not None else None,
         "group_ids": torch.arange(batch_size, device=device, dtype=torch.long),
     }
 
@@ -241,7 +253,7 @@ def _debug_with_dummy_batch(config: PretrainConfig, use_gpu: bool):
     view1 = _build_dummy_view(batch_size, seq_len, vocab_size, model_config, device, use_labels=True)
     view2 = _build_dummy_view(batch_size, seq_len, vocab_size, model_config, device, use_labels=False)
 
-    print(f"graph_mode={config.graph_mode}, seq_len={seq_len}, batch_size={batch_size}, device={device}")
+    print(f"use_cfg={config.use_cfg}, use_ddg={config.use_ddg}, seq_len={seq_len}, batch_size={batch_size}, device={device}")
 
     if use_gpu and torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -272,24 +284,6 @@ def _debug_with_dummy_batch(config: PretrainConfig, use_gpu: bool):
         if use_gpu and torch.cuda.is_available():
             torch.cuda.empty_cache()
             print("GPU cache cleared")
-
-def compute_group_ids(data: Dict[int, List[int]]) -> Dict[int, int]:
-    key_to_group_id = {}
-    for anchor_key, positive_keys in data.items():
-        if anchor_key in key_to_group_id:
-            continue
-
-        if positive_keys:
-            min_positive = min(positive_keys)
-            if anchor_key < min_positive:
-                group_id = anchor_key
-                key_to_group_id[anchor_key] = group_id
-                for member in positive_keys:
-                    key_to_group_id[member] = group_id
-        else:
-            key_to_group_id[anchor_key] = anchor_key
-            
-    return key_to_group_id
 
 def debug_cpu(config: PretrainConfig = DEFAULT_CONFIG):
     _debug_with_dummy_batch(config, use_gpu=False)
@@ -370,32 +364,38 @@ def profile_extreme_seq_len_memory(
         if use_labels:
             labels = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
 
-        cfg_u = None
-        cfg_v = None
-        ddg_edges = None
+        seq_lengths = [seq_len] * batch_size
+        ddg_graphs = []
+        cfg_graphs = []
+        max_edges = min(ddg_edges_per_sample, max(seq_len - 1, 0))
+        for _ in range(batch_size):
+            if model_config.use_ddg:
+                ddg_graphs.append([[idx, idx, idx + 1, idx + 1] for idx in range(max_edges)])
+            if model_config.use_cfg:
+                split = max(seq_len // 2, 1)
+                cfg_graphs.append([[0, split - 1, split, seq_len - 1, 1.0]] if seq_len > 1 else [])
 
-        if model_config.use_cfg:
-            cfg_u = torch.randn(batch_size, seq_len, model_config.svd_rank, device=device)
-            cfg_v = torch.randn(batch_size, seq_len, model_config.svd_rank, device=device)
-
-        if model_config.use_ddg:
-            max_edges = min(ddg_edges_per_sample, seq_len)
-            ddg_edges = torch.full((batch_size, max_edges, 4), -1, device=device, dtype=torch.long)
-            if max_edges > 0:
-                src = torch.arange(max_edges, device=device)
-                dst = (src + 1) % seq_len
-                # Use valid in-range indices and pad the rest with -1
-                ddg_edges[:, :, 0] = src
-                ddg_edges[:, :, 1] = src
-                ddg_edges[:, :, 2] = dst
-                ddg_edges[:, :, 3] = dst
+        ddg_tensors = (
+            build_batched_span_graph_tensors(ddg_graphs, seq_lengths, include_edge_attr=False)
+            if model_config.use_ddg
+            else {"node_spans": None, "node_batch": None, "edge_index": None}
+        )
+        cfg_tensors = (
+            build_batched_span_graph_tensors(cfg_graphs, seq_lengths, include_edge_attr=True)
+            if model_config.use_cfg
+            else {"node_spans": None, "node_batch": None, "edge_index": None, "edge_attr": None}
+        )
 
         view = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "cfg_u": cfg_u,
-            "cfg_v": cfg_v,
-            "ddg_edges": ddg_edges,
+            "ddg_node_spans": ddg_tensors["node_spans"].to(device) if ddg_tensors["node_spans"] is not None else None,
+            "ddg_node_batch": ddg_tensors["node_batch"].to(device) if ddg_tensors["node_batch"] is not None else None,
+            "ddg_edge_index": ddg_tensors["edge_index"].to(device) if ddg_tensors["edge_index"] is not None else None,
+            "cfg_node_spans": cfg_tensors["node_spans"].to(device) if cfg_tensors["node_spans"] is not None else None,
+            "cfg_node_batch": cfg_tensors["node_batch"].to(device) if cfg_tensors["node_batch"] is not None else None,
+            "cfg_edge_index": cfg_tensors["edge_index"].to(device) if cfg_tensors["edge_index"] is not None else None,
+            "cfg_edge_attr": cfg_tensors["edge_attr"].to(device) if cfg_tensors["edge_attr"] is not None else None,
         }
         if run_backward:
             group_ids = torch.arange(batch_size, device=device, dtype=torch.long)
@@ -498,9 +498,10 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         config=config
     )
 
-    output_dir = _append_graph_mode_suffix(config.output_dir, config.graph_mode)
-    logging_dir = _append_graph_mode_suffix(config.logging_dir, config.graph_mode)
-    final_model_dir = _append_graph_mode_suffix(config.final_model_dir, config.graph_mode)
+    graph_tag = _graph_tag(config)
+    output_dir = _append_graph_suffix(config.output_dir, graph_tag)
+    logging_dir = _append_graph_suffix(config.logging_dir, graph_tag)
+    final_model_dir = _append_graph_suffix(config.final_model_dir, graph_tag)
 
     bad_batch_log_path = None
     if config.skip_bad_batch:
@@ -559,7 +560,11 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         logging_steps=config.logging_steps,
         report_to=config.report_to,
     )
-    model.gradient_checkpointing_enable()
+    if config.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    else:
+        model.gradient_checkpointing_disable()
+
     class SafeTrainer(Trainer):
         def __init__(self, *args, **kwargs):
             self.bad_batch_log_path = kwargs.pop("bad_batch_log_path", None)
@@ -596,22 +601,15 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         def training_step(self, model, inputs, num_items_in_batch=None):
             if inputs is None:
                 self.skipped_steps += 1
-                return torch.tensor(0.0, device=self.args.device)
-            try:
-                return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
-            except Exception as exc:
-                if not config.skip_bad_batch:
-                    raise
-                self.skipped_steps += 1
-                self.model.zero_grad(set_to_none=True)
-                msg = f"[SKIP STEP] step={self.state.global_step} error={exc}"
+                msg = f"[SKIP STEP] step={self.state.global_step} reason=collator_returned_none"
                 print(msg)
-                traceback.print_exc()
                 if self.bad_batch_log_path:
                     with open(self.bad_batch_log_path, "a") as f:
                         f.write(msg + "\n")
-                        traceback.print_exc(file=f)
-                return torch.tensor(0.0, device=self.args.device)
+                return torch.zeros((), device=self.args.device)
+            # Do not swallow model/config/runtime errors here. If forward/backward
+            # fails, raise immediately so training cannot falsely appear successful.
+            return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
 
     trainer = SafeTrainer(
         model=model,
@@ -635,6 +633,15 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
     else:
         print("Starting training from scratch...")
         train_result = trainer.train()
+
+    if trainer.skipped_steps:
+        print(f"Skipped steps due to bad batches: {trainer.skipped_steps}")
+        if trainer.skipped_steps >= train_args.max_steps:
+            raise RuntimeError(
+                "All training steps were skipped due to bad batches. "
+                "Please check bad_batches.log and dataset/collator integrity."
+            )
+
     print("Training finished.")
 
     # --- 训练完成后 ---
@@ -653,18 +660,20 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
 
 @app.callback(invoke_without_command=True)
 def cli(ctx: typer.Context):
-    """Pretrain CLI. Default behavior is `debug cpu all`."""
+    """Pretrain CLI. Default behavior is `debug cpu`."""
     if ctx.invoked_subcommand is None:
-        _run_debug_all_modes(DEFAULT_CONFIG, debug_cpu, "debug_cpu")
+        debug_cpu(DEFAULT_CONFIG)
 
 
 @app.command("debug")
 def debug_command(
     device: str = typer.Argument("cpu", help="Run on cpu or gpu."),
-    graph_mode: str = typer.Argument(
-        "all",
-        help="all or one of both/no_cfg/no_ddg/none/cfg_as_ddg/cfg_as_ddg_no_ddg/both_cfg_as_ddg.",
+    graph_mode: Optional[str] = typer.Argument(
+        None,
+        help="Legacy positional graph mode (all/both/no_cfg/no_ddg/none).",
     ),
+    use_cfg: bool = typer.Option(True, "--cfg/--no-cfg", help="Enable CFG graph branch."),
+    use_ddg: bool = typer.Option(True, "--ddg/--no-ddg", help="Enable DDG graph branch."),
     override: Optional[List[str]] = typer.Option(
         None,
         "--set",
@@ -673,23 +682,23 @@ def debug_command(
     ),
 ):
     device = device.lower()
-    graph_mode = graph_mode.lower()
 
     if device not in {"cpu", "gpu"}:
         raise typer.BadParameter("device must be one of: cpu, gpu")
-    if graph_mode != "all" and graph_mode not in GRAPH_MODES:
-        raise typer.BadParameter(f"graph_mode must be all/{'/'.join(GRAPH_MODES)}")
 
     runner: Callable[[PretrainConfig], None] = debug_cpu if device == "cpu" else debug_gpu
-    runner_name = f"debug_{device}"
-    base_config = _build_config(overrides=override)
+    config = _build_config(overrides=override)
 
-    if graph_mode == "all":
-        _run_debug_all_modes(base_config, runner, runner_name)
-    else:
-        mode_config = copy.deepcopy(base_config)
-        mode_config.graph_mode = graph_mode
-        runner(mode_config)
+    if graph_mode is not None:
+        mode = graph_mode.lower()
+        if mode == "all":
+            _run_debug_across_supported_modes(config, runner)
+            return
+        use_cfg, use_ddg = _resolve_graph_flags_from_legacy_mode(mode)
+
+    config.use_cfg = use_cfg
+    config.use_ddg = use_ddg
+    runner(config)
 
 
 @app.command("profile-gpu-mem")
@@ -713,10 +722,12 @@ def profile_gpu_mem_command(
 
 @app.command("train")
 def train_command(
-    graph_mode: str = typer.Option(
-        "both",
+    use_cfg: bool = typer.Option(True, "--cfg/--no-cfg", help="Enable CFG graph branch."),
+    use_ddg: bool = typer.Option(True, "--ddg/--no-ddg", help="Enable DDG graph branch."),
+    graph_mode: Optional[str] = typer.Option(
+        None,
         "--graph-mode",
-        help="both/no_cfg/no_ddg/none/cfg_as_ddg/cfg_as_ddg_no_ddg/both_cfg_as_ddg",
+        help="Legacy graph mode (both/no_cfg/no_ddg/none). Prefer --cfg/--no-cfg and --ddg/--no-ddg.",
     ),
     resume: bool = typer.Option(
         False,
@@ -730,11 +741,13 @@ def train_command(
         help="Override config item, repeatable. Example: --set max_steps=5000 --set learning_rate=1e-4",
     ),
 ):
-    graph_mode = graph_mode.lower()
-    if graph_mode not in GRAPH_MODES:
-        raise typer.BadParameter(f"graph_mode must be one of: {'/'.join(GRAPH_MODES)}")
+    config = _build_config(overrides=override)
 
-    config = _build_config(graph_mode=graph_mode, overrides=override)
+    if graph_mode is not None:
+        use_cfg, use_ddg = _resolve_graph_flags_from_legacy_mode(graph_mode)
+
+    config.use_cfg = use_cfg
+    config.use_ddg = use_ddg
     config.resume_from_checkpoint = resume
     if not resume:
         config.resume_checkpoint_path = None

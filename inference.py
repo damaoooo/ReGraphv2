@@ -29,29 +29,11 @@ LLVM_DEFINE_NAME_PATTERN = re.compile(
     re.MULTILINE,
 )
 
-GRAPH_MODES = (
-    "both",
-    "no_cfg",
-    "no_ddg",
-    "none",
-    "cfg_as_ddg",
-    "cfg_as_ddg_no_ddg",
-    "both_cfg_as_ddg",
-)
-GRAPH_MODE_SUFFIX_ORDER = tuple(sorted(GRAPH_MODES, key=len, reverse=True))
 GRAPH_MODE_METADATA_FILES = ("regraph_config.json", "config.json")
 
-
-def normalize_graph_mode(graph_mode: str) -> str:
-    normalized = graph_mode.strip().lower()
-    if normalized not in GRAPH_MODES:
-        raise ValueError(f"graph_mode must be one of: {'/'.join(GRAPH_MODES)}")
-    return normalized
-
-
-def infer_graph_mode_from_model_path(model_path: Optional[str]) -> Optional[str]:
+def infer_graph_flags_from_model_path(model_path: Optional[str]) -> tuple[Optional[bool], Optional[bool]]:
     if not model_path:
-        return None
+        return None, None
 
     normalized_model_path = os.path.abspath(model_path)
     for metadata_file in GRAPH_MODE_METADATA_FILES:
@@ -62,40 +44,21 @@ def infer_graph_mode_from_model_path(model_path: Optional[str]) -> Optional[str]
         with open(metadata_path, "r", encoding="utf-8") as metadata_fp:
             metadata = json.load(metadata_fp)
 
-        graph_mode = metadata.get("graph_mode")
-        if graph_mode:
-            return normalize_graph_mode(str(graph_mode))
+        if "use_cfg" in metadata or "use_ddg" in metadata:
+            return metadata.get("use_cfg"), metadata.get("use_ddg")
 
-    model_dir_name = os.path.basename(normalized_model_path.rstrip(os.sep))
-    for graph_mode in GRAPH_MODE_SUFFIX_ORDER:
-        if model_dir_name == graph_mode or model_dir_name.endswith(f"_{graph_mode}"):
-            return graph_mode
-
-    return None
+    return None, None
 
 
-def resolve_graph_mode(
-    graph_mode: Optional[str],
+def resolve_graph_flags(
+    use_cfg: Optional[bool],
+    use_ddg: Optional[bool],
     model_path: Optional[str],
-) -> str:
-    explicit_graph_mode = normalize_graph_mode(graph_mode) if graph_mode else None
-    inferred_graph_mode = infer_graph_mode_from_model_path(model_path)
-
-    if explicit_graph_mode and inferred_graph_mode and explicit_graph_mode != inferred_graph_mode:
-        raise ValueError(
-            "graph_mode does not match model_path: "
-            f"explicit={explicit_graph_mode}, inferred={inferred_graph_mode}, model_path={model_path}"
-        )
-
-    if explicit_graph_mode:
-        return explicit_graph_mode
-    if inferred_graph_mode:
-        return inferred_graph_mode
-
-    raise ValueError(
-        "graph_mode is required because it could not be inferred from model_path. "
-        f"Please provide one of: {'/'.join(GRAPH_MODES)}"
-    )
+) -> tuple[bool, bool]:
+    inferred_use_cfg, inferred_use_ddg = infer_graph_flags_from_model_path(model_path)
+    resolved_use_cfg = use_cfg if use_cfg is not None else inferred_use_cfg
+    resolved_use_ddg = use_ddg if use_ddg is not None else inferred_use_ddg
+    return bool(True if resolved_use_cfg is None else resolved_use_cfg), bool(True if resolved_use_ddg is None else resolved_use_ddg)
 
 
 @dataclass
@@ -127,10 +90,10 @@ class InferencePipelineConfig:
     resume: bool = True
     task1_start_from_step2: bool = False
     model_path: Optional[str] = None
-    graph_mode: Optional[str] = None
+    use_cfg: Optional[bool] = None
+    use_ddg: Optional[bool] = None
     device: Optional[str] = None
     max_length: int = 4096
-    svd_rank: int = 32
     embedding_size: int = 768
     inference_batch_size: int = 8
 
@@ -192,7 +155,7 @@ class ReGraphInferencePipeline:
         self._collator = None
         self._model = None
         self._device = None
-        self._resolved_graph_mode = None
+        self._resolved_graph_flags = None
         self._function_map_cache: Dict[str, Dict[str, str]] = {}
 
     def _resolve_device(self) -> torch.device:
@@ -212,21 +175,23 @@ class ReGraphInferencePipeline:
             self._tokenizer = load_tokenizer(self.config.tokenizer_path)
         return self._tokenizer
 
-    def get_graph_mode(self) -> str:
-        if self._resolved_graph_mode is None:
-            self._resolved_graph_mode = resolve_graph_mode(
-                graph_mode=self.config.graph_mode,
+    def get_graph_flags(self) -> tuple[bool, bool]:
+        if self._resolved_graph_flags is None:
+            self._resolved_graph_flags = resolve_graph_flags(
+                use_cfg=self.config.use_cfg,
+                use_ddg=self.config.use_ddg,
                 model_path=self.config.model_path,
             )
-        return self._resolved_graph_mode
+        return self._resolved_graph_flags
 
     def get_collator(self) -> FunctionDataCollator:
         if self._collator is None:
+            use_cfg, use_ddg = self.get_graph_flags()
             self._collator = FunctionDataCollator(
                 self.get_tokenizer(),
                 max_length=self.config.max_length,
-                svd_rank=self.config.svd_rank,
-                graph_mode=self.get_graph_mode(),
+                use_cfg=use_cfg,
+                use_ddg=use_ddg,
             )
         return self._collator
 
@@ -298,13 +263,13 @@ class ReGraphInferencePipeline:
             if not self.config.model_path:
                 raise ValueError("model_path is required for embedding inference.")
 
-            graph_mode = self.get_graph_mode()
+            use_cfg, use_ddg = self.get_graph_flags()
             model = get_model(
                 self.config.model_path,
-                svd_rank=self.config.svd_rank,
                 max_seq_length=self.config.max_length,
                 embedding_size=self.config.embedding_size,
-                graph_mode=graph_mode,
+                use_cfg=use_cfg,
+                use_ddg=use_ddg,
                 tokenizer_path=self.config.tokenizer_path,
             )
             model.to(self._resolve_device())
@@ -313,7 +278,7 @@ class ReGraphInferencePipeline:
 
         return self._model
 
-    def run_inference(self, input_ids, attention_mask, cfg_u, cfg_v, ddg_edges):
+    def run_inference(self, input_ids, attention_mask, graph_inputs):
         model = self.load_model()
         autocast_context = (
             torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -326,14 +291,12 @@ class ReGraphInferencePipeline:
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    cfg_u=cfg_u,
-                    cfg_v=cfg_v,
-                    ddg_edges=ddg_edges,
                     return_dict=True,
+                    **graph_inputs,
                 )
         return outputs
 
-    def run_attention_probe(self, input_ids, attention_mask, cfg_u, cfg_v, ddg_edges):
+    def run_attention_probe(self, input_ids, attention_mask):
         model = self.load_model()
         autocast_context = (
             torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -346,9 +309,6 @@ class ReGraphInferencePipeline:
                 return model.roformer.compute_last_layer_attention_weights(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    cfg_u=cfg_u,
-                    cfg_v=cfg_v,
-                    ddg_edges=ddg_edges,
                 )
 
     def _embed_batch(
@@ -359,9 +319,9 @@ class ReGraphInferencePipeline:
         """Return embeddings list, or (embeddings, verbose_data) when verbose=True.
 
         verbose_data is a list of dicts with keys:
-        ir, tokens, cfg_graph, cfg_u, cfg_v, ddg, ddg_model_input, attention_weights.
-        其中 ddg/cfg_graph 始终返回原始图数据，便于排查 no_ddg/no_cfg 等模式下
-        “图存在但未参与计算”的场景；ddg_model_input 表示实际送进模型的 DDG 输入。
+        ir, tokens, cfg_graph, cfg_model_input, ddg, ddg_model_input, attention_weights.
+        其中 ddg/cfg_graph 始终返回原始图数据，便于排查图分支关闭时
+        “图存在但未参与计算”的场景；*_model_input 表示实际送进模型的图输入。
         attention_weights 只返回最后一层，并在 head 维度做平均聚合，
         最终形状为 [seq, seq]，避免全层/全 head attention 把 RAM 撑爆。
         Each value is a plain Python list (or None when the graph type is absent).
@@ -373,16 +333,24 @@ class ReGraphInferencePipeline:
         device = self._resolve_device()
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        cfg_u = batch["cfg_u"].to(device) if batch["cfg_u"] is not None else None
-        cfg_v = batch["cfg_v"].to(device) if batch["cfg_v"] is not None else None
-        ddg_edges = batch["ddg_edges"].to(device) if batch["ddg_edges"] is not None else None
+        graph_tensor_keys = (
+            "ddg_node_spans",
+            "ddg_node_batch",
+            "ddg_edge_index",
+            "cfg_node_spans",
+            "cfg_node_batch",
+            "cfg_edge_index",
+            "cfg_edge_attr",
+        )
+        graph_inputs = {
+            key: batch[key].to(device) if batch[key] is not None else None
+            for key in graph_tensor_keys
+        }
 
         outputs = self.run_inference(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            cfg_u=cfg_u,
-            cfg_v=cfg_v,
-            ddg_edges=ddg_edges,
+            graph_inputs=graph_inputs,
         )
         embeddings = outputs["embedding"]
         embeddings_list: List[List[float]] = embeddings.detach().cpu().float().tolist()
@@ -390,21 +358,49 @@ class ReGraphInferencePipeline:
         if not verbose:
             return embeddings_list
 
-        # verbose 模式下额外做一次 no_grad probe，只计算最后一层聚合后的 attention。
         last_attention = self.run_attention_probe(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            cfg_u=cfg_u,
-            cfg_v=cfg_v,
-            ddg_edges=ddg_edges,
         ).detach().cpu().float()
-        cpu_cfg_u = cfg_u.detach().cpu().float() if cfg_u is not None else None
-        cpu_cfg_v = cfg_v.detach().cpu().float() if cfg_v is not None else None
-        # ddg_edges is int, convert fully to nested list in one call
-        cpu_ddg_list = ddg_edges.detach().cpu().tolist() if ddg_edges is not None else None
         cpu_input_ids = input_ids.detach().cpu()
         cpu_attention_mask = attention_mask.detach().cpu()
+        cpu_graph_inputs = {
+            key: value.detach().cpu().tolist() if value is not None else None
+            for key, value in graph_inputs.items()
+        }
         tokenizer = self.get_tokenizer()
+
+        def extract_graph_input(prefix: str, sample_idx: int) -> Optional[Dict[str, Any]]:
+            node_spans = cpu_graph_inputs[f"{prefix}_node_spans"]
+            node_batch = cpu_graph_inputs[f"{prefix}_node_batch"]
+            edge_index = cpu_graph_inputs[f"{prefix}_edge_index"]
+            edge_attr = cpu_graph_inputs.get(f"{prefix}_edge_attr")
+
+            if node_spans is None or node_batch is None or edge_index is None:
+                return None
+
+            selected_nodes = [idx for idx, batch_idx in enumerate(node_batch) if batch_idx == sample_idx]
+            if not selected_nodes:
+                return None
+
+            node_id_map = {old_idx: new_idx for new_idx, old_idx in enumerate(selected_nodes)}
+            local_edges = []
+            local_edge_attrs = [] if edge_attr is not None else None
+
+            if len(edge_index) == 2:
+                edge_sources, edge_targets = edge_index
+                for edge_pos, (src_idx, dst_idx) in enumerate(zip(edge_sources, edge_targets)):
+                    if src_idx not in node_id_map or dst_idx not in node_id_map:
+                        continue
+                    local_edges.append([node_id_map[src_idx], node_id_map[dst_idx]])
+                    if local_edge_attrs is not None:
+                        local_edge_attrs.append(edge_attr[edge_pos])
+
+            return {
+                "node_spans": [node_spans[node_idx] for node_idx in selected_nodes],
+                "edge_index": local_edges,
+                "edge_attr": local_edge_attrs,
+            }
 
         verbose_data: List[Dict[str, Any]] = []
         for i in range(len(payloads)):
@@ -412,14 +408,14 @@ class ReGraphInferencePipeline:
             token_ids = cpu_input_ids[i, :valid_len].tolist()
             tokens = tokenizer.convert_ids_to_tokens(token_ids)
             verbose_data.append({
-                "graph_mode": self.get_graph_mode(),
+                "use_cfg": self.get_graph_flags()[0],
+                "use_ddg": self.get_graph_flags()[1],
                 "ir": payloads[i].normalized_ir,
                 "tokens": tokens,
                 "cfg_graph": payloads[i].cfg_graph,
-                "cfg_u": cpu_cfg_u[i].tolist() if cpu_cfg_u is not None else None,
-                "cfg_v": cpu_cfg_v[i].tolist() if cpu_cfg_v is not None else None,
+                "cfg_model_input": extract_graph_input("cfg", i),
                 "ddg": payloads[i].ddg_graph,
-                "ddg_model_input": cpu_ddg_list[i] if cpu_ddg_list is not None else None,
+                "ddg_model_input": extract_graph_input("ddg", i),
                 "attention_weights": last_attention[i, :valid_len, :valid_len].tolist(),
             })
 
@@ -543,8 +539,8 @@ class ReGraphInferencePipeline:
         """Embed all payloads.
 
         Returns Dict[name, List[float]] when verbose=False, or
-        Dict[name, {"embedding": List[float], "graph_mode": ..., "ir": ..., "tokens": ...,
-        "cfg_graph": ..., "cfg_u": ..., "cfg_v": ..., "ddg": ..., "ddg_model_input": ...,
+        Dict[name, {"embedding": List[float], "use_cfg": ..., "use_ddg": ..., "ir": ..., "tokens": ...,
+        "cfg_graph": ..., "cfg_model_input": ..., "ddg": ..., "ddg_model_input": ...,
         "attention_weights": ...}] when verbose=True.
         """
         embeddings_by_name: Dict[str, Any] = {}

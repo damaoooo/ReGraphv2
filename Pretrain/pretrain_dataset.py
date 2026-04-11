@@ -4,151 +4,12 @@ from Tokenizer.ir_tokenizer import load_tokenizer
 from transformers import DataCollatorForLanguageModeling, DataCollatorWithPadding
 from dataclasses import dataclass, field
 import torch
-from torch.nn.utils.rnn import pad_sequence
 import random
 
 from typing import List, Dict, Any, Optional
+from Model.graph_utils import build_batched_span_graph_tensors
 from .pretrain_config import PretrainConfig, DEFAULT_CONFIG
 
-
-def factorize_cfg_to_uv_batch(edge_tensor, rank, total_seq_len=None, device='cpu', svd_lowrank_threshold=128):
-    """
-    输入:
-        edge_tensor: Tensor [B, E, 5]
-            每条边为 [src_start, src_end, dst_start, dst_end, value]
-            E 维可能有 padding，整行全 -1 代表无效
-        rank: 期望的低秩维数 R
-        total_seq_len: 可选，若指定则输出对齐到该长度
-        svd_lowrank_threshold: 当 block 数量超过该阈值时，使用近似 SVD
-
-    输出:
-        U_batch: Tensor [B, Max_S, R]
-        V_batch: Tensor [B, Max_S, R]
-
-    约束:
-        - 如果实际矩阵秩 < rank，输出会在后面用 0 填充到 rank
-        - 如果实际矩阵秩 > rank，会被截断到 rank
-
-    满足: A[i, j] ≈ U[i] @ V[j].T
-    """
-    if edge_tensor.device.type != device:
-        edge_tensor = edge_tensor.to(device)
-    batch_size, _, _ = edge_tensor.shape
-    u_list = []
-    v_list = []
-    lengths = []
-
-    for b in range(batch_size):
-        edges = edge_tensor[b]
-        valid_mask = ~(edges == -1).all(dim=-1)
-        edges = edges[valid_mask]
-
-        if edges.numel() == 0:
-            actual_len = total_seq_len if total_seq_len is not None else 0
-            empty = torch.zeros((actual_len, rank), device=device, dtype=torch.float32)
-            u_list.append(empty)
-            v_list.append(empty)
-            lengths.append(0)
-            continue
-
-        ranges_src = edges[:, 0:2].to(torch.long)
-        ranges_dst = edges[:, 2:4].to(torch.long)
-        all_ranges = torch.cat([ranges_src, ranges_dst], dim=0)
-
-        max_val = torch.max(all_ranges[:, 1])
-        current_seq_len = total_seq_len if total_seq_len is not None else (max_val.item() + 1)
-        key_mul = max_val + 1
-
-        keys = all_ranges[:, 0] * key_mul + all_ranges[:, 1]
-        unique_keys = torch.unique(keys, sorted=True)
-        unique_starts = unique_keys // key_mul
-        unique_ends = unique_keys % key_mul
-
-        # The span indices are inclusive on both ends, so block size must include the end token.
-        block_sizes = (unique_ends - unique_starts + 1).to(torch.float32)
-        sqrt_sizes = torch.sqrt(block_sizes)
-        num_blocks = unique_keys.numel()
-
-        src_keys = keys[:ranges_src.shape[0]]
-        dst_keys = keys[ranges_src.shape[0]:]
-        i_idx = torch.searchsorted(unique_keys, src_keys)
-        j_idx = torch.searchsorted(unique_keys, dst_keys)
-
-        vals = edges[:, 4].to(torch.float32)
-        weight = vals * sqrt_sizes[i_idx] * sqrt_sizes[j_idx]
-
-        flat_idx = i_idx * num_blocks + j_idx
-        B_flat = torch.zeros(num_blocks * num_blocks, device=device, dtype=torch.float32)
-        B_flat.scatter_add_(0, flat_idx, weight)
-        B_tilde = B_flat.view(num_blocks, num_blocks)
-
-        real_rank = min(rank, num_blocks)
-        # 大矩阵时使用近似 SVD 加速
-        if num_blocks >= svd_lowrank_threshold and real_rank < num_blocks:
-            U_small, S_vals, V_small = torch.svd_lowrank(
-                B_tilde, q=real_rank, niter=2
-            )
-        else:
-            U_small, S_vals, Vh_small = torch.linalg.svd(B_tilde, full_matrices=False)
-            V_small = Vh_small[:real_rank, :].T
-        U_small = U_small[:, :real_rank]
-        S_vals = S_vals[:real_rank]
-
-        sqrt_S = torch.sqrt(S_vals).unsqueeze(0)
-        U_block_emb = (U_small * sqrt_S) / sqrt_sizes.unsqueeze(1)
-        V_block_emb = (V_small * sqrt_S) / sqrt_sizes.unsqueeze(1)
-
-        if real_rank < rank:
-            pad_cols = rank - real_rank
-            U_block_emb = torch.cat(
-                [U_block_emb, torch.zeros((num_blocks, pad_cols), device=device, dtype=U_block_emb.dtype)],
-                dim=1
-            )
-            V_block_emb = torch.cat(
-                [V_block_emb, torch.zeros((num_blocks, pad_cols), device=device, dtype=V_block_emb.dtype)],
-                dim=1
-            )
-
-        repeat_counts = block_sizes.to(torch.long)
-        U_compact = torch.repeat_interleave(U_block_emb, repeat_counts, dim=0)
-        V_compact = torch.repeat_interleave(V_block_emb, repeat_counts, dim=0)
-
-        starts_expanded = torch.repeat_interleave(unique_starts, repeat_counts)
-        total_tokens = int(repeat_counts.sum().item())
-        offsets = torch.arange(total_tokens, device=device) - torch.repeat_interleave(
-            torch.cumsum(repeat_counts, dim=0) - repeat_counts, repeat_counts
-        )
-        full_indices = starts_expanded + offsets
-
-        U_final = torch.zeros((current_seq_len, rank), device=device, dtype=U_compact.dtype)
-        V_final = torch.zeros((current_seq_len, rank), device=device, dtype=V_compact.dtype)
-
-        valid_idx_mask = full_indices < current_seq_len
-        if valid_idx_mask.all():
-            U_final[full_indices] = U_compact
-            V_final[full_indices] = V_compact
-        else:
-            valid_indices = full_indices[valid_idx_mask]
-            U_final[valid_indices] = U_compact[valid_idx_mask]
-            V_final[valid_indices] = V_compact[valid_idx_mask]
-
-        u_list.append(U_final)
-        v_list.append(V_final)
-        lengths.append(U_final.shape[0])
-
-    u_batch = pad_sequence(u_list, batch_first=True)
-    v_batch = pad_sequence(v_list, batch_first=True)
-
-    if total_seq_len is not None:
-        if u_batch.shape[1] < total_seq_len:
-            pad_len = total_seq_len - u_batch.shape[1]
-            u_batch = torch.nn.functional.pad(u_batch, (0, 0, 0, pad_len))
-            v_batch = torch.nn.functional.pad(v_batch, (0, 0, 0, pad_len))
-        elif u_batch.shape[1] > total_seq_len:
-            u_batch = u_batch[:, :total_seq_len]
-            v_batch = v_batch[:, :total_seq_len]
-
-    return u_batch, v_batch
 
 @dataclass
 class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很不一样了
@@ -159,7 +20,6 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
     config: PretrainConfig = field(default_factory=lambda: PretrainConfig())
     mlm: bool = None  # 将从config中获取
     mlm_probability: float = None  # 将从config中获取
-    edge_pad_value: int = None  # 将从config中获取
     
     def __post_init__(self):
         """初始化后设置默认值"""
@@ -167,26 +27,37 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
             self.mlm = self.config.mlm
         if self.mlm_probability is None:
             self.mlm_probability = self.config.mlm_probability
-        if self.edge_pad_value is None:
-            self.edge_pad_value = self.config.edge_pad_value
         self.use_cfg = self.config.use_cfg
         self.use_ddg = self.config.use_ddg
-        self.use_cfg_as_ddg = self.config.use_cfg_as_ddg
-        self.keep_original_ddg = self.config.keep_original_ddg
 
-    def _convert_cfg_edges_to_ddg(self, cfg_edges: List[List[Any]]) -> List[List[int]]:
-        """Convert CFG 5-tuple edges to DDG-compatible 4-tuple edges."""
-        converted: List[List[int]] = []
-        for edge in cfg_edges:
-            if edge is None or len(edge) < 4:
-                continue
-            converted.append([
-                int(edge[0]),
-                int(edge[1]),
-                int(edge[2]),
-                int(edge[3]),
-            ])
-        return converted
+    def _build_graph_inputs(
+        self,
+        cfg_list: List[List[Any]],
+        ddg_list: List[List[Any]],
+        input_ids: torch.Tensor,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        seq_lengths = [int((seq != self.tokenizer.pad_token_id).sum().item()) for seq in input_ids]
+
+        ddg_tensors = (
+            build_batched_span_graph_tensors(ddg_list, seq_lengths, include_edge_attr=False)
+            if self.use_ddg
+            else {"node_spans": None, "node_batch": None, "edge_index": None, "edge_attr": None}
+        )
+        cfg_tensors = (
+            build_batched_span_graph_tensors(cfg_list, seq_lengths, include_edge_attr=True)
+            if self.use_cfg
+            else {"node_spans": None, "node_batch": None, "edge_index": None, "edge_attr": None}
+        )
+
+        return {
+            "ddg_node_spans": ddg_tensors["node_spans"],
+            "ddg_node_batch": ddg_tensors["node_batch"],
+            "ddg_edge_index": ddg_tensors["edge_index"],
+            "cfg_node_spans": cfg_tensors["node_spans"],
+            "cfg_node_batch": cfg_tensors["node_batch"],
+            "cfg_edge_index": cfg_tensors["edge_index"],
+            "cfg_edge_attr": cfg_tensors["edge_attr"],
+        }
 
     def __call__(self, examples: Dict[str, List]) -> Dict[str, Any]:
         # --- 分离自定义列 ---
@@ -263,57 +134,19 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
         )
         batch_k = pad_collator(key_features)
 
-        # 6. 处理图结构 (CFG & DDG)
-        need_cfg_graph = self.use_cfg or self.use_cfg_as_ddg
-        need_ddg_graph = self.keep_original_ddg
-        cfg_graph_all = batch_cache['cfg_graph'] if need_cfg_graph else None
-        ddg_graph_all = batch_cache['ddg_graph'] if need_ddg_graph else None
-        
-        # 定义内部函数处理图 (复用逻辑)
-        def process_graphs(cfg_list, ddg_list, seq_len_tensor):
-            ddg_tensor = None
-            if self.use_ddg:
-                if self.use_cfg_as_ddg:
-                    ddg_inputs = []
-                    for idx, cfg_edges in enumerate(cfg_list):
-                        cfg_as_ddg = self._convert_cfg_edges_to_ddg(cfg_edges)
-                        if self.keep_original_ddg:
-                            original_ddg = ddg_list[idx] if idx < len(ddg_list) else []
-                            ddg_inputs.append(original_ddg + cfg_as_ddg)
-                        else:
-                            ddg_inputs.append(cfg_as_ddg)
-                else:
-                    ddg_inputs = ddg_list
+        cfg_graph_all = batch_cache['cfg_graph'] if self.use_cfg else None
+        ddg_graph_all = batch_cache['ddg_graph'] if self.use_ddg else None
 
-                padded_ddg = self.pad_graph(ddg_inputs)
-                ddg_tensor = torch.tensor(padded_ddg, dtype=torch.long)
-
-            u_tensor = None
-            v_tensor = None
-            if self.use_cfg:
-                padded_cfg = self.pad_graph(cfg_list, feature_length=5)
-                current_max_len = seq_len_tensor.shape[1]
-                u_tensor, v_tensor = factorize_cfg_to_uv_batch(
-                    torch.tensor(padded_cfg, dtype=torch.float),
-                    rank=self.config.svd_rank,
-                    total_seq_len=current_max_len,
-                    device='cpu'
-                )
-
-            return ddg_tensor, u_tensor, v_tensor
-
-        # 处理 Query 的图
-        ddg_q, u_q, v_q = process_graphs(
-            cfg_graph_all[:batch_size] if need_cfg_graph else [],
-            ddg_graph_all[:batch_size] if need_ddg_graph else [],
-            batch_q['input_ids']
+        query_graph_inputs = self._build_graph_inputs(
+            cfg_graph_all[:batch_size] if self.use_cfg else [],
+            ddg_graph_all[:batch_size] if self.use_ddg else [],
+            batch_q["input_ids"],
         )
-        
-        # 处理 Key 的图
-        ddg_k, u_k, v_k = process_graphs(
-            cfg_graph_all[batch_size:] if need_cfg_graph else [],
-            ddg_graph_all[batch_size:] if need_ddg_graph else [],
-            batch_k['input_ids']
+
+        key_graph_inputs = self._build_graph_inputs(
+            cfg_graph_all[batch_size:] if self.use_cfg else [],
+            ddg_graph_all[batch_size:] if self.use_ddg else [],
+            batch_k["input_ids"],
         )
 
         # 7. 组装最终返回字典 (Supervised MoCo 格式)
@@ -321,35 +154,17 @@ class MoCoDataCollator: # 这里我们简化，不再继承，因为它逻辑很
             "view1": {
                 "input_ids": batch_q["input_ids"],
                 "attention_mask": batch_q["attention_mask"],
-                "labels": batch_q["labels"], # 只有 Query 有 MLM label
-                "cfg_u": u_q,
-                "cfg_v": v_q,
-                "ddg_edges": ddg_q,
-                "group_ids": batch_group_ids_tensor # 传入 Ground Truth ID
+                "labels": batch_q["labels"],
+                "group_ids": batch_group_ids_tensor,
+                **query_graph_inputs,
             },
             "view2": {
                 "input_ids": batch_k["input_ids"],
                 "attention_mask": batch_k["attention_mask"],
-                # Key 不需要 labels
-                "cfg_u": u_k,
-                "cfg_v": v_k,
-                "ddg_edges": ddg_k,
-                "group_ids": batch_group_ids_tensor # Key 共享同一个 ID
+                "group_ids": batch_group_ids_tensor,
+                **key_graph_inputs,
             }
         }
-
-    def pad_graph(self, graph, feature_length: int = 4):
-        max_edges = max(len(g) for g in graph)
-        if max_edges == 0:
-            # Keep a 3D shape [B, 1, feature_length] filled with -1
-            # so downstream indexing always sees a 3D tensor.
-            max_edges = 1
-        padded_graphs = []
-        for g in graph:
-            padding_needed = max_edges - len(g)
-            padded_graph = g + [[-1] * feature_length] * padding_needed
-            padded_graphs.append(padded_graph)
-        return padded_graphs
         
         
         

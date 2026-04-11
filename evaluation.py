@@ -17,23 +17,13 @@ from Tokenizer.ir_tokenizer import load_tokenizer
 from torch.utils.data.dataset import Dataset as TorchDataset
 from torch.utils.data.dataloader import DataLoader
 from transformers import DataCollatorWithPadding
+from Model.graph_utils import build_batched_span_graph_tensors
 from Pretrain.pretrain_model import MoCoPretrainModel
-from Pretrain.pretrain_dataset import factorize_cfg_to_uv_batch
 from Pretrain.pretrain_config import PretrainConfig
 import torch
 from numba import njit, prange, types
 from numba.typed import Dict as NumbaDict
 
-
-GRAPH_MODES = (
-    "both",
-    "no_cfg",
-    "no_ddg",
-    "none",
-    "cfg_as_ddg",
-    "cfg_as_ddg_no_ddg",
-    "both_cfg_as_ddg",
-)
 
 # --- 设置 Rich 和 Typer ---
 logging.basicConfig(
@@ -129,34 +119,11 @@ def _build_pools_parallel(anchor_batch: np.ndarray, pos_flat: np.ndarray, pos_of
     
 class FunctionDataCollator:
     
-    def __init__(self, tokenizer, max_length=2048, svd_rank=32, graph_mode: str = "both"):
+    def __init__(self, tokenizer, max_length=2048, use_cfg: bool = True, use_ddg: bool = True):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.svd_rank = svd_rank
-        self.graph_mode = graph_mode
-        self.use_cfg = graph_mode in {"both", "no_ddg"}
-        self.use_ddg = graph_mode in {
-            "both",
-            "no_cfg",
-            "cfg_as_ddg",
-            "cfg_as_ddg_no_ddg",
-            "both_cfg_as_ddg",
-        }
-        self.use_cfg_as_ddg = graph_mode in {"cfg_as_ddg", "cfg_as_ddg_no_ddg", "both_cfg_as_ddg"}
-        self.keep_original_ddg = graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
-
-    def _convert_cfg_edges_to_ddg(self, cfg_edges):
-        converted = []
-        for edge in cfg_edges:
-            if edge is None or len(edge) < 4:
-                continue
-            converted.append([
-                int(edge[0]),
-                int(edge[1]),
-                int(edge[2]),
-                int(edge[3]),
-            ])
-        return converted
+        self.use_cfg = use_cfg
+        self.use_ddg = use_ddg
         
     def __call__(self, batch: List):
         pad_collator = DataCollatorWithPadding(tokenizer=self.tokenizer, padding=True, pad_to_multiple_of=8)
@@ -175,74 +142,43 @@ class FunctionDataCollator:
         
         input_ids = pad_collator({'input_ids': truncated_input_ids})
         input_ids, attention_mask = input_ids['input_ids'], input_ids['attention_mask']
-        cfg_u = None
-        cfg_v = None
-        ddg_graphs = None
-        cfg_graphs_raw = None
+        cfg_graphs_raw = [batch_item['cfg_graph'] for batch_item in batch] if self.use_cfg else None
 
-        if self.use_cfg or self.use_cfg_as_ddg:
-            cfg_graphs_raw = [batch_item['cfg_graph'] for batch_item in batch]
+        seq_lengths = [int(mask.sum().item()) for mask in attention_mask]
 
+        ddg_tensors = {"node_spans": None, "node_batch": None, "edge_index": None, "edge_attr": None}
         if self.use_ddg:
-            if self.use_cfg_as_ddg:
-                ddg_graphs_input = []
-                for idx, cfg_edges in enumerate(cfg_graphs_raw):
-                    cfg_as_ddg = self._convert_cfg_edges_to_ddg(cfg_edges)
-                    if self.keep_original_ddg:
-                        original_ddg = batch[idx]['ddg_graph']
-                        ddg_graphs_input.append(original_ddg + cfg_as_ddg)
-                    else:
-                        ddg_graphs_input.append(cfg_as_ddg)
-            else:
-                ddg_graphs_input = [batch_item['ddg_graph'] for batch_item in batch]
+            ddg_graphs_input = [batch_item['ddg_graph'] for batch_item in batch]
+            ddg_tensors = build_batched_span_graph_tensors(ddg_graphs_input, seq_lengths, include_edge_attr=False)
 
-            ddg_graphs_padded = self.pad_graph(ddg_graphs_input, feature_length=4)
-            ddg_graphs = torch.tensor(ddg_graphs_padded, dtype=torch.long)
-
+        cfg_tensors = {"node_spans": None, "node_batch": None, "edge_index": None, "edge_attr": None}
         if self.use_cfg:
-            cfg_graphs_padded = self.pad_graph(cfg_graphs_raw, feature_length=5)
-            cfg_tensor = torch.tensor(cfg_graphs_padded, dtype=torch.float)
-
-            current_max_len = input_ids.shape[1]
-            cfg_u, cfg_v = factorize_cfg_to_uv_batch(
-                cfg_tensor,
-                rank=self.svd_rank,
-                total_seq_len=current_max_len,
-                device='cpu'
-            )
+            cfg_tensors = build_batched_span_graph_tensors(cfg_graphs_raw, seq_lengths, include_edge_attr=True)
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "cfg_u": cfg_u,
-            "cfg_v": cfg_v,
-            "ddg_edges": ddg_graphs,
+            "ddg_node_spans": ddg_tensors["node_spans"],
+            "ddg_node_batch": ddg_tensors["node_batch"],
+            "ddg_edge_index": ddg_tensors["edge_index"],
+            "cfg_node_spans": cfg_tensors["node_spans"],
+            "cfg_node_batch": cfg_tensors["node_batch"],
+            "cfg_edge_index": cfg_tensors["edge_index"],
+            "cfg_edge_attr": cfg_tensors["edge_attr"],
         }
-
-    def pad_graph(self, graph, feature_length: int = 4):
-        max_edges = max(len(g) for g in graph)
-        if max_edges == 0:
-            max_edges = 1
-        padded_graphs = []
-        for g in graph:
-            padding_needed = max_edges - len(g)
-            padded_graph = g + [[-1] * feature_length] * padding_needed
-            padded_graphs.append(padded_graph)
-        return padded_graphs
     
 def get_model(
     model_path,
-    svd_rank=32,
     max_seq_length=4096,
     embedding_size=768,
-    graph_mode: str = "both",
+    use_cfg: bool = True,
+    use_ddg: bool = True,
     tokenizer_path: str = None,
 ):
     """加载MoCo模型并返回encoder_q用于推理
     
     Args:
         model_path: checkpoint目录路径
-        svd_rank: CFG图SVD分解的秩
         max_seq_length: 最大序列长度
         embedding_size: 对比学习嵌入向量维度（通常等于hidden_size）
     
@@ -251,12 +187,14 @@ def get_model(
     """
     import os
     
-    # 1. 创建配置（需要与训练时保持一致）
-    config = PretrainConfig(
-        max_seq_length=max_seq_length,
-        svd_rank=svd_rank,
-        graph_mode=graph_mode,
-    )
+    config_path = os.path.join(model_path, "config.json")
+    if os.path.exists(config_path):
+        config = PretrainConfig.from_pretrained(model_path)
+    else:
+        config = PretrainConfig(max_seq_length=max_seq_length)
+    config.max_seq_length = max_seq_length
+    config.use_cfg = use_cfg
+    config.use_ddg = use_ddg
     if tokenizer_path is not None:
         config.tokenizer_path = tokenizer_path
     
@@ -309,15 +247,15 @@ def get_dataloader(
     tokenizer,
     batch_size: int = 64,
     max_length: int = 2048,
-    svd_rank: int = 32,
-    graph_mode: str = "both",
+    use_cfg: bool = True,
+    use_ddg: bool = True,
 ) -> DataLoader:
     dataset = _load_dataset(dataset_source)
     collator = FunctionDataCollator(
         tokenizer,
         max_length=max_length,
-        svd_rank=svd_rank,
-        graph_mode=graph_mode,
+        use_cfg=use_cfg,
+        use_ddg=use_ddg,
     )
     dataloader = DataLoader(
         dataset,
@@ -338,9 +276,9 @@ def generate_embeddings_with_model(
     tokenizer,
     model_path: str,
     max_length: int = 4096,
-    svd_rank: int = 32,
     embedding_size: int = 768,
-    graph_mode: str = "both",
+    use_cfg: bool = True,
+    use_ddg: bool = True,
 ) -> np.ndarray:
     """
     使用本地模型为整个数据集生成嵌入向量。
@@ -357,10 +295,10 @@ def generate_embeddings_with_model(
     # 加载和设置模型（encoder_q用于推理）
     model = get_model(
         model_path=model_path,
-        svd_rank=svd_rank,
         max_seq_length=max_length,
         embedding_size=embedding_size,
-        graph_mode=graph_mode,
+        use_cfg=use_cfg,
+        use_ddg=use_ddg,
     )
     model = model.to(device)
     model.eval()  # 设置为评估模式
@@ -374,8 +312,8 @@ def generate_embeddings_with_model(
         tokenizer,
         batch_size=batch_size,
         max_length=max_length,
-        svd_rank=svd_rank,
-        graph_mode=graph_mode,
+        use_cfg=use_cfg,
+        use_ddg=use_ddg,
     )
 
     # 计算总样本数和embedding维度，提前创建memmap
@@ -416,41 +354,42 @@ def generate_embeddings_with_model(
         processed_count = 0
         batch_idx = 0
         current_idx = 0  # 当前memmap写入位置
+        graph_tensor_keys = (
+            "ddg_node_spans",
+            "ddg_node_batch",
+            "ddg_edge_index",
+            "cfg_node_spans",
+            "cfg_node_batch",
+            "cfg_edge_index",
+            "cfg_edge_attr",
+        )
         
         for batch in dataloader:
             batch_idx += 1
-            # 将所有输入数据移动到CUDA
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            cfg_u = batch['cfg_u'].to(device) if batch['cfg_u'] is not None else None
-            cfg_v = batch['cfg_v'].to(device) if batch['cfg_v'] is not None else None
-            ddg_edges = batch['ddg_edges'].to(device) if batch['ddg_edges'] is not None else None
+            graph_inputs = {
+                key: batch[key].to(device) if batch.get(key) is not None else None
+                for key in graph_tensor_keys
+            }
             
             try:
                 with torch.inference_mode():
-                    # 使用autocast自动管理混合精度
                     if use_bf16:
                         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                            # 使用encoder_q生成嵌入（ReFormerPretrainModel的forward方法）
                             outputs = model(
                                 input_ids=input_ids, 
                                 attention_mask=attention_mask, 
-                                cfg_u=cfg_u,
-                                cfg_v=cfg_v,
-                                ddg_edges=ddg_edges,
-                                return_dict=True
+                                return_dict=True,
+                                **graph_inputs,
                             )
-                            # 获取对比学习的嵌入向量（已经归一化）
                             embeddings = outputs['embedding']
                     else:
-                        # CPU模式，不使用autocast
                         outputs = model(
                             input_ids=input_ids, 
                             attention_mask=attention_mask, 
-                            cfg_u=cfg_u,
-                            cfg_v=cfg_v,
-                            ddg_edges=ddg_edges,
-                            return_dict=True
+                            return_dict=True,
+                            **graph_inputs,
                         )
                         embeddings = outputs['embedding']
                     
@@ -469,8 +408,7 @@ def generate_embeddings_with_model(
                     memory_usage = get_memory_usage()
                     progress.update(task, advance=batch_size_actual, speed=speed, memory=memory_usage)
                     
-                    # 显式删除临时变量
-                    del input_ids, attention_mask, cfg_u, cfg_v, ddg_edges
+                    del input_ids, attention_mask, graph_inputs
                     del outputs, embeddings, batch_embeddings, batch
                     
             except Exception as e:
@@ -485,7 +423,7 @@ def generate_embeddings_with_model(
                 console.print(f"[yellow]  错误类型: {type(e).__name__}[/yellow]")
                 console.print(f"[yellow]  错误信息: {str(e)}[/yellow]")
                 # 清理失败batch的变量
-                del input_ids, attention_mask, cfg_u, cfg_v, ddg_edges, batch
+                del input_ids, attention_mask, graph_inputs, batch
 
     # 输出失败统计信息
     if failed_batches:
@@ -671,12 +609,8 @@ def main(
     use_gpu: bool = typer.Option(True, "--gpu/--no-gpu", help="是否使用GPU加速计算。"),
     gpu_batch_size: int = typer.Option(512, "--gpu-batch-size", help="GPU批量处理的锚点数量。"),
     tokenizer_path: Path = typer.Option(None, "--tokenizer-path", help="Tokenizer文件路径，如果与模型路径不同。"),
-    svd_rank: int = typer.Option(32, "--svd-rank", help="CFG图SVD分解的秩（rank），需要与训练时保持一致。"),
-    graph_mode: str = typer.Option(
-        "both",
-        "--graph-mode",
-        help="图模式: both/no_cfg/no_ddg/none/cfg_as_ddg/cfg_as_ddg_no_ddg/both_cfg_as_ddg。",
-    ),
+    use_cfg: bool = typer.Option(True, "--cfg/--no-cfg", help="是否启用 CFG 图分支。"),
+    use_ddg: bool = typer.Option(True, "--ddg/--no-ddg", help="是否启用 DDG 图分支。"),
     use_bf16: bool = typer.Option(False, "--bf16", help="将嵌入以BF16加载到GPU，减少显存与带宽开销。"),
 ):
     """
@@ -684,10 +618,7 @@ def main(
     """
     console.rule(f"[bold blue]开始使用本地模型进行评估[/bold blue]")
     set_seed(seed)
-    graph_mode = graph_mode.lower()
-    if graph_mode not in GRAPH_MODES:
-        raise typer.BadParameter(f"graph_mode must be one of: {'/'.join(GRAPH_MODES)}")
-    console.print(f"[blue]Graph mode: {graph_mode}[/blue]")
+    console.print(f"[blue]Graph branches: cfg={use_cfg}, ddg={use_ddg}[/blue]")
     
     # GPU可用性检查
     if use_gpu and not GPU_AVAILABLE:
@@ -743,8 +674,8 @@ def main(
             tokenizer=tokenizer, 
             model_path=str(model_path),
             max_length=max_length,
-            svd_rank=svd_rank,
-            graph_mode=graph_mode,
+            use_cfg=use_cfg,
+            use_ddg=use_ddg,
         )
         logging.info(f"嵌入向量生成完毕，形状为: [green]{all_embeddings.shape}[/green]")
         

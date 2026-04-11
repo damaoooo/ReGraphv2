@@ -9,14 +9,13 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 from Utils.utils import DEFAULT_TOKENIZER_PATH
 from inference import (
-    GRAPH_MODES,
     InferencePipelineConfig,
     ReGraphInferencePipeline,
-    resolve_graph_mode,
+    resolve_graph_flags,
 )
 
 
-def _build_pipeline_config(model_path: str, graph_mode: Optional[str]) -> InferencePipelineConfig:
+def _build_pipeline_config(model_path: str, use_cfg: Optional[bool], use_ddg: Optional[bool]) -> InferencePipelineConfig:
     normalized_model_path = os.path.abspath(model_path)
     if not model_path:
         raise RuntimeError("REGRAPH_MODEL_PATH is required before starting the API.")
@@ -26,42 +25,55 @@ def _build_pipeline_config(model_path: str, graph_mode: Optional[str]) -> Infere
         tokenizer_path=DEFAULT_TOKENIZER_PATH,
         python_path=sys.executable,
         model_path=normalized_model_path,
-        graph_mode=graph_mode,
+        use_cfg=use_cfg,
+        use_ddg=use_ddg,
     )
 
 
 @lru_cache(maxsize=8)
-def get_pipeline(model_path: str, graph_mode: str) -> ReGraphInferencePipeline:
-    return ReGraphInferencePipeline(_build_pipeline_config(model_path, graph_mode))
+def get_pipeline(model_path: str, use_cfg: bool, use_ddg: bool) -> ReGraphInferencePipeline:
+    return ReGraphInferencePipeline(_build_pipeline_config(model_path, use_cfg, use_ddg))
 
 
-def _resolve_request_graph_mode(
+def _parse_optional_bool(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise HTTPException(status_code=400, detail=f"invalid boolean value: {value}")
+
+
+def _resolve_request_graph_flags(
     model_path: str,
-    graph_mode: Optional[str],
-    mode: Optional[str],
-) -> str:
-    if graph_mode and mode and graph_mode.strip().lower() != mode.strip().lower():
-        raise HTTPException(
-            status_code=400,
-            detail="mode and graph_mode must match when both are provided.",
-        )
-
-    requested_graph_mode = graph_mode or mode or os.environ.get("REGRAPH_GRAPH_MODE")
+    use_cfg: Optional[str],
+    use_ddg: Optional[str],
+) -> tuple[bool, bool]:
     try:
-        return resolve_graph_mode(requested_graph_mode, model_path)
+        requested_use_cfg = _parse_optional_bool(use_cfg) if use_cfg is not None else _parse_optional_bool(os.environ.get("REGRAPH_USE_CFG"))
+        requested_use_ddg = _parse_optional_bool(use_ddg) if use_ddg is not None else _parse_optional_bool(os.environ.get("REGRAPH_USE_DDG"))
+        return resolve_graph_flags(requested_use_cfg, requested_use_ddg, model_path)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _build_health_payload() -> Dict[str, object]:
     model_path = os.environ.get("REGRAPH_MODEL_PATH")
-    configured_graph_mode = os.environ.get("REGRAPH_GRAPH_MODE")
-    resolved_graph_mode = None
+    configured_use_cfg = os.environ.get("REGRAPH_USE_CFG")
+    configured_use_ddg = os.environ.get("REGRAPH_USE_DDG")
+    resolved_use_cfg = None
+    resolved_use_ddg = None
     resolution_error = None
 
     if model_path:
         try:
-            resolved_graph_mode = resolve_graph_mode(configured_graph_mode, model_path)
+            resolved_use_cfg, resolved_use_ddg = resolve_graph_flags(
+                _parse_optional_bool(configured_use_cfg) if configured_use_cfg is not None else None,
+                _parse_optional_bool(configured_use_ddg) if configured_use_ddg is not None else None,
+                model_path,
+            )
         except ValueError as exc:
             resolution_error = str(exc)
 
@@ -69,10 +81,11 @@ def _build_health_payload() -> Dict[str, object]:
         "status": "ok",
         "model_configured": bool(model_path),
         "model_path": model_path,
-        "graph_mode_env": configured_graph_mode,
-        "resolved_graph_mode": resolved_graph_mode,
-        "supported_graph_modes": list(GRAPH_MODES),
-        "graph_mode_resolution_error": resolution_error,
+        "use_cfg_env": configured_use_cfg,
+        "use_ddg_env": configured_use_ddg,
+        "resolved_use_cfg": resolved_use_cfg,
+        "resolved_use_ddg": resolved_use_ddg,
+        "graph_flag_resolution_error": resolution_error,
     }
 
 
@@ -88,13 +101,13 @@ def health() -> Dict[str, object]:
 async def embed_binary(
     binary: UploadFile = File(...),
     verbose: bool = Form(False),
-    graph_mode: Optional[str] = Form(None),
-    mode: Optional[str] = Form(None),
+    use_cfg: Optional[str] = Form(None),
+    use_ddg: Optional[str] = Form(None),
 ) -> Dict[str, Any]:
     """Embed all functions in a binary.
 
     When verbose=True each function value is a dict with keys:
-    embedding, graph_mode, ir, tokens, cfg_graph, cfg_u, cfg_v,
+    embedding, use_cfg, use_ddg, ir, tokens, cfg_graph, cfg_model_input,
     ddg, ddg_model_input, attention_weights.
     Otherwise it is a plain list of floats.
     """
@@ -106,8 +119,8 @@ async def embed_binary(
         raise HTTPException(status_code=500, detail="REGRAPH_MODEL_PATH is required before starting the API.")
 
     try:
-        resolved_graph_mode = _resolve_request_graph_mode(model_path, graph_mode, mode)
-        pipeline = get_pipeline(model_path, resolved_graph_mode)
+        resolved_use_cfg, resolved_use_ddg = _resolve_request_graph_flags(model_path, use_cfg, use_ddg)
+        pipeline = get_pipeline(model_path, resolved_use_cfg, resolved_use_ddg)
     except HTTPException:
         raise
 
@@ -136,5 +149,5 @@ async def embed_binary(
 
 if __name__ == "__main__":
     import uvicorn
-    os.environ["REGRAPH_MODEL_PATH"] = "db1_model_ablation30000_no_ddg"
+    os.environ["REGRAPH_MODEL_PATH"] = "db1_model"
     uvicorn.run(app, host="0.0.0.0", port=8000)

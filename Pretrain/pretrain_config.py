@@ -11,7 +11,7 @@ class PretrainConfig(RoFormerConfig):
     def __init__(
         self,
         # === 序列长度配置 ===
-        max_seq_length: int = 4096,
+        max_seq_length: int = 2048,
         # === 路径配置 ===
         tokenizer_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json",
         train_dataset_pool_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_dataset_pool",
@@ -21,9 +21,14 @@ class PretrainConfig(RoFormerConfig):
         final_model_dir: str = "./db1_model",
         logging_dir: str = "./logs",
         # === 模型扩展配置 ===
-        use_flash_attn: bool = True,
-        svd_rank: int = 32,
-        graph_mode: str = "both",
+        use_sdpa_attention: bool = True,
+        use_cfg: bool = True,
+        use_ddg: bool = True,
+        embedding_size: int = 768,
+        graph_hidden_size: Optional[int] = None,
+        graph_layers: int = 1,
+        graph_attention_heads: int = 4,
+        graph_dropout: float = 0.1,
         # === 训练配置 ===
         num_train_epochs: int = 1,
         max_steps: int = 300000,
@@ -59,7 +64,6 @@ class PretrainConfig(RoFormerConfig):
         # === MLM配置 ===
         mlm: bool = True,
         mlm_probability: float = 0.15,
-        edge_pad_value: int = -1,
         pad_to_multiple_of: int = 8,
         **kwargs: Any,
     ):
@@ -89,24 +93,14 @@ class PretrainConfig(RoFormerConfig):
         self.logging_dir = logging_dir
 
         # === 模型扩展配置 ===
-        self.use_flash_attn = use_flash_attn
-        self.svd_rank = svd_rank
-        self.graph_mode = graph_mode
-
-        valid_graph_modes = {
-            "both",
-            "no_cfg",
-            "no_ddg",
-            "none",
-            "cfg_as_ddg",
-            "cfg_as_ddg_no_ddg",
-            "both_cfg_as_ddg",
-        }
-        if self.graph_mode not in valid_graph_modes:
-            raise ValueError(
-                f"Invalid graph_mode={self.graph_mode}. "
-                f"Expected one of {sorted(valid_graph_modes)}"
-            )
+        self.use_sdpa_attention = use_sdpa_attention
+        self.use_cfg = use_cfg
+        self.use_ddg = use_ddg
+        self.embedding_size = embedding_size
+        self.graph_hidden_size = graph_hidden_size or self.hidden_size
+        self.graph_layers = graph_layers
+        self.graph_attention_heads = graph_attention_heads
+        self.graph_dropout = graph_dropout
 
         # === 训练配置 ===
         self.num_train_epochs = num_train_epochs
@@ -154,30 +148,7 @@ class PretrainConfig(RoFormerConfig):
         # === MLM配置 ===
         self.mlm = mlm
         self.mlm_probability = mlm_probability
-        self.edge_pad_value = edge_pad_value
         self.pad_to_multiple_of = pad_to_multiple_of
-
-    @property
-    def use_cfg(self) -> bool:
-        return self.graph_mode in {"both", "no_ddg"}
-
-    @property
-    def use_ddg(self) -> bool:
-        return self.graph_mode in {
-            "both",
-            "no_cfg",
-            "cfg_as_ddg",
-            "cfg_as_ddg_no_ddg",
-            "both_cfg_as_ddg",
-        }
-
-    @property
-    def use_cfg_as_ddg(self) -> bool:
-        return self.graph_mode in {"cfg_as_ddg", "cfg_as_ddg_no_ddg", "both_cfg_as_ddg"}
-
-    @property
-    def keep_original_ddg(self) -> bool:
-        return self.graph_mode in {"both", "no_cfg", "cfg_as_ddg", "both_cfg_as_ddg"}
 
 
 # 默认配置实例
