@@ -559,7 +559,7 @@ class LLVMIRNormalizer:
         """Normalize entire LLVM IR code"""
         
         # No matter what method, remove the attributes section at the end of the file, as it can contain non-deterministic content that doesn't affect program semantics
-        ir_code = self.patterns['attributes_section'].sub('', ir_code)
+        # ir_code = self.patterns['attributes_section'].sub('', ir_code)
         
         # Try LLVMLite first, fall back to regex if needed
         if LLVMLITE_AVAILABLE:
