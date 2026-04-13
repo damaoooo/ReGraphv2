@@ -333,7 +333,7 @@ def main():
         if opened:
             LOGGER.info("Closing database (save=%s)...", args.save_database)
             idapro.close_database(save=args.save_database)
-
+        return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

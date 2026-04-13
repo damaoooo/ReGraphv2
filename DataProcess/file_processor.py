@@ -1,103 +1,66 @@
 """
-Single file processing logic for LLVM IR files
+Single file processing logic for ASM files
 """
-import subprocess
-import os
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
+
 from transformers import PreTrainedTokenizerFast
 
-from GraphBuilder.ddg_graph_builder import DataDependencyGraphBuilder
-from GraphBuilder.cfg_graph_builder import CFGGraphBuilder
-from Tokenizer.normalizer import normalize_file
 from .processing_result import ProcessingResult
 
 
 class FileProcessor:
-    """Handles processing of individual LLVM IR files"""
-    
-    def __init__(self, 
-                 tokenizer: PreTrainedTokenizerFast,
-                 cleanup_temp_files: bool = True):
+    """Handles processing of individual ASM files."""
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerFast,
+        cleanup_temp_files: bool = True,
+    ):
         self.tokenizer = tokenizer
         self.cleanup_temp_files = cleanup_temp_files
         self.logger = logging.getLogger(__name__)
-        
-            
-    def _generate_ddg(self, input_file, purified_file, instrumented_file: str, dot_file: str) -> Union[None, List[Tuple[int, int, int, int]]]:
-        """Generate DDG graph structure using purified IR"""
+
+    def _load_asm_text(self, input_file: str) -> Optional[str]:
+        """Load raw ASM text from disk."""
         try:
-            builder = DataDependencyGraphBuilder(self.tokenizer)
-            ddg_graph = builder.generate_ddg_matrix(dot_file, instrumented_file, purified_file)
-            return ddg_graph
-        except Exception as e:
-            self.logger.error(f"Error in DDG building for {input_file}: {e}")
-            return None
-            
-    def _generate_cfg(self, input_file: str, purified_file: str, dot_file: str) -> Union[None, List[Tuple[int, int, int, int, float]]]:
-        """Generate CFG graph structure using purified IR"""
-        try:
-            builder = CFGGraphBuilder(self.tokenizer, purified_file, dot_file)
-            cfg_graph = builder.build_cfg_edges()
-            return cfg_graph
-        except Exception as e:
-            self.logger.error(f"Error in CFG building for {input_file}: {e}")
+            with open(input_file, "r", encoding="utf-8", errors="ignore") as handle:
+                return handle.read().replace("\r\n", "\n")
+        except Exception as exc:
+            self.logger.error(f"Error reading ASM file {input_file}: {exc}")
             return None
 
-    def _generate_token_ids(self, input_file: str, purified_file: str) -> Optional[Tuple[List[int], List[int]]]:
-        """Generate token IDs and attention mask using purified IR"""
+    def _generate_token_ids(self, input_file: str) -> Optional[Tuple[List[int], List[int]]]:
+        """Generate token ids directly from ASM text."""
         try:
-            normalized_ir = normalize_file(purified_file)
-            tokens = self.tokenizer(normalized_ir)
-            return tokens['input_ids'], tokens['attention_mask']
-        except Exception as e:
-            self.logger.error(f"Error in tokenization for {input_file}: {e}")
-            return None
-            
-    def _cleanup_temp_files(self, temp_files: List[str]):
-        """Clean up temporary files"""
-        if not self.cleanup_temp_files:
-            return
-            
-        for temp_file in temp_files:
-            try:
-                if temp_file and os.path.exists(temp_file):
-                    os.remove(temp_file)
-                    self.logger.debug(f"Cleaned up temporary file: {temp_file}")
-            except Exception as e:
-                self.logger.warning(f"Failed to clean up {temp_file}: {e}")
+            asm_text = self._load_asm_text(input_file)
+            if asm_text is None:
+                return None
+            if not asm_text.strip():
+                self.logger.error(f"ASM file is empty: {input_file}")
+                return None
 
-    def process_single_file(self, input_file, purified_file, instrumented_file, cfg_dot, ddg_dot) -> ProcessingResult:
-        """Process a single LLVM IR file"""
-        temp_files = []
-        
+            tokens = self.tokenizer(asm_text)
+            return tokens["input_ids"], tokens.get("attention_mask")
+        except Exception as exc:
+            self.logger.error(f"Error in tokenization for {input_file}: {exc}")
+            return None
+
+    def process_single_file(self, input_file: str) -> ProcessingResult:
+        """Process a single ASM file."""
         try:
-            # Generate DDG using purified IR
-            ddg_graph = self._generate_ddg(input_file=input_file, purified_file=purified_file, instrumented_file=instrumented_file, dot_file=ddg_dot)
-            
-            # Generate CFG using purified IR
-            cfg_graph = self._generate_cfg(input_file=input_file, purified_file=purified_file, dot_file=cfg_dot)
-            
-            # Generate tokens using purified IR
-            token_result = self._generate_token_ids(input_file=input_file, purified_file=purified_file)
+            token_result = self._generate_token_ids(input_file=input_file)
             input_ids, attention_mask = token_result if token_result else (None, None)
-            
-            success = ddg_graph is not None or cfg_graph is not None or input_ids is not None
-            
+
             return ProcessingResult(
                 file_path=input_file,
-                success=success,
-                ddg_graph=ddg_graph,
-                cfg_graph=cfg_graph,
+                success=input_ids is not None,
                 input_ids=input_ids,
-                attention_mask=attention_mask
+                attention_mask=attention_mask,
             )
-            
-        except Exception as e:
+        except Exception as exc:
             return ProcessingResult(
                 file_path=input_file,
                 success=False,
-                error_message=str(e)
+                error_message=str(exc),
             )
-        finally:
-            self._cleanup_temp_files(temp_files)
