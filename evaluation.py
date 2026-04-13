@@ -169,7 +169,7 @@ class FunctionDataCollator:
     
 def get_model(
     model_path,
-    max_seq_length=4096,
+    max_seq_length=2048,
     embedding_size=768,
     use_cfg: bool = True,
     use_ddg: bool = True,
@@ -275,7 +275,7 @@ def generate_embeddings_with_model(
     batch_size: int,
     tokenizer,
     model_path: str,
-    max_length: int = 4096,
+    max_length: int = 2048,
     embedding_size: int = 768,
     use_cfg: bool = True,
     use_ddg: bool = True,
