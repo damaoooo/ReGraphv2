@@ -5,6 +5,7 @@
 
 from typing import Optional, Any, Dict
 from transformers import RoFormerConfig
+from Utils.utils import DEFAULT_TOKENIZER_PATH
 
 
 class PretrainConfig(RoFormerConfig):
@@ -27,22 +28,16 @@ class PretrainConfig(RoFormerConfig):
         # === 序列长度配置 ===
         max_seq_length: int = 2048,
         # === 路径配置 ===
-        tokenizer_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json",
-        train_dataset_pool_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_dataset_pool",
-        train_dataset_idx_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_task_dataset",
-        train_dataset_map_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_positive_map.pkl",
+        tokenizer_path: str = DEFAULT_TOKENIZER_PATH,
+        train_dataset_pool_path: str = "/home/damaoooo/Datasets/IR/Dataset-1-asm/Dataset-1/train_final_set/train_dataset_pool",
+        train_dataset_idx_path: str = "/home/damaoooo/Datasets/IR/Dataset-1-asm/Dataset-1/train_final_set/train_task_dataset",
+        train_dataset_map_path: str = "/home/damaoooo/Datasets/IR/Dataset-1-asm/Dataset-1/train_final_set/train_positive_map.pkl",
         output_dir: str = "./output",
-        final_model_dir: str = "./db1_model",
+        final_model_dir: str = "./db1_model_asm",
         logging_dir: str = "./logs",
         # === 模型扩展配置 ===
         use_sdpa_attention: bool = True,
-        use_cfg: bool = True,
-        use_ddg: bool = True,
         embedding_size: int = 768,
-        graph_hidden_size: Optional[int] = None,
-        graph_layers: int = 1,
-        graph_attention_heads: int = 4,
-        graph_dropout: float = 0.1,
         # === 训练配置 ===
         num_train_epochs: int = 1,
         max_steps: int = 300000,
@@ -108,13 +103,7 @@ class PretrainConfig(RoFormerConfig):
 
         # === 模型扩展配置 ===
         self.use_sdpa_attention = use_sdpa_attention
-        self.use_cfg = use_cfg
-        self.use_ddg = use_ddg
         self.embedding_size = embedding_size
-        self.graph_hidden_size = graph_hidden_size or self.hidden_size
-        self.graph_layers = graph_layers
-        self.graph_attention_heads = graph_attention_heads
-        self.graph_dropout = graph_dropout
 
         # === 训练配置 ===
         self.num_train_epochs = num_train_epochs

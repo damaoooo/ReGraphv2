@@ -6,15 +6,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GenerationMixin, RoFormerForMaskedLM
 
-from Model.model_backbone import RoFormerGraph
+from Model.model_backbone import RoFormerEncoder
 from .pretrain_config import PretrainConfig
 
 
 class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
     def __init__(self, config: PretrainConfig):
         super().__init__(config)
-        self.roformer = RoFormerGraph(config)
-        # Re-tie MLM decoder weights to the new encoder embeddings.
+        self.roformer = RoFormerEncoder(config)
         self.tie_weights()
 
         self.linear = nn.Sequential(
@@ -25,30 +24,21 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
         )
 
     def tie_weights(self, **kwargs):
-        """Tie MLM decoder weights to word embeddings, bypassing HuggingFace's
-        _tied_weights_keys path validation.
-
-        HuggingFace validates _tied_weights_keys by matching parameter names via
-        regex.  That validation runs during super().__init__() when self.roformer
-        is still a plain RoFormerModel, before we replace it with RoFormerGraph.
-        At that point the path 'roformer.roformer.embeddings...' does not yet
-        exist, causing a ValueError.  By overriding tie_weights() we perform the
-        tying directly without any path validation.
-        """
+        """Tie MLM decoder weights to the encoder word embeddings."""
         if not getattr(self.config, "tie_word_embeddings", True):
             return
         try:
             input_embeddings = self.get_input_embeddings()
         except AttributeError:
-            # Called before self.roformer was replaced with RoFormerGraph; skip.
             return
         output_embeddings = self.get_output_embeddings()
         if output_embeddings is not None and input_embeddings is not None:
             output_embeddings.weight = input_embeddings.weight
-        # Tie the standalone bias to the decoder bias.
-        if (hasattr(self, "cls")
-                and hasattr(self.cls.predictions, "bias")
-                and hasattr(self.cls.predictions.decoder, "bias")):
+        if (
+            hasattr(self, "cls")
+            and hasattr(self.cls.predictions, "bias")
+            and hasattr(self.cls.predictions.decoder, "bias")
+        ):
             self.cls.predictions.decoder.bias = self.cls.predictions.bias
 
     def get_input_embeddings(self):
@@ -61,13 +51,6 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.FloatTensor,
-        ddg_node_spans: Optional[torch.LongTensor] = None,
-        ddg_node_batch: Optional[torch.LongTensor] = None,
-        ddg_edge_index: Optional[torch.LongTensor] = None,
-        cfg_node_spans: Optional[torch.LongTensor] = None,
-        cfg_node_batch: Optional[torch.LongTensor] = None,
-        cfg_edge_index: Optional[torch.LongTensor] = None,
-        cfg_edge_attr: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         return_dict: Optional[bool] = None,
         **kwargs,
@@ -75,21 +58,15 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         output_attentions = bool(kwargs.pop("output_attentions", False))
 
-        roformer_out = self.roformer(
+        encoder_out = self.roformer(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            ddg_node_spans=ddg_node_spans,
-            ddg_node_batch=ddg_node_batch,
-            ddg_edge_index=ddg_edge_index,
-            cfg_node_spans=cfg_node_spans,
-            cfg_node_batch=cfg_node_batch,
-            cfg_edge_index=cfg_edge_index,
-            cfg_edge_attr=cfg_edge_attr,
             output_attentions=output_attentions,
+            **kwargs,
         )
 
-        sequence_output = roformer_out["sequence_output"]
-        fused_feature = roformer_out["fused_feature"]
+        sequence_output = encoder_out["sequence_output"]
+        pooled_feature = encoder_out["fused_feature"]
 
         prediction_logits = self.cls(sequence_output)
 
@@ -97,11 +74,14 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
         if labels is not None:
             if (labels != -100).any():
                 loss_fct = nn.CrossEntropyLoss()
-                mlm_loss = loss_fct(prediction_logits.view(-1, self.config.vocab_size), labels.view(-1))
+                mlm_loss = loss_fct(
+                    prediction_logits.view(-1, self.config.vocab_size),
+                    labels.view(-1),
+                )
             else:
                 mlm_loss = prediction_logits.new_zeros(())
 
-        contrastive_embed = self.linear(fused_feature)
+        contrastive_embed = self.linear(pooled_feature)
         contrastive_embed = F.normalize(contrastive_embed, p=2, dim=1)
 
         if not return_dict:
@@ -113,7 +93,7 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
             "embedding": contrastive_embed,
         }
         if output_attentions:
-            result["attentions"] = roformer_out.get("attentions")
+            result["attentions"] = encoder_out.get("attentions")
         return result
 
 
@@ -142,7 +122,10 @@ class MoCoPretrainModel(nn.Module):
         for param_k in self.encoder_k.parameters():
             param_k.requires_grad = False
 
-        for (_, param_q), (_, param_k) in zip(self.encoder_q.named_parameters(), self.encoder_k.named_parameters()):
+        for (_, param_q), (_, param_k) in zip(
+            self.encoder_q.named_parameters(),
+            self.encoder_k.named_parameters(),
+        ):
             if param_q.shape != param_k.shape:
                 raise RuntimeError(f"Parameter size mismatch: {param_q.shape} vs {param_k.shape}")
 

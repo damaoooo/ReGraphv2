@@ -15,6 +15,26 @@ import pickle
 import typer
 
 
+OPT_LEVELS = {"O0", "O1", "O2", "O3", "Os", "Oz"}
+
+
+def parse_binary_folder_name(folder_name: str) -> Tuple[str, str]:
+    """Parse `<arch>-<compiler>-<ver>-<opt>_<binary>[_functions]` style folder names."""
+    stem = folder_name[:-10] if folder_name.endswith("_functions") else folder_name
+
+    parts = stem.split("-")
+    if len(parts) < 4:
+        return "unknown", stem
+
+    trailing = "-".join(parts[3:])
+    if "_" in trailing:
+        maybe_opt, binary_name = trailing.split("_", 1)
+        if maybe_opt in OPT_LEVELS and binary_name:
+            return maybe_opt, binary_name
+
+    return "unknown", trailing or stem
+
+
 def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, List[int]], function_info_df: pd.DataFrame, ratio: float = 0.9) -> None:
 
     print("原始数据集总大小:", len(original_dataset))
@@ -213,53 +233,42 @@ def build_positive_indices(dataset: datasets.Dataset, base_path: str) -> Tuple[d
     :param base_path: 数据集的基础路径
     :return: 正样本索引映射字典和包含function name的DataFrame
     """
-    example_file = dataset[0]['file_path']
     df: pd.DataFrame = dataset.select_columns(['file_path']).to_pandas()
     df['original_idx'] = range(len(df))
 
     def extract_binary_info_vectorized(file_paths: pd.Series) -> pd.DataFrame:
-        """向量化版本的信息提取"""
-        # 使用字符串方法进行批量操作
-        ll_names = file_paths.str.split('/').str[-1]
-        dir_names = file_paths.str.split('/').str[-3] + "/" + file_paths.str.split('/').str[-2]
-        origin_dir_names = dir_names.str.replace('_functions', '')
-        
-        # 批量分割和提取
-        split_parts = origin_dir_names.str.split('-')
-        binary_hashes = split_parts.str[-1]
-        opt_levels = split_parts.str[-2]
-        origin_binary_names = split_parts.apply(lambda x: '-'.join(x[:-2]) if len(x) > 2 else '')
-        
-        return pd.DataFrame({
-            'll_name': ll_names,
-            'opt_level': opt_levels,
-            'dir_name': dir_names,
-            'origin_binary_name': origin_binary_names
-        })
+        """从 ASM/LLVM 文件路径里提取可用于构造正样本的信息。"""
 
-    df[['ll_name', 'opt_level', 'dir_name', 'origin_binary_name']] = extract_binary_info_vectorized(df['file_path'])
+        def parse_single_file_path(file_path: str) -> Dict[str, str]:
+            normalized = os.path.normpath(file_path)
+            parts = normalized.split(os.sep)
 
-    grouped_by_dir_name = df.groupby('dir_name')
-    processed_groups = []
-    if "Dataset-2-IR" in base_path:
-        # Base path add /../
-        base_path = os.path.abspath(os.path.join(base_path, ".."))
-    for dir_name, group_content in tqdm(grouped_by_dir_name, desc="Mapping functions to original names"):
-        csv_path = os.path.join(base_path, dir_name, 'function_map.csv')
-        # print(f"Processing directory: {dir_name} with base path: {base_path}, csv_path is: {csv_path}")
-        try:
-            hash_map_df = pd.read_csv(csv_path)
-            hash_to_name_map = pd.Series(hash_map_df['OriginalFunctionName'].values, index=hash_map_df['HashedFileName']).to_dict()
-        except FileNotFoundError:
-            print(f"File {csv_path} not found, skipping.")
-            continue
+            file_name = parts[-1]
+            function_name = os.path.splitext(file_name)[0]
 
-        temp_df = group_content.copy()
-        temp_df['function_name'] = temp_df['ll_name'].map(hash_to_name_map)
-        processed_groups.append(temp_df)
+            folder_name = parts[-2] if len(parts) >= 2 else ""
+            project_name = parts[-3] if len(parts) >= 3 else ""
+            dir_name = os.path.join(project_name, folder_name) if project_name else folder_name
 
-    full_info_df = pd.concat(processed_groups)
+            opt_level, binary_name = parse_binary_folder_name(folder_name)
+            origin_binary_name = binary_name
 
+            if project_name:
+                origin_binary_name = f"{project_name}/{origin_binary_name}"
+
+            return {
+                "file_name": file_name,
+                "function_name": function_name,
+                "opt_level": opt_level,
+                "dir_name": dir_name,
+                "origin_binary_name": origin_binary_name,
+            }
+
+        parsed_rows = [parse_single_file_path(file_path) for file_path in file_paths]
+        return pd.DataFrame(parsed_rows)
+
+    extracted_df = extract_binary_info_vectorized(df['file_path'])
+    full_info_df = pd.concat([df.reset_index(drop=True), extracted_df.reset_index(drop=True)], axis=1)
     full_info_df.dropna(subset=['origin_binary_name', 'function_name'], inplace=True)
 
     print("Grouping by [origin_binary_name, function_name] to find correct positive pairs...")
@@ -280,7 +289,7 @@ def build_positive_indices(dataset: datasets.Dataset, base_path: str) -> Tuple[d
 
 def main(
     dataset_path: str = typer.Argument(..., help="Path to the dataset directory"),
-    base_path: str = typer.Option("/home/damaoooo/Datasets/IR/small_test/small_test", help="Base path for function mapping CSV files"),
+    base_path: str = typer.Option(".", help="Base path of the source dataset tree. Retained for CLI compatibility."),
     train_ratio: float = typer.Option(0.9, help="Training set ratio (0.0-1.0)"),
     random_seed: int = typer.Option(42, help="Random seed for reproducibility"),
     output_dir: str = typer.Option(".", help="Output directory for generated files")
