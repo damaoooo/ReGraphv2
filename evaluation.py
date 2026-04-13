@@ -24,6 +24,8 @@ import torch
 from numba import njit, prange, types
 from numba.typed import Dict as NumbaDict
 
+MRR_CUTOFFS = (10, 30, 50, 100)
+
 
 # --- 设置 Rich 和 Typer ---
 logging.basicConfig(
@@ -515,7 +517,7 @@ def _build_eval_subset(
     return subset, subset_positive_map, subset_anchors
 
 
-def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets, pool_sizes, k_values: List[int], use_gpu: bool = True) -> dict:
+def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets, pool_sizes, k_values: List[int], use_gpu: bool = True):
     """
     处理锚点批次，计算与所有嵌入向量的相似度，并返回Recall@K结果。
     使用GPU加速计算相似度。
@@ -525,7 +527,8 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets
         recalls[pool_size] = {
             "recall": {k: [0, 0] for k in k_values},
         }
-    mrr_stats = {10: [0.0, 0], 30: [0.0, 0]}
+    mrr_stats = {cutoff: [0.0, 0] for cutoff in MRR_CUTOFFS}
+    mrr_pool_stats = {pool_size: [0.0, 0] for pool_size in pool_sizes}
     
     max_pool_size = max(pool_sizes)
     pool_size = max_pool_size - 1
@@ -536,7 +539,7 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets
     pools = _build_pools_parallel(anchor_batch_arr, pos_flat, pos_offsets, total_size, pool_size)
     valid_mask = pools[:, 0] >= 0
     if not np.any(valid_mask):
-        return recalls
+        return recalls, mrr_stats, mrr_pool_stats
 
     pools = pools[valid_mask]
     anchor_batch_arr = anchor_batch_arr[valid_mask]
@@ -568,7 +571,7 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets
     mrr_pos_scores = mrr_sim_slice[:, 0].unsqueeze(1)
     mrr_count_greater = (mrr_sim_slice > mrr_pos_scores).sum(dim=1)
     mrr_ranks = mrr_count_greater + 1
-    for cutoff in (10, 30):
+    for cutoff in MRR_CUTOFFS:
         mrr_cutoff = min(cutoff, max_pool_size)
         mrr_scores = torch.where(
             mrr_ranks <= mrr_cutoff,
@@ -584,6 +587,12 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets
         pos_scores = sim_slice[:, 0].unsqueeze(1)
         # 统计比正样本更大的个数，个数 < k 即表示正样本进入Top-K
         count_greater = (sim_slice > pos_scores).sum(dim=1)
+        ranks = count_greater + 1
+
+        mrr_pool_scores = 1.0 / ranks.float()
+        mrr_pool_stats[pool_size][0] += mrr_pool_scores.sum().item()
+        mrr_pool_stats[pool_size][1] += mrr_pool_scores.numel()
+
         for k in k_values:
             success = (count_greater < k).sum().item()
             total = count_greater.numel()
@@ -591,7 +600,7 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets
             recalls[pool_size]["recall"][k][0] += success
             recalls[pool_size]["recall"][k][1] += total
 
-    return recalls, mrr_stats
+    return recalls, mrr_stats, mrr_pool_stats
 
 
 @app.command()
@@ -729,12 +738,13 @@ def main(
         temp_results[pool_size] = {
             "recall": {k: [0, 0] for k in k_values},
         }
-    total_mrr = {10: [0.0, 0], 30: [0.0, 0]}
+    total_mrr = {cutoff: [0.0, 0] for cutoff in MRR_CUTOFFS}
+    total_mrr_by_pool = {pool_size: [0.0, 0] for pool_size in pool_sizes}
     
     
     for i in track(range(0, len(anchors_to_evaluate), gpu_batch_size), description="正在评估..."):
         anchor_batch = anchors_to_evaluate[i:i + gpu_batch_size]
-        result, batch_mrr = process_anchor_batch_gpu(
+        result, batch_mrr, batch_mrr_by_pool = process_anchor_batch_gpu(
             all_embeddings_gpu if use_gpu else all_embeddings,
             anchor_batch,
             pos_flat,
@@ -748,9 +758,12 @@ def main(
             for k in k_values:
                 temp_results[pool_size]["recall"][k][0] += result[pool_size]["recall"][k][0]
                 temp_results[pool_size]["recall"][k][1] += result[pool_size]["recall"][k][1]
-        for cutoff in (10, 30):
+        for cutoff in MRR_CUTOFFS:
             total_mrr[cutoff][0] += batch_mrr[cutoff][0]
             total_mrr[cutoff][1] += batch_mrr[cutoff][1]
+        for pool_size in pool_sizes:
+            total_mrr_by_pool[pool_size][0] += batch_mrr_by_pool[pool_size][0]
+            total_mrr_by_pool[pool_size][1] += batch_mrr_by_pool[pool_size][1]
                 
     # 将结果转换为百分比
     
@@ -775,10 +788,17 @@ def main(
         table.add_row(*row_data)
         
     console.print(table)
-    mrr10 = total_mrr[10][0] / total_mrr[10][1] if total_mrr[10][1] > 0 else 0
-    mrr30 = total_mrr[30][0] / total_mrr[30][1] if total_mrr[30][1] > 0 else 0
-    console.print(f"[bold green]MRR@10: {mrr10:.4f}[/bold green]")
-    console.print(f"[bold green]MRR@30: {mrr30:.4f}[/bold green]")
+    for cutoff in MRR_CUTOFFS:
+        mrr_value = total_mrr[cutoff][0] / total_mrr[cutoff][1] if total_mrr[cutoff][1] > 0 else 0
+        console.print(f"[bold green]MRR@{cutoff}: {mrr_value:.4f}[/bold green]")
+
+    mrr_pool_table = Table(title="MRR@P 在不同大小检索池中的表现")
+    mrr_pool_table.add_column("Pool Size", justify="right", style="cyan")
+    mrr_pool_table.add_column("MRR@P", justify="right", style="green")
+    for pool_size in pool_sizes:
+        mrr_p = total_mrr_by_pool[pool_size][0] / total_mrr_by_pool[pool_size][1] if total_mrr_by_pool[pool_size][1] > 0 else 0
+        mrr_pool_table.add_row(f"{pool_size:,}", f"{mrr_p:.4f}")
+    console.print(mrr_pool_table)
 
 
 if __name__ == "__main__":
