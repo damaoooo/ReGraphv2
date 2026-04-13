@@ -1,6 +1,6 @@
 # Dataset Builder Code Refactoring
 
-这个文件夹包含了重构后的 LLVM IR 数据集构建器代码。原来的 `dataset_builder.py` 文件超过1000行，现在被拆分成了更易管理的模块。
+这个文件夹包含了重构后的 LLVM IR 数据集构建器代码。原来的单体数据集构建器超过1000行，现在被拆分成了更易管理的模块。
 
 ## 文件结构
 
@@ -37,11 +37,6 @@
 7. **`cli.py`** - 命令行界面
    - Typer 基础的 CLI 实现
    - 所有命令行参数和选项
-
-8. **`dataset_builder.py`** - 向后兼容模块
-   - 提供向后兼容性
-   - 重新导出所有重要组件
-   - 遗留函数包装器
 
 ## 使用方式
 
@@ -82,11 +77,8 @@ result = processor.process_single_file(file_path)
 ### 命令行使用
 
 ```bash
-# 使用新的 CLI
+# 使用 CLI
 python cli.py directory /path/to/input /path/to/output.json
-
-# 或者使用原来的方式（向后兼容）
-python dataset_builder.py directory /path/to/input /path/to/output.json
 ```
 
 ## 重构的好处
@@ -95,11 +87,11 @@ python dataset_builder.py directory /path/to/input /path/to/output.json
 2. **可维护性**：更小的文件更容易理解和修改
 3. **可重用性**：组件可以独立使用
 4. **可测试性**：更容易对单个组件进行单元测试
-5. **向后兼容**：现有代码无需修改
+5. **可扩展性**：后续功能继续集中在模块化实现中
 
 ## 迁移指南
 
-现有的代码可以继续使用 `dataset_builder.py`，不需要立即迁移。如果要使用新的模块化代码：
+如果要使用新的模块化代码：
 
 1. 直接从相应模块导入需要的类
 2. 使用 `dataset_builder_new.py` 中的 `DatasetBuilder` 类
@@ -109,5 +101,4 @@ python dataset_builder.py directory /path/to/input /path/to/output.json
 
 - 新功能应该添加到相应的模块中
 - 保持每个模块的单一职责
-- 添加新功能时考虑向后兼容性
-- 在 `dataset_builder.py` 中添加必要的导入和包装器
+- 添加新功能时优先放在模块化实现中
