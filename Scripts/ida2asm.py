@@ -146,17 +146,8 @@ def sanitize_filename(name, fallback_name):
     return sanitized or fallback_name
 
 
-def ensure_unique_path(output_dir, base_name):
-    candidate = output_dir / f"{base_name}.asm"
-    if not candidate.exists():
-        return candidate
-
-    suffix = 1
-    while True:
-        candidate = output_dir / f"{base_name}_{suffix}.asm"
-        if not candidate.exists():
-            return candidate
-        suffix += 1
+def get_output_path(output_dir, base_name):
+    return output_dir / f"{base_name}.asm"
 
 
 def get_function_code_eas(func_ea):
@@ -257,7 +248,7 @@ def export_function(output_dir, func_ea):
         return None, f"Skipped {func_name}: {skip_reason}"
 
     clean_name = sanitize_filename(func_name, fallback_name)
-    file_path = ensure_unique_path(output_dir, clean_name)
+    file_path = get_output_path(output_dir, clean_name)
 
     with file_path.open("w", encoding=DEFAULT_ENCODING) as handle:
         for curr in code_eas:
