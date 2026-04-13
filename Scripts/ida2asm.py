@@ -316,7 +316,11 @@ def main():
             skipped,
             failed,
         )
-        return 0 if failed == 0 else 1
+        if exported > 0:
+            return 0
+        if failed > 0:
+            return 1
+        return 0
     except Exception as exc:
         LOGGER.exception("Export failed: %s", exc)
         return 1
@@ -324,7 +328,6 @@ def main():
         if opened:
             LOGGER.info("Closing database (save=%s)...", args.save_database)
             idapro.close_database(save=args.save_database)
-        return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

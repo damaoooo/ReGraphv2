@@ -220,7 +220,8 @@ def export_single_i64(
 
     try:
         result = subprocess.run(command, capture_output=True, text=True)
-        success = result.returncode == 0 and directory_contains_asm(output_dir)
+        generated_asm = directory_contains_asm(output_dir)
+        success = generated_asm
         return (
             success,
             i64_path,
@@ -527,6 +528,19 @@ def main(
                     success, _, _, command, returncode, stdout, stderr = future.result()
                     if success:
                         success_count += 1
+                        if returncode != 0:
+                            logger.warning(separator)
+                            logger.warning(
+                                "ASM export for %s produced output but returned non-zero status %s",
+                                i64_path,
+                                returncode,
+                            )
+                            logger.warning("Output dir: %s", output_dir)
+                            logger.warning("Command: %s", " ".join(command))
+                            if stdout:
+                                logger.warning("--- stdout ---\n%s", trim_output(stdout))
+                            if stderr:
+                                logger.warning("--- stderr ---\n%s", trim_output(stderr))
                     else:
                         failed_count += 1
                         failed_files.append(i64_path)
@@ -581,7 +595,7 @@ def main(
     logger.info("bin2asm completed at %s", datetime.now())
     logger.info(separator)
 
-    if failed_count > 0:
+    if success_count == 0 and failed_count > 0:
         raise typer.Exit(code=1)
 
     return True
