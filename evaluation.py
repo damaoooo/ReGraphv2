@@ -13,11 +13,11 @@ from rich.table import Table
 from transformers import set_seed
 from datasets import Dataset as HFDataset, load_from_disk
 from Tokenizer.ir_tokenizer import load_tokenizer
+from Utils.utils import DEFAULT_TOKENIZER_PATH
 
 from torch.utils.data.dataset import Dataset as TorchDataset
 from torch.utils.data.dataloader import DataLoader
 from transformers import DataCollatorWithPadding
-from Model.graph_utils import build_batched_span_graph_tensors
 from Pretrain.pretrain_model import MoCoPretrainModel
 from Pretrain.pretrain_config import PretrainConfig
 import torch
@@ -121,11 +121,9 @@ def _build_pools_parallel(anchor_batch: np.ndarray, pos_flat: np.ndarray, pos_of
     
 class FunctionDataCollator:
     
-    def __init__(self, tokenizer, max_length=2048, use_cfg: bool = True, use_ddg: bool = True):
+    def __init__(self, tokenizer, max_length=2048):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.use_cfg = use_cfg
-        self.use_ddg = use_ddg
         
     def __call__(self, batch: List):
         pad_collator = DataCollatorWithPadding(tokenizer=self.tokenizer, padding=True, pad_to_multiple_of=8)
@@ -144,37 +142,16 @@ class FunctionDataCollator:
         
         input_ids = pad_collator({'input_ids': truncated_input_ids})
         input_ids, attention_mask = input_ids['input_ids'], input_ids['attention_mask']
-        cfg_graphs_raw = [batch_item['cfg_graph'] for batch_item in batch] if self.use_cfg else None
-
-        seq_lengths = [int(mask.sum().item()) for mask in attention_mask]
-
-        ddg_tensors = {"node_spans": None, "node_batch": None, "edge_index": None, "edge_attr": None}
-        if self.use_ddg:
-            ddg_graphs_input = [batch_item['ddg_graph'] for batch_item in batch]
-            ddg_tensors = build_batched_span_graph_tensors(ddg_graphs_input, seq_lengths, include_edge_attr=False)
-
-        cfg_tensors = {"node_spans": None, "node_batch": None, "edge_index": None, "edge_attr": None}
-        if self.use_cfg:
-            cfg_tensors = build_batched_span_graph_tensors(cfg_graphs_raw, seq_lengths, include_edge_attr=True)
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "ddg_node_spans": ddg_tensors["node_spans"],
-            "ddg_node_batch": ddg_tensors["node_batch"],
-            "ddg_edge_index": ddg_tensors["edge_index"],
-            "cfg_node_spans": cfg_tensors["node_spans"],
-            "cfg_node_batch": cfg_tensors["node_batch"],
-            "cfg_edge_index": cfg_tensors["edge_index"],
-            "cfg_edge_attr": cfg_tensors["edge_attr"],
         }
     
 def get_model(
     model_path,
     max_seq_length=2048,
     embedding_size=768,
-    use_cfg: bool = True,
-    use_ddg: bool = True,
     tokenizer_path: str = None,
 ):
     """加载MoCo模型并返回encoder_q用于推理
@@ -195,8 +172,6 @@ def get_model(
     else:
         config = PretrainConfig(max_seq_length=max_seq_length)
     config.max_seq_length = max_seq_length
-    config.use_cfg = use_cfg
-    config.use_ddg = use_ddg
     if tokenizer_path is not None:
         config.tokenizer_path = tokenizer_path
     
@@ -249,16 +224,9 @@ def get_dataloader(
     tokenizer,
     batch_size: int = 64,
     max_length: int = 2048,
-    use_cfg: bool = True,
-    use_ddg: bool = True,
 ) -> DataLoader:
     dataset = _load_dataset(dataset_source)
-    collator = FunctionDataCollator(
-        tokenizer,
-        max_length=max_length,
-        use_cfg=use_cfg,
-        use_ddg=use_ddg,
-    )
+    collator = FunctionDataCollator(tokenizer, max_length=max_length)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -279,8 +247,7 @@ def generate_embeddings_with_model(
     model_path: str,
     max_length: int = 2048,
     embedding_size: int = 768,
-    use_cfg: bool = True,
-    use_ddg: bool = True,
+    device_override: str | None = None,
 ) -> np.ndarray:
     """
     使用本地模型为整个数据集生成嵌入向量。
@@ -291,7 +258,10 @@ def generate_embeddings_with_model(
     import os
     
     # 检查CUDA是否可用
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device_override is not None:
+        device = torch.device(device_override)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     console.print(f"Using device: {device}")
     
     # 加载和设置模型（encoder_q用于推理）
@@ -299,8 +269,6 @@ def generate_embeddings_with_model(
         model_path=model_path,
         max_seq_length=max_length,
         embedding_size=embedding_size,
-        use_cfg=use_cfg,
-        use_ddg=use_ddg,
     )
     model = model.to(device)
     model.eval()  # 设置为评估模式
@@ -314,8 +282,6 @@ def generate_embeddings_with_model(
         tokenizer,
         batch_size=batch_size,
         max_length=max_length,
-        use_cfg=use_cfg,
-        use_ddg=use_ddg,
     )
 
     # 计算总样本数和embedding维度，提前创建memmap
@@ -356,24 +322,11 @@ def generate_embeddings_with_model(
         processed_count = 0
         batch_idx = 0
         current_idx = 0  # 当前memmap写入位置
-        graph_tensor_keys = (
-            "ddg_node_spans",
-            "ddg_node_batch",
-            "ddg_edge_index",
-            "cfg_node_spans",
-            "cfg_node_batch",
-            "cfg_edge_index",
-            "cfg_edge_attr",
-        )
         
         for batch in dataloader:
             batch_idx += 1
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            graph_inputs = {
-                key: batch[key].to(device) if batch.get(key) is not None else None
-                for key in graph_tensor_keys
-            }
             
             try:
                 with torch.inference_mode():
@@ -383,7 +336,6 @@ def generate_embeddings_with_model(
                                 input_ids=input_ids, 
                                 attention_mask=attention_mask, 
                                 return_dict=True,
-                                **graph_inputs,
                             )
                             embeddings = outputs['embedding']
                     else:
@@ -391,7 +343,6 @@ def generate_embeddings_with_model(
                             input_ids=input_ids, 
                             attention_mask=attention_mask, 
                             return_dict=True,
-                            **graph_inputs,
                         )
                         embeddings = outputs['embedding']
                     
@@ -410,7 +361,7 @@ def generate_embeddings_with_model(
                     memory_usage = get_memory_usage()
                     progress.update(task, advance=batch_size_actual, speed=speed, memory=memory_usage)
                     
-                    del input_ids, attention_mask, graph_inputs
+                    del input_ids, attention_mask
                     del outputs, embeddings, batch_embeddings, batch
                     
             except Exception as e:
@@ -425,7 +376,7 @@ def generate_embeddings_with_model(
                 console.print(f"[yellow]  错误类型: {type(e).__name__}[/yellow]")
                 console.print(f"[yellow]  错误信息: {str(e)}[/yellow]")
                 # 清理失败batch的变量
-                del input_ids, attention_mask, graph_inputs, batch
+                del input_ids, attention_mask, batch
 
     # 输出失败统计信息
     if failed_batches:
@@ -618,8 +569,6 @@ def main(
     use_gpu: bool = typer.Option(True, "--gpu/--no-gpu", help="是否使用GPU加速计算。"),
     gpu_batch_size: int = typer.Option(512, "--gpu-batch-size", help="GPU批量处理的锚点数量。"),
     tokenizer_path: Path = typer.Option(None, "--tokenizer-path", help="Tokenizer文件路径，如果与模型路径不同。"),
-    use_cfg: bool = typer.Option(True, "--cfg/--no-cfg", help="是否启用 CFG 图分支。"),
-    use_ddg: bool = typer.Option(True, "--ddg/--no-ddg", help="是否启用 DDG 图分支。"),
     use_bf16: bool = typer.Option(False, "--bf16", help="将嵌入以BF16加载到GPU，减少显存与带宽开销。"),
 ):
     """
@@ -627,7 +576,6 @@ def main(
     """
     console.rule(f"[bold blue]开始使用本地模型进行评估[/bold blue]")
     set_seed(seed)
-    console.print(f"[blue]Graph branches: cfg={use_cfg}, ddg={use_ddg}[/blue]")
     
     # GPU可用性检查
     if use_gpu and not GPU_AVAILABLE:
@@ -649,9 +597,7 @@ def main(
     if tokenizer_path:
         tokenizer = load_tokenizer(str(tokenizer_path))
     else:
-        # 使用默认的tokenizer路径（假设与测试代码中相同）
-        default_tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
-        tokenizer = load_tokenizer(default_tokenizer_path)
+        tokenizer = load_tokenizer(DEFAULT_TOKENIZER_PATH)
 
 
     dataset_for_eval, positive_map_for_eval, anchors_to_evaluate = _build_eval_subset(
@@ -683,8 +629,7 @@ def main(
             tokenizer=tokenizer, 
             model_path=str(model_path),
             max_length=max_length,
-            use_cfg=use_cfg,
-            use_ddg=use_ddg,
+            device_override="cuda" if use_gpu else "cpu",
         )
         logging.info(f"嵌入向量生成完毕，形状为: [green]{all_embeddings.shape}[/green]")
         
