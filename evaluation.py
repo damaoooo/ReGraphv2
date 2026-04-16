@@ -45,6 +45,44 @@ else:
     console.print("[yellow]⚠ 未检测到可用GPU，将使用CPU计算[/yellow]")
 
 
+def _format_bytes(num_bytes: int) -> str:
+    """把字节数格式化为便于日志阅读的单位。"""
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{num_bytes} B"
+
+
+def _dtype_nbytes(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _move_batch_embeddings_to_gpu(
+    all_embeddings: np.ndarray,
+    anchor_batch_arr: np.ndarray,
+    pools: np.ndarray,
+    target_dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    从CPU数组/memmap中只取当前batch需要的embedding，再搬到GPU。
+    这样可以避免把整份缓存一次性加载进显存。
+    """
+    embedding_dim = all_embeddings.shape[1]
+    anchor_np = np.ascontiguousarray(all_embeddings[anchor_batch_arr], dtype=np.float32)
+    pool_np = np.ascontiguousarray(
+        all_embeddings[pools.reshape(-1)],
+        dtype=np.float32,
+    ).reshape(pools.shape[0], pools.shape[1], embedding_dim)
+
+    anchors = torch.as_tensor(anchor_np, dtype=target_dtype, device=device)
+    embedding_pools = torch.as_tensor(pool_np, dtype=target_dtype, device=device)
+    return anchors, embedding_pools
+
+
 @njit
 def _floyd_sample(pop_size: int, sample_size: int) -> np.ndarray:
     """Floyd算法：在O(k)时间内均匀采样k个不重复整数。"""
@@ -408,22 +446,22 @@ def generate_embeddings_with_model(
 
 
 def _build_eval_subset(
-    dataset: HFDataset,
+    total_size: int,
     positive_map: dict,
     eval_samples: int,
     pool_samples: int,
-) -> tuple[HFDataset, dict, List[int]]:
+) -> tuple[List[int] | None, dict, List[int]]:
     all_possible_anchors = list(positive_map.keys())
     if not all_possible_anchors:
-        return dataset, positive_map, []
+        return None, positive_map, []
 
     if eval_samples > 0 and eval_samples < len(all_possible_anchors):
         anchors_to_evaluate = random.sample(all_possible_anchors, eval_samples)
     else:
         anchors_to_evaluate = all_possible_anchors
 
-    if pool_samples <= 0 or pool_samples >= len(dataset):
-        return dataset, positive_map, anchors_to_evaluate
+    if pool_samples <= 0 or pool_samples >= total_size:
+        return None, positive_map, anchors_to_evaluate
 
     selected_global_indices = set(anchors_to_evaluate)
     for anchor_idx in anchors_to_evaluate:
@@ -433,16 +471,13 @@ def _build_eval_subset(
 
     remaining_budget = pool_samples - len(selected_global_indices)
     if remaining_budget > 0:
-        all_indices = list(range(len(dataset)))
-        excluded = selected_global_indices
-        candidates = [idx for idx in all_indices if idx not in excluded]
-        if remaining_budget < len(candidates):
-            selected_global_indices.update(random.sample(candidates, remaining_budget))
-        else:
-            selected_global_indices.update(candidates)
+        excluded = np.asarray(sorted(selected_global_indices), dtype=np.int64)
+        sample_size = min(remaining_budget, total_size - excluded.size)
+        if sample_size > 0:
+            sampled = _sample_excluding(total_size, excluded, sample_size)
+            selected_global_indices.update(int(idx) for idx in sampled)
 
     selected_indices = sorted(selected_global_indices)
-    subset = dataset.select(selected_indices)
     old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(selected_indices)}
 
     subset_positive_map = {}
@@ -465,10 +500,46 @@ def _build_eval_subset(
         new_idx = old_to_new[idx]
         if new_idx in subset_positive_map:
             subset_anchors.append(new_idx)
-    return subset, subset_positive_map, subset_anchors
+    return selected_indices, subset_positive_map, subset_anchors
 
 
-def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets, pool_sizes, k_values: List[int], use_gpu: bool = True):
+def _materialize_embedding_subset(
+    all_embeddings: np.ndarray,
+    selected_indices: List[int],
+    chunk_size: int = 8192,
+) -> tuple[np.memmap, Path]:
+    """把选中的embedding子集复制到临时memmap，避免一次性占满内存。"""
+    import tempfile
+
+    subset_size = len(selected_indices)
+    embedding_dim = all_embeddings.shape[1]
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".emb")
+    temp_path = Path(temp_file.name)
+    temp_file.close()
+
+    subset_embeddings = np.memmap(
+        temp_path,
+        dtype=np.float32,
+        mode="w+",
+        shape=(subset_size, embedding_dim),
+    )
+    selected_indices_arr = np.asarray(selected_indices, dtype=np.int64)
+    for start in range(0, subset_size, chunk_size):
+        end = min(start + chunk_size, subset_size)
+        subset_embeddings[start:end] = all_embeddings[selected_indices_arr[start:end]]
+    return subset_embeddings, temp_path
+
+
+def process_anchor_batch_gpu(
+    all_embeddings,
+    anchor_batch,
+    pos_flat,
+    pos_offsets,
+    pool_sizes,
+    k_values: List[int],
+    use_gpu: bool = True,
+    gpu_dtype: torch.dtype = torch.float32,
+):
     """
     处理锚点批次，计算与所有嵌入向量的相似度，并返回Recall@K结果。
     使用GPU加速计算相似度。
@@ -496,18 +567,26 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets
     anchor_batch_arr = anchor_batch_arr[valid_mask]
 
     if use_gpu:
-        device = all_embeddings.device
-        anchor_idx_tensor = torch.as_tensor(anchor_batch_arr, device=device, dtype=torch.long)
-        anchors = all_embeddings.index_select(0, anchor_idx_tensor)
-    else:
-        anchors = all_embeddings[anchor_batch_arr]
-    if use_gpu:
-        # 将索引放到GPU上，直接在GPU内存中gather，避免CPU->GPU大拷贝
-        pool_idx_tensor = torch.as_tensor(pools, device=device, dtype=torch.long)
-        embedding_pools = all_embeddings[pool_idx_tensor]
+        if torch.is_tensor(all_embeddings):
+            device = all_embeddings.device
+            anchor_idx_tensor = torch.as_tensor(anchor_batch_arr, device=device, dtype=torch.long)
+            anchors = all_embeddings.index_select(0, anchor_idx_tensor)
+            # 将索引放到GPU上，直接在GPU内存中gather，避免CPU->GPU大拷贝
+            pool_idx_tensor = torch.as_tensor(pools, device=device, dtype=torch.long)
+            embedding_pools = all_embeddings[pool_idx_tensor]
+        else:
+            device = torch.device("cuda")
+            anchors, embedding_pools = _move_batch_embeddings_to_gpu(
+                all_embeddings=all_embeddings,
+                anchor_batch_arr=anchor_batch_arr,
+                pools=pools,
+                target_dtype=gpu_dtype,
+                device=device,
+            )
         anchor_emb = anchors.unsqueeze(1)
         similarities = torch.bmm(anchor_emb, embedding_pools.transpose(1, 2)).squeeze(1)
     else:
+        anchors = all_embeddings[anchor_batch_arr]
         embedding_pools = all_embeddings[pools]  # size: (batch_size, pool_size, embedding_dim)
         anchor_emb = anchors[:, np.newaxis, :]
         anchor_emb_t = torch.as_tensor(anchor_emb)
@@ -570,6 +649,11 @@ def main(
     gpu_batch_size: int = typer.Option(512, "--gpu-batch-size", help="GPU批量处理的锚点数量。"),
     tokenizer_path: Path = typer.Option(None, "--tokenizer-path", help="Tokenizer文件路径，如果与模型路径不同。"),
     use_bf16: bool = typer.Option(False, "--bf16", help="将嵌入以BF16加载到GPU，减少显存与带宽开销。"),
+    embeddings_gpu_mode: str = typer.Option(
+        "auto",
+        "--embeddings-gpu-mode",
+        help="GPU端embedding加载策略: auto/preload/stream。",
+    ),
 ):
     """
     在验证集上评估模型的函数检索性能 (Recall@K)，使用本地模型生成嵌入，GPU加速相似度计算。
@@ -587,42 +671,67 @@ def main(
     else:
         console.print("[blue]💻 使用CPU计算[/blue]")
     
-    # --- 1. 加载数据和Tokenizer ---
-    logging.info("正在加载数据和Tokenizer...")
+    # --- 1. 加载正样本映射 ---
+    logging.info("正在加载正样本映射...")
     with open(validation_positive_map_path, 'rb') as f:
         positive_map = pickle.load(f)
-    dataset = load_from_disk(str(validation_dataset_pool_path))
-    
-    # 加载Tokenizer
-    if tokenizer_path:
-        tokenizer = load_tokenizer(str(tokenizer_path))
-    else:
-        tokenizer = load_tokenizer(DEFAULT_TOKENIZER_PATH)
-
-
-    dataset_for_eval, positive_map_for_eval, anchors_to_evaluate = _build_eval_subset(
-        dataset=dataset,
-        positive_map=positive_map,
-        eval_samples=eval_samples,
-        pool_samples=pool_samples,
-    )
-
-    if pool_samples > 0:
-        logging.info(
-            f"快速评估模式: 检索池从 {len(dataset):,} 缩小到 {len(dataset_for_eval):,}，"
-            f"锚点数 {len(anchors_to_evaluate):,}"
-        )
-        if embeddings_path:
-            logging.warning("启用了 --pool-samples 时，请确保 embeddings_path 不与全量评估缓存混用。")
-    else:
-        logging.info(f"全量评估模式: 检索池 {len(dataset_for_eval):,}，锚点数 {len(anchors_to_evaluate):,}")
+    selected_indices = None
+    temp_subset_embeddings_path: Path | None = None
 
     # --- 2. 生成或加载所有嵌入向量 ---
     if embeddings_path and embeddings_path.exists():
-        logging.info(f"正在从 [cyan]{embeddings_path}[/cyan] 加载已缓存的嵌入向量...")
+        logging.info(f"检测到嵌入缓存 [cyan]{embeddings_path}[/cyan]，将跳过dataset/tokenizer加载。")
         all_embeddings = np.load(embeddings_path, mmap_mode='r')  # 使用mmap_mode避免全部加载到内存
         logging.info(f"嵌入向量加载完毕，形状为: [green]{all_embeddings.shape}[/green]")
+
+        selected_indices, positive_map_for_eval, anchors_to_evaluate = _build_eval_subset(
+            total_size=len(all_embeddings),
+            positive_map=positive_map,
+            eval_samples=eval_samples,
+            pool_samples=pool_samples,
+        )
+
+        if selected_indices is not None:
+            logging.info(
+                f"快速评估模式: 检索池从 {len(all_embeddings):,} 缩小到 {len(selected_indices):,}，"
+                f"锚点数 {len(anchors_to_evaluate):,}"
+            )
+            logging.info("正在从缓存embedding构建评估子集，不再读取原始dataset...")
+            all_embeddings, temp_subset_embeddings_path = _materialize_embedding_subset(
+                all_embeddings,
+                selected_indices,
+            )
+            logging.info(f"评估子集embedding已准备完毕，形状为: [green]{all_embeddings.shape}[/green]")
+        else:
+            logging.info(f"全量评估模式: 检索池 {len(all_embeddings):,}，锚点数 {len(anchors_to_evaluate):,}")
     else:
+        logging.info("未检测到可用embedding缓存，正在加载dataset和Tokenizer...")
+        dataset = load_from_disk(str(validation_dataset_pool_path))
+
+        if tokenizer_path:
+            tokenizer = load_tokenizer(str(tokenizer_path))
+        else:
+            tokenizer = load_tokenizer(DEFAULT_TOKENIZER_PATH)
+
+        selected_indices, positive_map_for_eval, anchors_to_evaluate = _build_eval_subset(
+            total_size=len(dataset),
+            positive_map=positive_map,
+            eval_samples=eval_samples,
+            pool_samples=pool_samples,
+        )
+
+        if selected_indices is not None:
+            logging.info(
+                f"快速评估模式: 检索池从 {len(dataset):,} 缩小到 {len(selected_indices):,}，"
+                f"锚点数 {len(anchors_to_evaluate):,}"
+            )
+            dataset_for_eval = dataset.select(selected_indices)
+            if embeddings_path:
+                logging.warning("启用了 --pool-samples 时，请确保 embeddings_path 不与全量评估缓存混用。")
+        else:
+            dataset_for_eval = dataset
+            logging.info(f"全量评估模式: 检索池 {len(dataset_for_eval):,}，锚点数 {len(anchors_to_evaluate):,}")
+
         all_embeddings = generate_embeddings_with_model(
             dataset_source=dataset_for_eval,
             batch_size=batch_size, 
@@ -643,26 +752,73 @@ def main(
             all_embeddings = np.load(str(embeddings_path), mmap_mode='r')
             logging.info(f"已将嵌入向量切换为内存映射模式 (mmap)")
 
-    # --- 3. GPU内存预处理 ---
-    if use_gpu:
-        logging.info("正在将嵌入向量转移到GPU...")
-        # 一次性把全部嵌入加载到GPU，避免每个batch的CPU->GPU拷贝
-        # memmap在mmap_mode='r'下是只读的，先拷贝为可写数组再转成Tensor
-        target_dtype = torch.bfloat16 if use_bf16 else torch.float32
-        all_embeddings_gpu = torch.from_numpy(np.array(all_embeddings, copy=True)).to("cuda", dtype=target_dtype, non_blocking=False)
-        dtype_label = "BF16" if use_bf16 else "FP32"
-        logging.info(f"[green]✓ 已将全部嵌入加载到GPU ({dtype_label}): {all_embeddings_gpu.nbytes / (1024**3):.2f} GB[/green]")
-    else:
-        all_embeddings_gpu = None
-
-
-    # --- 4. 设置评估参数 ---
+    # --- 3. 设置评估参数 ---
     pool_sizes = [2**i for i in range(1, 14)] + [100, 10000]
     # Sort it
     pool_sizes = sorted(pool_sizes)
     k_values = sorted([int(k.strip()) for k in ks_str.split(',')])
-    max_k = max(k_values)
+    max_pool_size = max(pool_sizes)
     results = {}
+
+    # --- 4. GPU内存预处理 ---
+    all_embeddings_gpu = None
+    gpu_dtype = torch.bfloat16 if use_bf16 else torch.float32
+    valid_gpu_modes = {"auto", "preload", "stream"}
+    if embeddings_gpu_mode not in valid_gpu_modes:
+        raise typer.BadParameter(
+            f"--embeddings-gpu-mode 必须是 {', '.join(sorted(valid_gpu_modes))} 之一，当前为: {embeddings_gpu_mode}"
+        )
+
+    if use_gpu:
+        embedding_gpu_bytes = len(all_embeddings) * all_embeddings.shape[1] * _dtype_nbytes(gpu_dtype)
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        reserve_bytes = max(2 * 1024**3, int(total_bytes * 0.25))
+        gpu_budget_bytes = max(0, free_bytes - reserve_bytes)
+        if embeddings_gpu_mode == "auto":
+            resolved_gpu_mode = "preload" if embedding_gpu_bytes <= gpu_budget_bytes else "stream"
+        else:
+            resolved_gpu_mode = embeddings_gpu_mode
+
+        logging.info(
+            "GPU embedding策略: "
+            f"{resolved_gpu_mode} "
+            f"(embedding约 {_format_bytes(embedding_gpu_bytes)}，"
+            f"当前空闲 {_format_bytes(free_bytes)}，"
+            f"预留后预算 {_format_bytes(gpu_budget_bytes)})"
+        )
+
+        if resolved_gpu_mode == "preload":
+            if embedding_gpu_bytes > gpu_budget_bytes:
+                raise RuntimeError(
+                    "当前GPU空闲显存不足以整包加载embedding。"
+                    f" 需要约 {_format_bytes(embedding_gpu_bytes)}，"
+                    f"预留后仅剩 {_format_bytes(gpu_budget_bytes)}。"
+                    " 请改用 --embeddings-gpu-mode stream，或减小缓存规模。"
+                )
+            logging.info("正在将全部嵌入向量预加载到GPU...")
+            all_embeddings_gpu = torch.as_tensor(np.asarray(all_embeddings), dtype=gpu_dtype, device="cuda")
+            dtype_label = "BF16" if use_bf16 else "FP32"
+            gpu_tensor_bytes = all_embeddings_gpu.element_size() * all_embeddings_gpu.numel()
+            logging.info(
+                f"[green]✓ 已将全部嵌入加载到GPU ({dtype_label}): "
+                f"{_format_bytes(gpu_tensor_bytes)}[/green]"
+            )
+        else:
+            stream_batch_bytes = gpu_batch_size * max_pool_size * all_embeddings.shape[1] * _dtype_nbytes(gpu_dtype)
+            logging.info("将保持embedding在CPU/磁盘端，评估时按anchor batch流式搬运到GPU。")
+            logging.info(
+                f"当前 --gpu-batch-size={gpu_batch_size} 时，"
+                f"单批候选池embedding约 {_format_bytes(stream_batch_bytes)}"
+            )
+            if gpu_budget_bytes > 0 and stream_batch_bytes > gpu_budget_bytes:
+                recommended_batch_size = max(
+                    1,
+                    gpu_budget_bytes // (max_pool_size * all_embeddings.shape[1] * _dtype_nbytes(gpu_dtype)),
+                )
+                logging.warning(
+                    "当前流式batch仍可能爆显存，"
+                    f"建议把 --gpu-batch-size 降到 {recommended_batch_size} 或更小。"
+                )
     
     total_size = len(all_embeddings)
     # 预处理正样本映射为扁平数组，便于numba并行访问
@@ -690,13 +846,14 @@ def main(
     for i in track(range(0, len(anchors_to_evaluate), gpu_batch_size), description="正在评估..."):
         anchor_batch = anchors_to_evaluate[i:i + gpu_batch_size]
         result, batch_mrr, batch_mrr_by_pool = process_anchor_batch_gpu(
-            all_embeddings_gpu if use_gpu else all_embeddings,
+            all_embeddings_gpu if all_embeddings_gpu is not None else all_embeddings,
             anchor_batch,
             pos_flat,
             pos_offsets,
             pool_sizes,
             k_values,
             use_gpu=use_gpu,
+            gpu_dtype=gpu_dtype,
         )
         # 累加结果
         for pool_size in pool_sizes:
@@ -744,6 +901,15 @@ def main(
         mrr_p = total_mrr_by_pool[pool_size][0] / total_mrr_by_pool[pool_size][1] if total_mrr_by_pool[pool_size][1] > 0 else 0
         mrr_pool_table.add_row(f"{pool_size:,}", f"{mrr_p:.4f}")
     console.print(mrr_pool_table)
+
+    if all_embeddings_gpu is not None:
+        del all_embeddings_gpu
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if temp_subset_embeddings_path is not None:
+        del all_embeddings
+        temp_subset_embeddings_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
