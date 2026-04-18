@@ -20,7 +20,7 @@ Pretrain/bert_pretrain_output
 __pycache__/
 **/__pycache__/
 *.pyc
-
+*.re
 *.pkl
 *.log
 *.png
@@ -41,7 +41,10 @@ temp.*
 *log.txt
 
 db1_model/
+
 *.pt
 test.py
 
 *.sif
+*.o
+*.i64

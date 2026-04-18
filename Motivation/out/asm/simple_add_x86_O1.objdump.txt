@@ -1,0 +1,32 @@
+
+Motivation/out/obj/simple_add_x86_O1.o:	file format elf64-x86-64
+
+Disassembly of section .text:
+
+0000000000000000 <example>:
+       0: 31 c0                        	xorl	%eax, %eax
+       2: 66 66 66 66 66 2e 0f 1f 84 00 00 00 00 00    	nopw	%cs:(%rax,%rax)
+      10: 31 c6                        	xorl	%eax, %esi
+      12: ff c0                        	incl	%eax
+      14: 83 f8 05                     	cmpl	$0x5, %eax
+      17: 75 f7                        	jne	0x10 <example+0x10>
+      19: 8d 04 37                     	leal	(%rdi,%rsi), %eax
+      1c: 05 2c 9f 07 00               	addl	$0x79f2c, %eax          # imm = 0x79F2C
+      21: c3                           	retq
+      22: 66 66 66 66 66 2e 0f 1f 84 00 00 00 00 00    	nopw	%cs:(%rax,%rax)
+
+0000000000000030 <main>:
+      30: 50                           	pushq	%rax
+      31: bf 05 00 00 00               	movl	$0x5, %edi
+      36: be 0a 00 00 00               	movl	$0xa, %esi
+      3b: e8 00 00 00 00               	callq	0x40 <main+0x10>
+		000000000000003c:  R_X86_64_PLT32	example-0x4
+      40: 48 8d 3d 00 00 00 00         	leaq	(%rip), %rdi            # 0x47 <main+0x17>
+		0000000000000043:  R_X86_64_PC32	.L.str-0x4
+      47: 89 c6                        	movl	%eax, %esi
+      49: 31 c0                        	xorl	%eax, %eax
+      4b: e8 00 00 00 00               	callq	0x50 <main+0x20>
+		000000000000004c:  R_X86_64_PLT32	printf-0x4
+      50: 31 c0                        	xorl	%eax, %eax
+      52: 59                           	popq	%rcx
+      53: c3                           	retq

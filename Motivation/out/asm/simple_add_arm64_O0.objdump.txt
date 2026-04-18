@@ -1,0 +1,72 @@
+
+Motivation/out/obj/simple_add_arm64_O0.o:	file format elf64-littleaarch64
+
+Disassembly of section .text:
+
+0000000000000000 <example>:
+       0: d10043ff     	sub	sp, sp, #0x10
+       4: b9000fe0     	str	w0, [sp, #0xc]
+       8: b9000be1     	str	w1, [sp, #0x8]
+       c: b90007ff     	str	wzr, [sp, #0x4]
+      10: 14000001     	b	0x14 <example+0x14>
+      14: b94007e8     	ldr	w8, [sp, #0x4]
+      18: 710fa108     	subs	w8, w8, #0x3e8
+      1c: 5400016a     	b.ge	0x48 <example+0x48>
+      20: 14000001     	b	0x24 <example+0x24>
+      24: b94007e9     	ldr	w9, [sp, #0x4]
+      28: b9400fe8     	ldr	w8, [sp, #0xc]
+      2c: 0b090108     	add	w8, w8, w9
+      30: b9000fe8     	str	w8, [sp, #0xc]
+      34: 14000001     	b	0x38 <example+0x38>
+      38: b94007e8     	ldr	w8, [sp, #0x4]
+      3c: 11000508     	add	w8, w8, #0x1
+      40: b90007e8     	str	w8, [sp, #0x4]
+      44: 17fffff4     	b	0x14 <example+0x14>
+      48: b90003ff     	str	wzr, [sp]
+      4c: 14000001     	b	0x50 <example+0x50>
+      50: b94003e8     	ldr	w8, [sp]
+      54: 71001508     	subs	w8, w8, #0x5
+      58: 5400016a     	b.ge	0x84 <example+0x84>
+      5c: 14000001     	b	0x60 <example+0x60>
+      60: b94003e9     	ldr	w9, [sp]
+      64: b9400be8     	ldr	w8, [sp, #0x8]
+      68: 4a090108     	eor	w8, w8, w9
+      6c: b9000be8     	str	w8, [sp, #0x8]
+      70: 14000001     	b	0x74 <example+0x74>
+      74: b94003e8     	ldr	w8, [sp]
+      78: 11000508     	add	w8, w8, #0x1
+      7c: b90003e8     	str	w8, [sp]
+      80: 17fffff4     	b	0x50 <example+0x50>
+      84: b9400fe8     	ldr	w8, [sp, #0xc]
+      88: b9400be9     	ldr	w9, [sp, #0x8]
+      8c: 0b090100     	add	w0, w8, w9
+      90: 910043ff     	add	sp, sp, #0x10
+      94: d65f03c0     	ret
+
+0000000000000098 <main>:
+      98: d100c3ff     	sub	sp, sp, #0x30
+      9c: a9027bfd     	stp	x29, x30, [sp, #0x20]
+      a0: 910083fd     	add	x29, sp, #0x20
+      a4: 2a1f03e8     	mov	w8, wzr
+      a8: b9000fe8     	str	w8, [sp, #0xc]
+      ac: b81fc3bf     	stur	wzr, [x29, #-0x4]
+      b0: 528000a8     	mov	w8, #0x5                // =5
+      b4: b81f83a8     	stur	w8, [x29, #-0x8]
+      b8: 52800148     	mov	w8, #0xa                // =10
+      bc: b81f43a8     	stur	w8, [x29, #-0xc]
+      c0: b85f83a0     	ldur	w0, [x29, #-0x8]
+      c4: b85f43a1     	ldur	w1, [x29, #-0xc]
+      c8: 94000000     	bl	0xc8 <main+0x30>
+		00000000000000c8:  R_AARCH64_CALL26	example
+      cc: b90013e0     	str	w0, [sp, #0x10]
+      d0: b94013e1     	ldr	w1, [sp, #0x10]
+      d4: 90000000     	adrp	x0, 0x0 <example>
+		00000000000000d4:  R_AARCH64_ADR_PREL_PG_HI21	.rodata.str1.1
+      d8: 91000000     	add	x0, x0, #0x0
+		00000000000000d8:  R_AARCH64_ADD_ABS_LO12_NC	.rodata.str1.1
+      dc: 94000000     	bl	0xdc <main+0x44>
+		00000000000000dc:  R_AARCH64_CALL26	printf
+      e0: b9400fe0     	ldr	w0, [sp, #0xc]
+      e4: a9427bfd     	ldp	x29, x30, [sp, #0x20]
+      e8: 9100c3ff     	add	sp, sp, #0x30
+      ec: d65f03c0     	ret
