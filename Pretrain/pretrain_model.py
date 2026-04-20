@@ -57,6 +57,54 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
     def set_input_embeddings(self, value):
         self.roformer.roformer.embeddings.word_embeddings = value
 
+    def encode(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.FloatTensor,
+        ddg_node_spans: Optional[torch.LongTensor] = None,
+        ddg_node_batch: Optional[torch.LongTensor] = None,
+        ddg_edge_index: Optional[torch.LongTensor] = None,
+        cfg_node_spans: Optional[torch.LongTensor] = None,
+        cfg_node_batch: Optional[torch.LongTensor] = None,
+        cfg_edge_index: Optional[torch.LongTensor] = None,
+        cfg_edge_attr: Optional[torch.FloatTensor] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[Tuple, Dict[str, torch.Tensor]]:
+        """Inference-only embedding path.
+
+        This bypasses the MLM head entirely and returns only the normalized
+        contrastive embedding (plus attentions when explicitly requested).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_attentions = bool(kwargs.pop("output_attentions", False))
+
+        roformer_out = self.roformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            ddg_node_spans=ddg_node_spans,
+            ddg_node_batch=ddg_node_batch,
+            ddg_edge_index=ddg_edge_index,
+            cfg_node_spans=cfg_node_spans,
+            cfg_node_batch=cfg_node_batch,
+            cfg_edge_index=cfg_edge_index,
+            cfg_edge_attr=cfg_edge_attr,
+            output_attentions=output_attentions,
+        )
+
+        contrastive_embed = self.linear(roformer_out["fused_feature"])
+        contrastive_embed = F.normalize(contrastive_embed, p=2, dim=1)
+
+        if not return_dict:
+            return (contrastive_embed,)
+
+        result = {
+            "embedding": contrastive_embed,
+        }
+        if output_attentions:
+            result["attentions"] = roformer_out.get("attentions")
+        return result
+
     def forward(
         self,
         input_ids: torch.LongTensor,

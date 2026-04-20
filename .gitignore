@@ -48,3 +48,4 @@ test.py
 *.sif
 *.o
 *.i64
+*.eps

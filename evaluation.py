@@ -379,7 +379,7 @@ def generate_embeddings_with_model(
                 with torch.inference_mode():
                     if use_bf16:
                         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                            outputs = model(
+                            outputs = model.encode(
                                 input_ids=input_ids, 
                                 attention_mask=attention_mask, 
                                 return_dict=True,
@@ -387,7 +387,7 @@ def generate_embeddings_with_model(
                             )
                             embeddings = outputs['embedding']
                     else:
-                        outputs = model(
+                        outputs = model.encode(
                             input_ids=input_ids, 
                             attention_mask=attention_mask, 
                             return_dict=True,
@@ -434,6 +434,13 @@ def generate_embeddings_with_model(
         console.print("\n[bold]失败batch详情:[/bold]")
         for failure in failed_batches:
             console.print(f"  Batch #{failure['batch_idx']}: {failure['error_type']} - {failure['error'][:100]}")
+        del model
+        del all_embeddings
+        os.unlink(temp_memmap_path)
+        raise RuntimeError(
+            "Embedding generation encountered failed batches. "
+            "Evaluation has been aborted to avoid computing metrics on incomplete embeddings."
+        )
     else:
         console.print(f"\n[bold green]✓ 评估完成！所有batch推理成功[/bold green]")
 

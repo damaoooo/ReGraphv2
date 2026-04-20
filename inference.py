@@ -288,7 +288,7 @@ class ReGraphInferencePipeline:
 
         with torch.inference_mode():
             with autocast_context:
-                outputs = model(
+                outputs = model.encode(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     return_dict=True,
