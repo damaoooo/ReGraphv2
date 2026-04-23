@@ -10,7 +10,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import typer
 import subprocess
 import multiprocessing
-from utils import console
+from utils import console, normalize_clang_opt_level
 
 # Configuration
 BINARY_PATH = "/home/damaoooo/Downloads/regraphv2/Binaries"
@@ -20,7 +20,7 @@ app = typer.Typer()
 def run_task(script_name: str, args: list):
     """Run a task script with given arguments"""
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script_name)
-    command = ["python3", script_path] + args
+    command = [sys.executable, script_path] + args
     
     console.print(f"[blue]Running: {' '.join(command)}[/blue]")
     result = subprocess.run(command)
@@ -58,9 +58,16 @@ def task2(
     input_path: str = typer.Option(..., help="Input directory containing .ll files"),
     workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
     resume: bool = typer.Option(False, help="Resume from previous run"),
+    opt_level: str = typer.Option(
+        "O3",
+        "--opt-level",
+        help="clang optimization level for Task 2, e.g. O0, O1, O2, O3, Os, Oz",
+    ),
 ):
     """Run Task 2: Re-optimize LLVM IR files"""
+    normalized_opt_level = normalize_clang_opt_level(opt_level)
     args = ["--input-path", input_path, "--workers", str(workers)]
+    args.extend(["--opt-level", normalized_opt_level])
     if resume:
         args.append("--resume")
     
@@ -124,9 +131,15 @@ def pipeline(
         False,
         help="Enable optional Task 4 recompile (.bc -> .re). Disabled by default",
     ),
+    opt_level: str = typer.Option(
+        "O3",
+        "--opt-level",
+        help="clang optimization level for Task 2, e.g. O0, O1, O2, O3, Os, Oz",
+    ),
 ):
     """Run the complete pipeline or start from a specific task"""
-    
+    normalized_opt_level = normalize_clang_opt_level(opt_level)
+
     if db1 and input_path:
         console.print("[red]Error: Cannot specify both --db1 and --input_path. Choose one.[/red]")
         raise typer.Exit(code=1)
@@ -147,6 +160,7 @@ def pipeline(
     console.print(f"[bold green]Starting pipeline from task {start_from}[/bold green]")
     console.print(f"[green]Input: {actual_input_path}[/green]")
     console.print(f"[green]Output: {final_output_path}[/green]")
+    console.print(f"[green]Task 2 opt level: {normalized_opt_level}[/green]")
 
     # Task 1: Lift binary files to LLVM IR
     if start_from <= 1:
@@ -175,6 +189,7 @@ def pipeline(
         console.print("[bold blue]=" * 60 + "[/bold blue]")
         
         args = ["--input-path", final_output_path, "--workers", str(workers)]
+        args.extend(["--opt-level", normalized_opt_level])
         if resume:
             args.append("--resume")
         

@@ -4,9 +4,28 @@ Common utilities for the lift dataset pipeline
 import subprocess
 import os
 import resource
+import typer
 from rich.console import Console
 
 console = Console()
+
+
+def normalize_clang_opt_level(opt_level: str) -> str:
+    """Normalize a clang optimization level flag to the form ``-O*``."""
+    value = opt_level.strip()
+    if not value:
+        raise typer.BadParameter("opt level cannot be empty")
+
+    normalized = value if value.startswith("-") else f"-{value}"
+
+    if " " in normalized or "\t" in normalized:
+        raise typer.BadParameter("opt level cannot contain whitespace")
+    if not normalized.startswith("-O") or len(normalized) <= 2:
+        raise typer.BadParameter(
+            "opt level must look like O0/O1/O2/O3/Os/Oz/Ofast or start with -O"
+        )
+
+    return normalized
 
 def run_command(command, description="", timeout=3600, memory_limit_gb=10):
     """Run a shell command and return success status, stdout, stderr

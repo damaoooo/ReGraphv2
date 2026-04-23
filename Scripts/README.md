@@ -32,6 +32,9 @@ python3 pipeline.py pipeline --output /path/to/output --start-from 2
 
 # 自定义工作进程数
 python3 pipeline.py pipeline --output /path/to/output --workers 8
+
+# Task 2 使用 Os 而不是默认 O3
+python3 pipeline.py pipeline --output /path/to/output --opt-level Os
 ```
 
 ### 2. 运行单个任务
@@ -56,8 +59,11 @@ python3 task1_lift.py --output /path/to/output
 # 通过pipeline运行
 python3 pipeline.py task2 --input-path /path/to/ll/files
 
+# 指定优化等级
+python3 pipeline.py task2 --input-path /path/to/ll/files --opt-level O0
+
 # 直接运行任务脚本
-python3 task2_reoptimize.py --input-path /path/to/ll/files --resume
+python3 task2_reoptimize.py --input-path /path/to/ll/files --resume --opt-level Os
 ```
 
 #### 任务3：提取单个函数
@@ -77,6 +83,7 @@ python3 task3_extract.py --input-path /path/to/bc/files --resume
 4. **灵活的控制**：可以从任意任务开始运行流水线
 5. **清晰的进度显示**：每个任务都有独立的进度条
 6. **更好的日志**：任务1有独立的日志文件 `lift_task1_log.txt`
+7. **Task 2 优化级别可配置**：支持 `--opt-level O0/O1/O2/O3/Os/Oz/...`，默认 `O3`
 
 ## 典型使用场景
 
@@ -92,7 +99,7 @@ python3 pipeline.py pipeline --db1 --output /path/to/output --resume
 
 ### 场景3：只想重新优化已有的.ll文件
 ```bash
-python3 pipeline.py task2 --input-path /path/to/existing/ll/files --resume
+python3 pipeline.py task2 --input-path /path/to/existing/ll/files --resume --opt-level O1
 ```
 
 ### 场景4：从任务2开始运行（任务1已完成）

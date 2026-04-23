@@ -30,7 +30,13 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeEl
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from utils import console, directory_exists_and_not_empty, ensure_directory, file_exists_and_not_empty
+from utils import (
+    console,
+    directory_exists_and_not_empty,
+    ensure_directory,
+    file_exists_and_not_empty,
+    normalize_clang_opt_level,
+)
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +48,10 @@ SPLIT_LLVM_IR_SCRIPT = os.path.join(SCRIPT_DIR, "split_llvm_ir.sh")
 IDA_TEMP_SUFFIXES = (".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm")
 IGNORED_INPUT_SUFFIXES = IDA_TEMP_SUFFIXES + (".i64", ".ll", ".bc", ".c", ".cpp", ".h", ".hpp")
 IGNORED_TEXT_SUFFIXES = (".txt", ".log", ".md", ".py", ".sh")
+
+
+def opt_level_state_token(opt_level: str) -> str:
+    return opt_level.lstrip("-").replace(os.sep, "_")
 
 
 def clip_text(text: str, limit: int = 2000) -> str:
@@ -189,6 +199,13 @@ def marker_path_for_item(stage: str, item: Dict[str, str], config: Dict[str, obj
         relative_path = os.path.relpath(item["input"], str(config["db_path"]))
     else:
         relative_path = os.path.relpath(item["output"], str(config["final_output_path"]))
+    if stage == "task2":
+        return os.path.join(
+            state_root,
+            stage,
+            opt_level_state_token(str(config["task2_opt_level"])),
+            relative_path + ".done",
+        )
     return os.path.join(state_root, stage, relative_path + ".done")
 
 
@@ -390,7 +407,7 @@ def process_stage_item(stage: str, item: Dict[str, str], config: Dict[str, objec
         command = [
             str(config["clang_bin"]),
             "-m32",
-            "-O3",
+            str(config["task2_opt_level"]),
             "-c",
             "-emit-llvm",
             "-fno-inline",
@@ -862,6 +879,11 @@ def main(
     ),
     conda_bin: str = typer.Option("conda", help="Conda executable used only when --conda-env is set"),
     clang_bin: str = typer.Option("clang", help="clang executable used in task 2"),
+    opt_level: str = typer.Option(
+        "O3",
+        "--opt-level",
+        help="clang optimization level for Task 2, e.g. O0, O1, O2, O3, Os, Oz",
+    ),
     bash_bin: str = typer.Option("bash", help="Shell executable used for task 3"),
     task2_timeout: int = typer.Option(3600, help="Timeout in seconds for each clang task"),
     task3_timeout: int = typer.Option(3600, help="Timeout in seconds for each split task"),
@@ -884,6 +906,8 @@ def main(
     if ray_mode not in ("auto", "local", "external", "slurm"):
         console.print("[red]Error: --ray-mode must be one of auto, local, external, slurm.[/red]")
         raise typer.Exit(code=1)
+
+    normalized_opt_level = normalize_clang_opt_level(opt_level)
 
     if input_path:
         db_path = os.path.abspath(input_path)
@@ -937,6 +961,7 @@ def main(
     else:
         console.print(f"[green]ida2llvm via: {resolved_ida2llvm_python}[/green]")
     console.print(f"[green]clang: {clang_bin}[/green]")
+    console.print(f"[green]Task 2 opt level: {normalized_opt_level}[/green]")
     if resume:
         console.print("[yellow]Resume mode enabled[/yellow]")
     if task1_start_from_step2:
@@ -961,6 +986,7 @@ def main(
         "conda_env": conda_env,
         "conda_bin": conda_bin,
         "clang_bin": clang_bin,
+        "task2_opt_level": normalized_opt_level,
         "bash_bin": bash_bin,
         "task2_timeout": task2_timeout,
         "task3_timeout": task3_timeout,
