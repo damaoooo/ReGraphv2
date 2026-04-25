@@ -155,7 +155,7 @@ def pipeline(
         raise typer.Exit(code=1)
 
     db = os.path.basename(actual_input_path)
-    final_output_path = os.path.join(output, db)
+    final_output_path = output
 
     console.print(f"[bold green]Starting pipeline from task {start_from}[/bold green]")
     console.print(f"[green]Input: {actual_input_path}[/green]")
