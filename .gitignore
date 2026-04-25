@@ -45,6 +45,7 @@ db1_model/
 *.pt
 test.py
 
+.codex
 *.sif
 *.o
 *.i64

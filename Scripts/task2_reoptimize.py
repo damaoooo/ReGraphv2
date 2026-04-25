@@ -41,7 +41,7 @@ def reoptimize_file(file_path: str, output_path: str, opt_level: str, marker_pat
     if os.path.exists(marker_path):
         os.remove(marker_path)
 
-    command = ["clang", "-m32", opt_level, "-c", "-emit-llvm", "-fno-inline", file_path, "-o", output_path]
+    command = ["clang", "-m32", opt_level, "-c", "-emit-llvm", "-fno-inline", "-fno-inline-functions", file_path, "-o", output_path]
     success, stdout, stderr = run_command(command, f"Re-optimizing {file_path} with {opt_level}")
 
     if success and not file_exists_and_not_empty(output_path):
@@ -90,6 +90,10 @@ def main(
     for root, dirs, files in os.walk(normalized_input_path):
         if TASK2_STATE_DIRNAME in dirs:
             dirs.remove(TASK2_STATE_DIRNAME)
+
+        # if dir ends with _functions, skip it
+        if os.path.basename(root).endswith("_functions"):
+            continue
 
         for file in files:
             if file.endswith(".ll"):
