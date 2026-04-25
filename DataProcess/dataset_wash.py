@@ -9,12 +9,12 @@ from typing_extensions import Annotated
 # parent_path = os.path.dirname(os.getcwd())
 # sys.path.append(parent_path)
 from Tokenizer.ir_tokenizer import load_tokenizer
-
+from Utils.utils import DEFAULT_TOKENIZER_PATH
 
 def main(
     dataset_path: Annotated[str, typer.Option(help="Path to the dataset.", rich_help_panel="Custom Arguments")],
     output_path: Annotated[str, typer.Option(help="Path to save the processed dataset.", rich_help_panel="Custom Arguments")],
-    tokenizer_path: Annotated[str, typer.Option(help="Path to the tokenizer file.", rich_help_panel="Custom Arguments")] = "/home/damaoooo/Datasets/IR/Dataset-1-all/train_corpus_tokenizer/llvm_ir_bpe.json",
+    tokenizer_path: Annotated[str, typer.Option(help="Path to the tokenizer file.", rich_help_panel="Custom Arguments")] = DEFAULT_TOKENIZER_PATH,
     max_seq_length: Annotated[int, typer.Option(help="Maximum sequence length.",rich_help_panel="Custom Arguments")] = 2048,
 ):
     
