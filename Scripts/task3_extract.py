@@ -13,7 +13,10 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeEl
 from utils import console, run_command, ensure_directory, directory_exists_and_not_empty
 
 # Configuration
-EXTRACT_SCRIPT = "/home/damaoooo/Downloads/regraphv2/Scripts/split_llvm_ir.sh"
+EXTRACT_SCRIPT = os.environ.get(
+    "REGRAPH_SPLIT_LLVM_IR_SCRIPT",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "split_llvm_ir.sh"),
+)
 
 app = typer.Typer()
 

@@ -11,6 +11,25 @@ from typing_extensions import Annotated
 from Tokenizer.ir_tokenizer import load_tokenizer
 from Utils.utils import DEFAULT_TOKENIZER_PATH
 
+
+def truncate_example(example, eos_token_id, max_seq_length):
+    ids = example['input_ids']
+    if len(ids) > max_seq_length:
+        truncated_ids = ids[:max_seq_length-1] + [eos_token_id]
+    else:
+        truncated_ids = ids
+    if example['ddg_graph'] is not None:
+        example['ddg_graph'] = [edge for edge in example['ddg_graph'] if max(edge) < max_seq_length]
+    if example['cfg_graph'] is not None:
+        example['cfg_graph'] = [edge for edge in example['cfg_graph'] if max(edge) < max_seq_length]
+    example['input_ids'] = truncated_ids
+    return example
+
+
+def has_required_graphs(example):
+    return example['cfg_graph'] is not None and example['ddg_graph'] is not None
+
+
 def main(
     dataset_path: Annotated[str, typer.Option(help="Path to the dataset.", rich_help_panel="Custom Arguments")],
     output_path: Annotated[str, typer.Option(help="Path to save the processed dataset.", rich_help_panel="Custom Arguments")],
@@ -25,20 +44,10 @@ def main(
     eos_token_id = tokenizer.eos_token_id
 
     def trunker(example):
-        ids = example['input_ids']
-        if len(ids) > max_seq_length:
-            truncated_ids = ids[:max_seq_length-1] + [eos_token_id]  # 保留 EOS token
-        else:
-            truncated_ids = ids
-        if example['ddg_graph'] is not None:
-            example['ddg_graph'] = [edge for edge in example['ddg_graph'] if max(edge) < max_seq_length]
-        if example['cfg_graph'] is not None:
-            example['cfg_graph'] = [edge for edge in example['cfg_graph'] if max(edge) < max_seq_length]
-        example['input_ids'] = truncated_ids
-        return example
+        return truncate_example(example, eos_token_id, max_seq_length)
 
     def filter_function(example):
-        return example['cfg_graph'] is not None and example['ddg_graph'] is not None
+        return has_required_graphs(example)
 
     num_cores = os.cpu_count()
     print(f"Number of CPU cores: {num_cores}")
