@@ -10,6 +10,7 @@ import numpy as np
 from collections import defaultdict
 from itertools import combinations
 import os
+import re
 from typing import Dict, List, Any, Tuple
 import pickle
 import typer
@@ -71,10 +72,15 @@ def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, Li
         opt_levels.append(idx_to_opt_level[old_idx])
         origin_binary_names.append(idx_to_origin_binary_name[old_idx])
     
+    def replace_column(dataset: datasets.Dataset, name: str, values: List[Any]) -> datasets.Dataset:
+        if name in dataset.column_names:
+            dataset = dataset.remove_columns([name])
+        return dataset.add_column(name, values)
+
     # 将这些信息添加到数据集
-    original_dataset = original_dataset.add_column("function_name", function_names)
-    original_dataset = original_dataset.add_column("opt_level", opt_levels)
-    original_dataset = original_dataset.add_column("origin_binary_name", origin_binary_names)
+    original_dataset = replace_column(original_dataset, "function_name", function_names)
+    original_dataset = replace_column(original_dataset, "opt_level", opt_levels)
+    original_dataset = replace_column(original_dataset, "origin_binary_name", origin_binary_names)
     
     # 更新 positive_map，将旧索引映射到新索引
     print("更新 positive_map 以适应新的索引...")
@@ -206,61 +212,61 @@ def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, Li
     final_validation_dataset.save_to_disk('validation_dataset_pool')
         
 
-def build_positive_indices(dataset: datasets.Dataset, base_path: str) -> Tuple[dict, pd.DataFrame]:
+OPT_LEVEL_PATTERN = re.compile(r"^(?P<prefix>.+)-(?P<opt>O0|O1|O2|O3|Os|Oz)_(?P<binary>.+)$")
+
+
+def derive_origin_and_opt(binary_name: str) -> Tuple[str, str]:
+    """Derive a stable source-binary key and optimization level from fused Task3 binary_name."""
+    normalized = binary_name.replace("\\", "/")
+    directory, _, basename = normalized.rpartition("/")
+    match = OPT_LEVEL_PATTERN.match(basename)
+    if match:
+        origin_basename = f"{match.group('prefix')}_{match.group('binary')}"
+        origin = f"{directory}/{origin_basename}" if directory else origin_basename
+        return origin, match.group("opt")
+
+    legacy_parts = basename.rsplit("-", 2)
+    if len(legacy_parts) == 3 and legacy_parts[1] in {"O0", "O1", "O2", "O3", "Os", "Oz"}:
+        origin_basename = legacy_parts[0]
+        origin = f"{directory}/{origin_basename}" if directory else origin_basename
+        return origin, legacy_parts[1]
+
+    return normalized, ""
+
+
+def build_positive_indices(dataset: datasets.Dataset, base_path: str = "") -> Tuple[dict, pd.DataFrame]:
     """
     构建正样本索引映射
-    :param datasets: 包含函数的datasets.Dataset对象
-    :param base_path: 数据集的基础路径
+    :param dataset: 包含函数的datasets.Dataset对象
+    :param base_path: 保留该参数仅用于兼容旧调用；新数据集不再读取 function_map.csv
     :return: 正样本索引映射字典和包含function name的DataFrame
     """
-    example_file = dataset[0]['file_path']
-    df: pd.DataFrame = dataset.select_columns(['file_path']).to_pandas()
+    required_columns = {"binary_name", "function_name"}
+    missing_columns = required_columns.difference(dataset.column_names)
+    if missing_columns:
+        raise ValueError(
+            "Dataset is missing fused Task3 columns: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    selected_columns = ["binary_name", "function_name"]
+    if "file_path" in dataset.column_names:
+        selected_columns.append("file_path")
+    if "opt_level" in dataset.column_names:
+        selected_columns.append("opt_level")
+
+    df: pd.DataFrame = dataset.select_columns(selected_columns).to_pandas()
     df['original_idx'] = range(len(df))
+    derived_info = df['binary_name'].apply(derive_origin_and_opt)
+    df['origin_binary_name'] = derived_info.apply(lambda item: item[0])
+    derived_opt_levels = derived_info.apply(lambda item: item[1])
+    if 'opt_level' not in df.columns:
+        df['opt_level'] = derived_opt_levels
+    else:
+        df['opt_level'] = df['opt_level'].fillna('')
+        df.loc[df['opt_level'] == '', 'opt_level'] = derived_opt_levels[df['opt_level'] == '']
 
-    def extract_binary_info_vectorized(file_paths: pd.Series) -> pd.DataFrame:
-        """向量化版本的信息提取"""
-        # 使用字符串方法进行批量操作
-        ll_names = file_paths.str.split('/').str[-1]
-        dir_names = file_paths.str.split('/').str[-3] + "/" + file_paths.str.split('/').str[-2]
-        origin_dir_names = dir_names.str.replace('_functions', '')
-        
-        # 批量分割和提取
-        split_parts = origin_dir_names.str.split('-')
-        binary_hashes = split_parts.str[-1]
-        opt_levels = split_parts.str[-2]
-        origin_binary_names = split_parts.apply(lambda x: '-'.join(x[:-2]) if len(x) > 2 else '')
-        
-        return pd.DataFrame({
-            'll_name': ll_names,
-            'opt_level': opt_levels,
-            'dir_name': dir_names,
-            'origin_binary_name': origin_binary_names
-        })
-
-    df[['ll_name', 'opt_level', 'dir_name', 'origin_binary_name']] = extract_binary_info_vectorized(df['file_path'])
-
-    grouped_by_dir_name = df.groupby('dir_name')
-    processed_groups = []
-    if "Dataset-2-IR" in base_path:
-        # Base path add /../
-        base_path = os.path.abspath(os.path.join(base_path, ".."))
-    for dir_name, group_content in tqdm(grouped_by_dir_name, desc="Mapping functions to original names"):
-        csv_path = os.path.join(base_path, dir_name, 'function_map.csv')
-        # print(f"Processing directory: {dir_name} with base path: {base_path}, csv_path is: {csv_path}")
-        try:
-            hash_map_df = pd.read_csv(csv_path)
-            hash_to_name_map = pd.Series(hash_map_df['OriginalFunctionName'].values, index=hash_map_df['HashedFileName']).to_dict()
-        except FileNotFoundError:
-            print(f"File {csv_path} not found, skipping.")
-            continue
-
-        temp_df = group_content.copy()
-        temp_df['function_name'] = temp_df['ll_name'].map(hash_to_name_map)
-        processed_groups.append(temp_df)
-
-    full_info_df = pd.concat(processed_groups)
-
-    full_info_df.dropna(subset=['origin_binary_name', 'function_name'], inplace=True)
+    full_info_df = df.dropna(subset=['binary_name', 'function_name']).copy()
 
     print("Grouping by [origin_binary_name, function_name] to find correct positive pairs...")
     final_grouped = full_info_df.groupby(['origin_binary_name', 'function_name'])
@@ -280,7 +286,7 @@ def build_positive_indices(dataset: datasets.Dataset, base_path: str) -> Tuple[d
 
 def main(
     dataset_path: str = typer.Argument(..., help="Path to the dataset directory"),
-    base_path: str = typer.Option("/home/damaoooo/Datasets/IR/small_test/small_test", help="Base path for function mapping CSV files"),
+    base_path: str = typer.Option("", help="Deprecated; fused Task3 datasets carry binary/function names directly"),
     train_ratio: float = typer.Option(0.9, help="Training set ratio (0.0-1.0)"),
     random_seed: int = typer.Option(42, help="Random seed for reproducibility"),
     output_dir: str = typer.Option(".", help="Output directory for generated files")
@@ -291,6 +297,10 @@ def main(
     # Set random seed
     random.seed(random_seed)
     np.random.seed(random_seed)
+    dataset_path = os.path.abspath(dataset_path)
+    if base_path:
+        base_path = os.path.abspath(base_path)
+    output_dir = os.path.abspath(output_dir)
     
     # Change to output directory
     original_cwd = os.getcwd()

@@ -81,11 +81,26 @@ def task2(
 @app.command()
 def task3(
     input_path: str = typer.Option(..., help="Input directory containing .bc files"),
+    output: str = typer.Option("", help="Output directory for fused Task 3 parquet artifacts"),
     workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
     resume: bool = typer.Option(False, help="Resume from previous run"),
+    backend: str = typer.Option("local", "--backend", help="Task 3 backend: local or ray"),
+    max_seq_length: int = typer.Option(2048, "--max-seq-length", help="Truncate token ids and graph edges to this length"),
 ):
-    """Run Task 3: Extract individual functions"""
-    args = ["--input-path", input_path, "--workers", str(workers)]
+    """Run Task 3: Fused function extraction, graph building, and parquet output"""
+    task3_output = output or f"{input_path.rstrip('/')}_task3_fused"
+    args = [
+        "--input-path",
+        input_path,
+        "--output",
+        task3_output,
+        "--workers",
+        str(workers),
+        "--backend",
+        backend,
+        "--max-seq-length",
+        str(max_seq_length),
+    ]
     if resume:
         args.append("--resume")
     
@@ -131,6 +146,21 @@ def pipeline(
         False,
         help="Enable optional Task 4 recompile (.bc -> .re). Disabled by default",
     ),
+    task3_output: str = typer.Option(
+        "",
+        "--task3-output",
+        help="Output directory for fused Task 3 parquet artifacts",
+    ),
+    task3_backend: str = typer.Option(
+        "local",
+        "--task3-backend",
+        help="Task 3 backend: local or ray",
+    ),
+    max_seq_length: int = typer.Option(
+        2048,
+        "--max-seq-length",
+        help="Task 3 max sequence length for token and graph truncation",
+    ),
     opt_level: str = typer.Option(
         "O3",
         "--opt-level",
@@ -156,10 +186,12 @@ def pipeline(
 
     db = os.path.basename(actual_input_path)
     final_output_path = output
+    final_task3_output = task3_output or f"{final_output_path.rstrip('/')}_task3_fused"
 
     console.print(f"[bold green]Starting pipeline from task {start_from}[/bold green]")
     console.print(f"[green]Input: {actual_input_path}[/green]")
     console.print(f"[green]Output: {final_output_path}[/green]")
+    console.print(f"[green]Task 3 output: {final_task3_output}[/green]")
     console.print(f"[green]Task 2 opt level: {normalized_opt_level}[/green]")
 
     # Task 1: Lift binary files to LLVM IR
@@ -203,7 +235,18 @@ def pipeline(
         console.print("[bold blue]TASK 3: Extracting individual functions[/bold blue]")
         console.print("[bold blue]=" * 60 + "[/bold blue]")
         
-        args = ["--input-path", final_output_path, "--workers", str(workers)]
+        args = [
+            "--input-path",
+            final_output_path,
+            "--output",
+            final_task3_output,
+            "--workers",
+            str(workers),
+            "--backend",
+            task3_backend,
+            "--max-seq-length",
+            str(max_seq_length),
+        ]
         if resume:
             args.append("--resume")
         

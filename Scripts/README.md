@@ -7,7 +7,7 @@
 - `utils.py` - 通用工具函数
 - `task1_lift.py` - 任务1：二进制文件提升到LLVM IR  
 - `task2_reoptimize.py` - 任务2：重新优化LLVM IR文件
-- `task3_extract.py` - 任务3：提取单个函数
+- `task3_extract.py` - 任务3：函数抽取、CFG/DDG 构图、tokenize、parquet 输出的 fused stage
 - `pipeline.py` - 主控制脚本，可以运行单个任务或完整流水线
 
 ## 使用方法
@@ -66,13 +66,29 @@ python3 pipeline.py task2 --input-path /path/to/ll/files --opt-level O0
 python3 task2_reoptimize.py --input-path /path/to/ll/files --resume --opt-level Os
 ```
 
-#### 任务3：提取单个函数
+#### 任务3：Fused 函数图数据生成
 ```bash
 # 通过pipeline运行
-python3 pipeline.py task3 --input-path /path/to/bc/files
+python3 pipeline.py task3 --input-path /path/to/bc/files --output /path/to/task3-output
 
 # 直接运行任务脚本
-python3 task3_extract.py --input-path /path/to/bc/files --resume
+python3 task3_extract.py \
+  --input-path /path/to/bc/files \
+  --output /path/to/task3-output \
+  --backend local \
+  --resume
+
+# Shaheen/Ray 环境
+python3 task3_extract.py \
+  --input-path /path/to/bc/files \
+  --output /path/to/task3-output \
+  --backend ray \
+  --resume
+
+# 将最终 parquet 保存成 HuggingFace dataset
+python3 -m DataProcess.cli parquet \
+  --input-parquet-dir /path/to/task3-output/parquet \
+  --output-dir /path/to/hf-output
 ```
 
 ## 主要改进
@@ -84,6 +100,7 @@ python3 task3_extract.py --input-path /path/to/bc/files --resume
 5. **清晰的进度显示**：每个任务都有独立的进度条
 6. **更好的日志**：任务1有独立的日志文件 `lift_task1_log.txt`
 7. **Task 2 优化级别可配置**：支持 `--opt-level O0/O1/O2/O3/Os/Oz/...`，默认 `O3`
+8. **Task 3 fused 输出**：不再保留函数级小文件或 `results.db`，默认输出受控数量的 parquet 分片
 
 ## 典型使用场景
 

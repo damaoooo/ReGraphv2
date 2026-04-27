@@ -1,6 +1,109 @@
-# Ray Opt Ablation
+# Ray Pipelines on Shaheen
+
+## 新版 fused `.ll -> final_set` 流程
+
+新流程入口是：
+
+```text
+Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch
+Scripts/ray_opt_ablation/ray_fused_pipeline.py
+```
+
+它替代旧的 `function_map.csv + results.db + wash` 链路，执行：
+
+```text
+.ll -> Task2 .bc -> fused Task3 parquet -> HuggingFace dataset -> final_set
+```
+
+### 提交 fused 流程
+
+正式跑一个 opt level：
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+DATASET_PATH=/scratch/zhoul0e/Dataset-1-lift/Dataset-1 \
+OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O3-fused \
+FORCE_CLEAN=1 \
+sbatch Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O3
+```
+
+冒烟测试：
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+SMOKE=1 FORCE_CLEAN=1 \
+sbatch --time=00:30:00 Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O3
+```
+
+续跑：
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+DATASET_PATH=/scratch/zhoul0e/Dataset-1-lift/Dataset-1 \
+OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O3-fused \
+RESUME=1 \
+sbatch Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O3
+```
+
+覆盖节点数：
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+DATASET_PATH=/scratch/zhoul0e/Dataset-1-lift/Dataset-1 \
+OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O3-fused \
+FORCE_CLEAN=1 \
+sbatch --nodes=3 Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O3
+```
+
+传递 driver 参数：
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+DRIVER_EXTRA_ARGS="--task2-chunk-size 100 --task3-chunk-size 200 --max-parquet-files 5000 --command-timeout-seconds 600" \
+DATASET_PATH=/scratch/zhoul0e/Dataset-1-lift/Dataset-1 \
+OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O3-fused \
+sbatch Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O3
+```
+
+### Fused 输出
+
+所有输出写入 `OUTPUT_PATH`：
+
+- `bc/`：Task2 reoptimized `.bc`，按输入 split/相对路径镜像。
+- `task3_fused/parquet/`：最终 parquet，通常包含 `train/`、`validation/`、`test/`。
+- `task3_fused/manifests/`：fused Task3 的 `.bc` 级 success/failed/no-function manifest。
+- `hf/`：由 parquet 保存出的 HuggingFace dataset，例如 `train_dataset`。
+- `train_final_set`、`validation_final_set`、`test_final_set`：最终训练/验证任务数据。
+- `logs/run.log`、`logs/events.jsonl`、`logs/stage_failures/*.txt`。
+- `manifests/task2_{success,failed,skipped}.jsonl`。
+
+成功标准：
+
+1. `sacct -j <jobid> --format=JobID,JobName%30,State,ExitCode,Elapsed,NNodes,AllocCPUS -P` 显示主作业 `COMPLETED|0:0`。
+2. `OUTPUT_PATH/logs/run.log` 里出现 `pipeline completed successfully`。
+3. `ray_cluster_cpus` 等于 `节点数 * 384`，例如 2 节点是 `768`。
+4. 需要的 split 下存在 `<split>_final_set/train_dataset_pool`。
+5. `squeue -u $USER` 没有遗留测试作业。
+
+### Fused 流程与 Shaheen Ray 标准
+
+`slurm_ray_fused_pipeline.sbatch` 继承当前已验证的 Shaheen 启动方式：
+
+- 不使用 `ray job submit`；在 head node 上直接执行 driver。
+- Ray head/worker 都通过 `srun --overlap` 启动。
+- 每个 Ray 节点显式设置 control ports 和 worker port range。
+- 每个 worker node 使用独立端口段。
+- cache 默认写到 `/tmp/regraph_<slurm-job-id>`，包含 HuggingFace/datasets、Ray temp、XDG cache。
+- cleanup 先 `ray stop --force`，再终止后台 Ray `srun` step。
+- driver 通过绝对路径提交，不使用 Ray `--working-dir` 打包 repo/dataset。
+
+`Scripts/task3_extract.py --backend ray` 只是一个 Ray driver，假设 Ray 集群已经由 sbatch 按上述标准启动；不要单独把它当成 Shaheen launcher。
+
+## Legacy Ray Opt Ablation
 
 该目录包含 `Scripts/opt_ablation.sh` 的 Ray 多节点版本。
+
+注意：下面的 `slurm_ray_opt_ablation.sbatch` / `ray_opt_ablation.py` 是旧流程，仍描述 `function_map.csv`、`results.db`、raw/wash/final 数据集链路。新 fused 需求应使用上一节的 `slurm_ray_fused_pipeline.sbatch`。
 
 ## 提交任务
 

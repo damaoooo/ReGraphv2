@@ -7,6 +7,8 @@ import datasets
 def get_dataset_features():
     """Define the features structure for HuggingFace dataset"""
     return datasets.Features({
+        'binary_name': datasets.Value('string'),
+        'function_name': datasets.Value('string'),
         'file_path': datasets.Value('string'),
         'ddg_graph': datasets.Sequence(
             datasets.Sequence(datasets.Value('int32'))
