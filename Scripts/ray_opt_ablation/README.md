@@ -5,47 +5,53 @@
 ## 提交任务
 
 ```bash
-sbatch /ibex/tmp/zhoul0e/regraphv2/Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
+cd /scratch/zhoul0e/ReGraphv2
+sbatch Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
 ```
 
 冒烟测试：
 
 ```bash
-SMOKE=1 FORCE_CLEAN=1 sbatch /ibex/tmp/zhoul0e/regraphv2/Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
+cd /scratch/zhoul0e/ReGraphv2
+SMOKE=1 FORCE_CLEAN=1 sbatch Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
 ```
 
 续跑：
 
 ```bash
-RESUME=1 sbatch /ibex/tmp/zhoul0e/regraphv2/Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
+cd /scratch/zhoul0e/ReGraphv2
+RESUME=1 sbatch Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
 ```
 
 覆盖路径：
 
 ```bash
-DATASET_PATH=/ibex/tmp/zhoul0e/Dataset-1 \
-OUTPUT_PATH=/ibex/tmp/zhoul0e/Dataset-1-O0 \
-sbatch /ibex/tmp/zhoul0e/regraphv2/Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
+cd /scratch/zhoul0e/ReGraphv2
+DATASET_PATH=/scratch/zhoul0e/Dataset-1 \
+OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O0 \
+sbatch Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
 ```
 
 传递 driver 参数：
 
 ```bash
+cd /scratch/zhoul0e/ReGraphv2
 DRIVER_EXTRA_ARGS="--progress-summary-interval-s 30 --graph-chunk-size 100" \
-sbatch /ibex/tmp/zhoul0e/regraphv2/Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
+sbatch Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
 ```
 
 默认 cache 路径：
 
 ```bash
-/ibex/tmp/zhoul0e/regraph_cache/<slurm-job-id>
+/tmp/regraph_<slurm-job-id>
 ```
 
 如需覆盖：
 
 ```bash
-CACHE_ROOT=/ibex/tmp/zhoul0e/my_regraph_cache \
-sbatch /ibex/tmp/zhoul0e/regraphv2/Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
+cd /scratch/zhoul0e/ReGraphv2
+CACHE_ROOT=/scratch/zhoul0e/my_regraph_cache \
+sbatch Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
 ```
 
 ## 输出
@@ -58,12 +64,12 @@ sbatch /ibex/tmp/zhoul0e/regraphv2/Scripts/ray_opt_ablation/slurm_ray_opt_ablati
 - `train_final_set`, `validation_final_set`, `test_final_set`.
 - `logs/run.log`, `logs/events.jsonl`, `logs/stage_failures/*.txt`.
 - `manifests/*_{success,failed,skipped}.jsonl`.
-- Slurm 的 stdout/stderr 会写入 `Scripts/ray_opt_ablation/slurm_logs/slurm-<jobid>.out` 和 `.err`。
+- Slurm 的 stdout/stderr 默认写入 `Scripts/ray_opt_ablation/slurm_logs/regraph_ray_opt-<jobid>.out` 和 `.err`。
 - HuggingFace/datasets cache 会写入 `CACHE_ROOT` 下的 `huggingface/`，不会使用 `/home/zhoul0e/.cache/huggingface`。
 
 ## 共享文件系统
 
-launcher 假定 `/ibex/tmp/zhoul0e` 在所有分配节点上共享，并被 bind 到 Singularity 容器里。driver 通过绝对路径提交，不使用 Ray `--working-dir`，因此 Ray 不会在启动前打包或上传 repo/dataset。
+launcher 假定 `/scratch/zhoul0e` 在所有分配节点上共享，并被 bind 到 Singularity 容器里。driver 通过绝对路径提交，不使用 Ray `--working-dir`，因此 Ray 不会在启动前打包或上传 repo/dataset。
 
 ## 扩展与伸缩
 
@@ -71,4 +77,110 @@ launcher 假定 `/ibex/tmp/zhoul0e` 在所有分配节点上共享，并被 bind
 
 默认使用自适应 chunk 大小。仅在必要时通过 `ray_opt_ablation.py` 的 driver 参数进行覆盖。
 
-sbatch 文件默认请求 `--mem-per-cpu=8G`，以避免 LLVM 提取与图生成受限于 Slurm 较小的每 CPU 默认内存。对于特别大的二进制可适当增大；若分区策略要求更小请求，可相应调低。
+Shaheen 版本默认请求 `--exclusive`、`--cpus-per-task=384` 和 `--mem=0`，让每个分配节点的 CPU 和内存都交给 Ray 使用。
+
+## Shaheen 成功运行记录（2026-04-26）
+
+这次在 KAUST Shaheen 上跑通的关键点如下。后续如果换一个 LLM 接手，优先按这一节判断，不要从通用 Ray 集群教程重新猜。
+
+### 已验证的提交方式
+
+当前 sbatch 脚本默认适配 Shaheen：`workq`、独占节点、每节点 384 CPU、Singularity 镜像 `/scratch/zhoul0e/regraph-data-env-llvm18.1.3.sif`。
+
+冒烟测试命令：
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+SMOKE=1 FORCE_CLEAN=1 sbatch --time=00:30:00 Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
+```
+
+正式跑默认数据集：
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+FORCE_CLEAN=1 sbatch Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
+```
+
+如果要临时改成 3 节点，可以让 sbatch 命令行覆盖脚本里的 `#SBATCH --nodes=2`：
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+FORCE_CLEAN=1 sbatch --nodes=3 Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch O0
+```
+
+### 为什么这个脚本能在 Shaheen 上跑
+
+- 不使用 `ray job submit`。Shaheen 上 Ray Jobs API 曾出现 504/404 或长时间无响应；现在是在 head node 上直接执行 driver：`RAY_ADDRESS=<head-ip>:<port> python3 ray_opt_ablation.py ...`。
+- Ray head/worker 都通过 `srun --overlap` 启动。因为 `ray start --block` 会长期占住 step，后续 `ray status`、driver 和 cleanup 仍然需要新的 `srun` step。
+- 每个 Ray 节点显式设置 control ports 和 worker port range。Shaheen 每节点 384 CPU，`WORKER_PORT_SPAN` 默认是 `900`，否则 Ray worker 数量可能超过可用 worker port，导致节点注册或 worker 启动失败。
+- 每个 worker node 用独立端口段。脚本按 Slurm job id 计算 `base_port`，head 使用 `base_port+100` 开始的 worker range，worker 节点使用 `base_port+1000`、`base_port+2000` 等独立 range，避免多节点端口冲突。
+- cache 默认放在 `/tmp/regraph_<jobid>`。HuggingFace/datasets cache、Ray temp 和 XDG cache 都跟着 job 隔离，避免写 login home 或复用坏 cache。
+- cleanup 会先 `ray stop --force`，再等待/终止后台 Ray `srun` step。日志里 `[ray-step] ... exited after cleanup with status=1` 是 Ray 被 stop 后的正常现象，不代表 job 失败。
+
+### 本次成功证据
+
+2 节点 smoke job `11689167` 已在 Shaheen 上完成：
+
+```text
+sacct: 11689167|regraph_ray_opt|COMPLETED|0:0|00:12:40|2|768
+ray_cluster_cpus=768
+stage=task2 complete success=20 failed=0 skipped=0
+stage=task3 complete success=20 failed=0 skipped=0
+stage=graph complete success=27095 failed=0 skipped=0
+stage=dataprocess complete success=27095 failed=0 skipped=0
+stage=wash complete success=3013 failed=0 skipped=0
+stage=final complete success=3 failed=0 skipped=0
+pipeline completed successfully
+```
+
+之前独立 RayTest 也验证过 3 节点 Ray 集群能起来并执行任务：3 节点共 1152 CPU，所有简单 Ray task 均成功返回数字和 IP。
+
+### 成功标准
+
+至少同时满足下面几点，才算真的跑通：
+
+1. `sacct -j <jobid> --format=JobID,JobName%30,State,ExitCode,Elapsed,NNodes,AllocCPUS -P` 显示主作业 `COMPLETED|0:0`。
+2. `logs/run.log` 里出现 `pipeline completed successfully`。
+3. `task2`、`task3`、`graph`、`dataprocess`、`wash`、`final` 都是 `failed=0`。
+4. `ray_cluster_cpus` 等于 `节点数 * 384`，例如 2 节点是 `768`，3 节点是 `1152`。
+5. `squeue -u $USER` 没有遗留测试作业。`squeue` 清空后，`sacct` 有时会短暂仍显示 RUNNING，等 10 秒再查通常会更新成 COMPLETED。
+
+### 常用排障命令
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+squeue -u $USER
+sacct -j <jobid> --format=JobID,JobName%30,State,ExitCode,Elapsed,NNodes,AllocCPUS -P
+tail -n 220 /scratch/zhoul0e/Dataset-smoketest-O0/logs/run.log
+tail -n 160 Scripts/ray_opt_ablation/slurm_logs/regraph_ray_opt-<jobid>.out
+tail -n 260 Scripts/ray_opt_ablation/slurm_logs/regraph_ray_opt-<jobid>.err
+```
+
+如果 job 已经确认失败或不再需要，先取消 allocation，避免独占节点浪费：
+
+```bash
+scancel <jobid>
+squeue -u $USER
+```
+
+### 常见误判
+
+- `FutureWarning: Ray will no longer override accelerator visible devices env var` 是 Ray 自身提示，不是失败。
+- cleanup 后看到 Ray background step `status=1` 可以是正常的，因为 `ray stop --force` 会让 `ray start --block` 退出。
+- `ray status` 里 CPU 使用为 `0.0/768.0 CPU` 只表示当前没有 task 正在跑，不表示 Ray 没看到 CPU；关键看分母是否是预期总 CPU。
+- `llvm-nm` 找不到 `T` 函数的 `.bc` 不应该让 task3 失败。`split_llvm_ir.sh` 会写 `.no_functions` marker，`ray_opt_ablation.py` 会把 `function_map.csv + .no_functions` 视为成功处理过的样本。
+
+### 修改前先做的轻量检查
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+bash -n Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch
+bash -n Scripts/split_llvm_ir.sh
+singularity exec --bind /scratch/zhoul0e:/scratch/zhoul0e \
+  /scratch/zhoul0e/regraph-data-env-llvm18.1.3.sif \
+  python3 -m py_compile Scripts/ray_opt_ablation/ray_opt_ablation.py
+git diff --check -- \
+  Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch \
+  Scripts/ray_opt_ablation/ray_opt_ablation.py \
+  Scripts/split_llvm_ir.sh
+```

@@ -33,10 +33,7 @@ RELL_PYTHON = os.environ.get(
 )
 IDA_HOME = os.environ.get("REGRAPH_IDA_HOME", "/scratch/zhoul0e")
 TASK1_DEFAULT_WORKERS = int(os.environ.get("REGRAPH_TASK1_WORKERS", "16"))
-TASK1_TIMEOUT_SECONDS = int(os.environ.get("REGRAPH_TASK1_TIMEOUT_SECONDS", "600"))
-ALLOW_FAILURES_DEFAULT = os.environ.get("REGRAPH_TASK1_ALLOW_FAILURES", "0").lower() in {"1", "true", "yes", "on"}
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lift_task1_log.txt")
-FAILED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lift_task1_failed_files.txt")
 SKIP_INPUT_SUFFIXES = (
     ".i64", ".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm",
     ".ll", ".bc", ".c", ".cpp", ".h", ".hpp", ".txt", ".log", ".md", ".py", ".sh",
@@ -105,7 +102,7 @@ def generate_i64(binary_path: str) -> tuple:
 def lift_single_file(input_binary: str, output_llvm: str) -> tuple:
     """
     Lift a single binary file to LLVM IR.
-
+    
     :param input_binary: Path to the binary file
     :param output_llvm: Path to the output LLVM IR file
     :return: (success, input_binary) tuple
@@ -120,45 +117,23 @@ def lift_single_file(input_binary: str, output_llvm: str) -> tuple:
         output_llvm,
         "-v",
     ]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=build_ida_env(),
-            timeout=TASK1_TIMEOUT_SECONDS,
-        )
-        success = result.returncode == 0 and file_exists_and_not_empty(output_llvm)
-        if (not success) or result.stdout or result.stderr:
-            with open(LOG_PATH, "a") as log_file:
-                print("=" * 60, file=log_file)
-                print(f"Command output for: {input_binary}", file=log_file)
-                print(f"Return code: {result.returncode}", file=log_file)
-                if result.returncode < 0:
-                    print(f"Signal: {-result.returncode}", file=log_file)
-                if result.stdout:
-                    print("--- stdout ---", file=log_file)
-                    log_file.write(result.stdout)
-                if result.stderr:
-                    print("--- stderr ---", file=log_file)
-                    log_file.write(result.stderr)
-    except subprocess.TimeoutExpired as exc:
-        success = False
+    result = subprocess.run(cmd, capture_output=True, text=True, env=build_ida_env())
+    success = result.returncode == 0
+    if result.stdout or result.stderr:
         with open(LOG_PATH, "a") as log_file:
-            print("=" * 60, file=log_file)
-            print(f"Timeout lifting: {input_binary}", file=log_file)
-            print(f"Timeout seconds: {TASK1_TIMEOUT_SECONDS}", file=log_file)
-            if exc.stdout:
-                print("--- stdout ---", file=log_file)
-                log_file.write(exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode(errors="replace"))
-            if exc.stderr:
-                print("--- stderr ---", file=log_file)
-                log_file.write(exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode(errors="replace"))
-    if not success and os.path.exists(output_llvm):
-        try:
-            os.remove(output_llvm)
-        except OSError:
-            pass
+            log_file.write("=" * 60 + "\n")
+            log_file.write(f"Command output for: {input_binary}\n")
+            log_file.write(f"Return code: {result.returncode}\n")
+            if result.stdout:
+                log_file.write("--- stdout ---\n")
+                log_file.write(result.stdout)
+                if not result.stdout.endswith("\n"):
+                    log_file.write("\n")
+            if result.stderr:
+                log_file.write("--- stderr ---\n")
+                log_file.write(result.stderr)
+                if not result.stderr.endswith("\n"):
+                    log_file.write("\n")
     return (success, input_binary)
 
 @app.command()
@@ -166,8 +141,6 @@ def main(
     input_path: str = typer.Option("", help="Input directory (defaults to DataProcess-1)"),
     output: str = typer.Option(..., help="Output directory"),
     workers: int = typer.Option(TASK1_DEFAULT_WORKERS, help="Number of worker processes"),
-    timeout_seconds: int = typer.Option(TASK1_TIMEOUT_SECONDS, help="Per-file ida2llvm timeout in seconds"),
-    allow_failures: bool = typer.Option(ALLOW_FAILURES_DEFAULT, help="Exit 0 after recording failed files"),
     resume: bool = typer.Option(False, help="Resume from previous run, skip existing files"),
     start_from_step2: bool = typer.Option(
         False,
@@ -499,10 +472,6 @@ def main(
     logger.info(f"  LLVM IR Success: {success_count}")
     logger.info(f"  Lift Failed:  {failed_count}")
     if failed_count > 0:
-        with open(FAILED_PATH, "w") as failed_log:
-            for f in failed_files:
-                print(f, file=failed_log)
-        console.print(f"[yellow]Failed file list: {FAILED_PATH}[/yellow]")
         logger.info(f"Failed files:")
         for f in failed_files:
             logger.info(f"    - {f}")
@@ -511,11 +480,9 @@ def main(
     
     console.print(f"[cyan]Detailed logs: {LOG_PATH}[/cyan]")
     
-    if failed_count > 0 and not allow_failures:
+    if failed_count > 0:
         console.print("[yellow]To retry failed files, run with the same output directory[/yellow]")
         raise typer.Exit(code=1)
-    if failed_count > 0:
-        console.print("[yellow]Continuing with exit code 0 because --allow-failures is enabled[/yellow]")
     return True
 
 if __name__ == "__main__":

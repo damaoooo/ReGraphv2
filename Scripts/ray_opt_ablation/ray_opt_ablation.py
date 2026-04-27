@@ -35,10 +35,10 @@ from rich.progress import (
 from rich.text import Text
 
 
-DEFAULT_REPO_ROOT = Path("/ibex/tmp/zhoul0e/regraphv2")
-DEFAULT_DATASET_PATH = Path("/ibex/tmp/zhoul0e/Dataset-1")
-DEFAULT_SMOKE_DATASET_PATH = Path("/ibex/tmp/zhoul0e/Dataset-smoketest")
-DEFAULT_CACHE_ROOT = Path("/ibex/tmp/zhoul0e/regraph_cache")
+DEFAULT_REPO_ROOT = Path("/scratch/zhoul0e/ReGraphv2")
+DEFAULT_DATASET_PATH = Path("/scratch/zhoul0e/Dataset-1")
+DEFAULT_SMOKE_DATASET_PATH = Path("/scratch/zhoul0e/Dataset-smoketest")
+DEFAULT_CACHE_ROOT = Path("/scratch/zhoul0e/regraph_cache")
 SPLITS = ("train", "validation", "test")
 GRAPH_TEMP_SUFFIXES = ("_purified.ll", "_instrumented.ll")
 
@@ -549,7 +549,8 @@ def task3_chunk(chunk_id: str, items: list[dict[str, Any]], context: dict[str, A
             success, stdout, stderr = task3_extract.extract_functions(item["output_bc"], item["function_dir"])
             has_map = (function_dir / "function_map.csv").exists()
             has_functions = any(function_dir.glob("*.ll"))
-            if success and has_map and has_functions:
+            has_no_functions = (function_dir / ".no_functions").exists()
+            if success and has_map and (has_functions or has_no_functions):
                 successes.append(item)
             else:
                 failures.append(
@@ -988,7 +989,7 @@ def split_task3_items(items: list[dict[str, Any]], resume: bool) -> tuple[list[d
         if (
             resume
             and (function_dir / "function_map.csv").exists()
-            and any(function_dir.glob("*.ll"))
+            and (any(function_dir.glob("*.ll")) or (function_dir / ".no_functions").exists())
         ):
             skipped.append(item)
         else:

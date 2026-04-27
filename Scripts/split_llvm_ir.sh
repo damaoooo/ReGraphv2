@@ -72,22 +72,22 @@ fi
 
 # --- 3. Extraction and Processing ---
 
-# Run llvm-nm on the bitcode file.
-# `grep ' T '` filters for defined functions (text/code symbols).
-# `awk '{print $3}'` prints the third field, which is the function name.
-FUNCTION_LIST=$(llvm-nm "$TEMP_BC_FILE" | grep ' T ' | awk '{print $3}')
+# Ensure the output directory exists and create a clean map file for this run.
+mkdir -p "$OUTPUT_DIR"
+MAP_FILE="${OUTPUT_DIR}/function_map.csv"
+NO_FUNCTIONS_MARKER="${OUTPUT_DIR}/.no_functions"
+echo "OriginalFunctionName,HashedFileName" > "$MAP_FILE"
+rm -f "$NO_FUNCTIONS_MARKER"
+
+# Run llvm-nm on the bitcode file. Some objects legitimately have no defined
+# text symbols; do not let grep/pipefail turn that into a task failure.
+FUNCTION_LIST=$(llvm-nm "$TEMP_BC_FILE" | awk '$2 == "T" {print $3}' || true)
 
 if [ -z "$FUNCTION_LIST" ]; then
+    touch "$NO_FUNCTIONS_MARKER"
     echo "Warning: No defined functions found in '$INPUT_FILE'. Nothing to do." >&2
     exit 0
 fi
-
-# Ensure the output directory exists.
-mkdir -p "$OUTPUT_DIR"
-
-# Define the map file path and write the header (overwriting any existing file).
-MAP_FILE="${OUTPUT_DIR}/function_map.csv"
-echo "OriginalFunctionName,HashedFileName" > "$MAP_FILE"
 
 # Loop through each function name and run llvm-extract.
 for func_name in $FUNCTION_LIST; do

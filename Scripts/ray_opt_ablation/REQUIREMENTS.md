@@ -7,7 +7,7 @@
 ## 环境
 
 - Slurm 资源分配中，每个节点运行一个 Ray 进程。
-- Singularity 镜像：`/ibex/tmp/zhoul0e/regraph-data-env-llvm18.1.3.sif`。
+- Singularity 镜像：`/scratch/zhoul0e/regraph-data-env-llvm18.1.3.sif`。
 - 默认 Slurm 资源从 3 节点 x 2 CPU 起步，但实现必须支持通过 sbatch 头部增加节点数和 CPU 数。
 - Slurm 作业应为大规模 LLVM 提取与图生成请求足够内存。默认 sbatch 使用 `--mem-per-cpu=16G`，因此在增大 `--cpus-per-task` 时内存会随之扩展。
 - Ray 启动模式：
@@ -15,16 +15,17 @@
   - 在 Singularity 内启动 Ray head/worker
   - `ray job submit`
   - `ray stop --force` 清理
-- `/ibex/tmp/zhoul0e` 是所有节点共享的文件系统；launcher 不应通过 Ray `--working-dir` 打包/上传 repo 或 Dataset-1，而应直接使用共享路径。
+- `/scratch/zhoul0e` 是所有节点共享的文件系统；launcher 不应通过 Ray `--working-dir` 打包/上传 repo 或 Dataset-1，而应直接使用共享路径。
+- 代码仓库位于 `/home/zhoul0e/ReGraphv2`，需在容器中 bind `/home/zhoul0e` 以访问仓库。
 - Ray driver entrypoint 应固定运行在 head node，避免 Ray Jobs supervisor 被调度到启动后退出的 worker 上。
 
 ## 数据与输出
 
 - 源数据集为只读。
-- 默认全量数据集：`/ibex/tmp/zhoul0e/Dataset-1`。
-- 冒烟测试数据集：`/ibex/tmp/zhoul0e/Dataset-smoketest`。
-- 默认输出：`/ibex/tmp/zhoul0e/Dataset-1-${OPT_LEVEL}`。
-- 冒烟输出：`/ibex/tmp/zhoul0e/Dataset-smoketest-${OPT_LEVEL}`。
+- 默认全量数据集：`/scratch/zhoul0e/Dataset-1`。
+- 冒烟测试数据集：`/scratch/zhoul0e/Dataset-smoketest`。
+- 默认输出：`/scratch/zhoul0e/Dataset-1-${OPT_LEVEL}`。
+- 冒烟输出：`/scratch/zhoul0e/Dataset-smoketest-${OPT_LEVEL}`。
 - 输出需镜像源数据 split 结构：
   - `train/...`
   - `validation/...`
@@ -98,7 +99,7 @@
   - `bash -n Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch`
   - `sbatch --test-only Scripts/ray_opt_ablation/slurm_ray_opt_ablation.sbatch`
 - 冒烟运行：
-  - 数据集：`/ibex/tmp/zhoul0e/Dataset-smoketest`
+  - 数据集：`/scratch/zhoul0e/Dataset-smoketest`
   - 先跑一个优化等级，例如 `O0`
   - Slurm 作业以 `COMPLETED 0:0` 结束
   - Ray 能识别所有已分配节点和 CPU
