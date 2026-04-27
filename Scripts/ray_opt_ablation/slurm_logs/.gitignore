@@ -1,3 +1,0 @@
-slurm-*.out
-slurm-*.err
-ray_step_state_*/
