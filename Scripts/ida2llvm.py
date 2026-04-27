@@ -43,12 +43,74 @@ ptext = {}  # 缓存反编译的函数: {地址: 反编译结果}
 refreshed_funcs = set()  # 避免重复触发无缓存反编译
 lifting_funcs = set()  # 正在定义函数体的函数，防止递归重入
 lifted_funcs = set()  # 已经完成函数体定义的函数
+function_signature_cache = {}  # 缓存函数签名: {地址: ida_typeinf.tinfo_t}
+name_cache = {}
+func_cache = {}
+segtype_cache = {}
+llvm_type_cache = {}
+target_data = None
+_CACHE_MISS = object()
 
 # 线程局部存储段大小（Windows FS段标准大小）
 FS_SEGMENT_SIZE = 0x10000  # 64KB
 
 # 浮点数提取失败时的默认值
 DEFAULT_FLOAT_VALUE = 1.0
+
+
+def _reset_lift_state():
+    """清理一次 binary lift 过程中的全局缓存。"""
+    global target_data
+    ptext.clear()
+    refreshed_funcs.clear()
+    lifting_funcs.clear()
+    lifted_funcs.clear()
+    function_signature_cache.clear()
+    name_cache.clear()
+    func_cache.clear()
+    segtype_cache.clear()
+    llvm_type_cache.clear()
+    target_data = None
+
+
+def _get_target_data():
+    """复用 llvmlite target data，避免热路径重复构造。"""
+    global target_data
+    if target_data is None:
+        target_data = llvm.create_target_data("e")
+    return target_data
+
+
+def _get_name_cached(ea):
+    name = name_cache.get(ea)
+    if name is None:
+        name = ida_name.get_name(ea)
+        name_cache[ea] = name
+    return name
+
+
+def _get_func_cached(ea):
+    func = func_cache.get(ea, _CACHE_MISS)
+    if func is _CACHE_MISS:
+        func = ida_funcs.get_func(ea)
+        func_cache[ea] = func
+    return func
+
+
+def _get_segtype_cached(ea):
+    segtype = segtype_cache.get(ea, _CACHE_MISS)
+    if segtype is _CACHE_MISS:
+        segtype = ida_segment.segtype(ea)
+        segtype_cache[ea] = segtype
+    return segtype
+
+
+def _tif_cache_key(tif: ida_typeinf.tinfo_t, width: int = -1):
+    """为 IDA tinfo 生成保守缓存键；失败时禁用该次缓存。"""
+    try:
+        return (tif.dstr(), tif.get_size(), tif.get_type_name() or "", width)
+    except Exception:
+        return None
 
 
 def _function_state_key(func_name: str, ea: int):
@@ -86,6 +148,17 @@ def _get_register_storage(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRB
     return func.lvars[reg_name]
 
 def lift_tif(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
+    cache_key = _tif_cache_key(tif, width)
+    if cache_key is not None and cache_key in llvm_type_cache:
+        return llvm_type_cache[cache_key]
+
+    res = _lift_tif_uncached(tif, width)
+    if cache_key is not None:
+        llvm_type_cache[cache_key] = res
+    return res
+
+
+def _lift_tif_uncached(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
     """
     将IDA类型转换为对应的LLVM类型。
     如果IDA类型是数组/结构体/复合类型，则递归执行类型转换。
@@ -296,7 +369,7 @@ def get_offset_to(builder: ir.IRBuilder, arg: ir.Value, off: int = 0) -> ir.Valu
     """
     if isinstance(arg.type, ir.PointerType) and isinstance(arg.type.pointee, ir.ArrayType):
         arr = arg.type.pointee
-        td = llvm.create_target_data("e")
+        td = _get_target_data()
         size = arr.element.get_abi_size(td)
         return builder.gep(arg, (ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), off // size),))
     # elif isinstance(arg.type, ir.PointerType) and isinstance(arg.type.pointee, ir.LiteralStructType):
@@ -304,7 +377,7 @@ def get_offset_to(builder: ir.IRBuilder, arg: ir.Value, off: int = 0) -> ir.Valu
     elif isinstance(arg.type, ir.PointerType) and isinstance(arg.type.pointee, ir.IdentifiedStructType):
         return typecast(arg, ir.IntType(8).as_pointer(), builder)
     elif isinstance(arg.type, ir.PointerType) and off > 0:
-        td = llvm.create_target_data("e")
+        td = _get_target_data()
         size = arg.type.pointee.get_abi_size(td)
         return builder.gep(arg, (ir.Constant(ir.IntType(32), off // size),))
     else:
@@ -337,7 +410,7 @@ def dedereference(arg: ir.Value) -> ir.Value:
 
 def lift_type_from_address(ea: int, pfunc=None):
     """从地址获取类型信息。"""
-    if ida_funcs.get_func(ea) != None and ida_segment.segtype(ea) & ida_segment.SEG_XTRN:
+    if _get_func_cached(ea) != None and _get_segtype_cached(ea) & ida_segment.SEG_XTRN:
         # 假设这是一个返回void且接受可变参数的函数
         ida_func_details = ida_typeinf.func_type_data_t()
         void = ida_typeinf.tinfo_t()
@@ -349,18 +422,29 @@ def lift_type_from_address(ea: int, pfunc=None):
         function_tinfo.create_func(ida_func_details)
         return function_tinfo
 
+    if pfunc is not None and getattr(pfunc, "type", None) is not None:
+        function_signature_cache[ea] = pfunc.type
+        return pfunc.type
+
     if ea in ptext:
         pfunc_cached = ptext.get(ea)
         if pfunc_cached is not None and getattr(pfunc_cached, "type", None) is not None:
+            function_signature_cache[ea] = pfunc_cached.type
             return pfunc_cached.type
         # Stale or invalid cache entry, drop and fall back to IDA type info.
         with suppress(KeyError):
             del ptext[ea]
+
+    cached_tif = function_signature_cache.get(ea)
+    if cached_tif is not None:
+        return cached_tif
             
     tif = ida_typeinf.tinfo_t()
     has_tinfo = ida_nalt.get_tinfo(tif, ea)
     if not has_tinfo:
         ida_typeinf.guess_tinfo(tif, ea)
+    if tif.is_func() or tif.is_funcptr():
+        function_signature_cache[ea] = tif
     return tif
 
 def analyze_insn(module, ida_insn, ea):
@@ -383,14 +467,14 @@ def analyze_insn(module, ida_insn, ea):
         callnum = len(ida_insn.d.f.args)
         if ida_insn.l.t == ida_hexrays.mop_v: 
             temp_ea = ida_insn.l.g
-            func_name = ida_name.get_name(temp_ea)
-            temp_func = ida_funcs.get_func(temp_ea)
+            func_name = _get_name_cached(temp_ea)
+            temp_func = _get_func_cached(temp_ea)
             if ((temp_func is not None)
             and (temp_func.flags & ida_funcs.FUNC_THUNK)): 
                 tfunc_ea, ptr = ida_funcs.calc_thunk_func_target(temp_func)
                 if tfunc_ea != ida_idaapi.BADADDR:
                     temp_ea = tfunc_ea
-                    func_name = ida_name.get_name(temp_ea)
+                    func_name = _get_name_cached(temp_ea)
 
             tif = lift_type_from_address(temp_ea)
             if tif.is_func() or tif.is_funcptr():
@@ -411,6 +495,7 @@ def analyze_insn(module, ida_insn, ea):
                             pfunc = ida_hexrays.decompile(temp_ea, ida_hf, ida_hexrays.DECOMP_NO_CACHE)
                             if pfunc != None:
                                 ptext[temp_ea] = pfunc
+                                function_signature_cache[temp_ea] = pfunc.type
                         except:
                             pass
 
@@ -421,6 +506,7 @@ def analyze_insn(module, ida_insn, ea):
                             pfunc = ida_hexrays.decompile(ea, ida_hf, ida_hexrays.DECOMP_NO_CACHE) 
                             if pfunc != None:
                                 ptext[ea] = pfunc
+                                function_signature_cache[ea] = pfunc.type
                         except:
                             return
 
@@ -440,7 +526,7 @@ def lift_from_address(module: ir.Module, ea: int, typ: ir.Type = None):
 
 def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
     if isinstance(typ, ir.FunctionType):
-        func_name = ida_name.get_name(ea)
+        func_name = _get_name_cached(ea)
         if func_name == "":
             func_name = f"data_{hex(ea)[2:]}"
         res = module.get_global(func_name)
@@ -520,15 +606,16 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
 
         # lift each bblk in cfg
         for index, blk in enumerate(res.blocks):
+            next_blk = res.blocks[index + 1] if index + 1 < len(res.blocks) else None
             ida_blk = mba.get_mblock(index)
             ida_insn = ida_blk.head
             while ida_insn is not None:
-                lift_insn(ida_insn, blk, builder)
+                lift_insn(ida_insn, blk, builder, next_blk)
                 ida_insn = ida_insn.next
 
-            if not blk.is_terminated and index + 1 < len(res.blocks):
+            if not blk.is_terminated and next_blk is not None:
                 with builder.goto_block(blk):
-                    builder.branch(res.blocks[index + 1])
+                    builder.branch(next_blk)
 
         # if function is variadic, declare va_end intrinsic
         if tif.is_vararg_cc() and typ.var_arg:
@@ -555,14 +642,14 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
         val = ir.Constant(typ, None)
         return val
     elif isinstance(typ, ir.ArrayType):
-        td = llvm.create_target_data("e")
+        td = _get_target_data()
         subSize = typ.element.get_abi_size(td)
         array = [ lift_from_address(module, sub_ea, typ.element)
             for sub_ea in range(ea, ea + subSize * typ.count, subSize)
         ]
         return ir.Constant.literal_array(array)
     elif isinstance(typ, ir.LiteralStructType) or isinstance(typ, ir.IdentifiedStructType):
-        td = llvm.create_target_data("e")
+        td = _get_target_data()
         structEles = []
         for el in typ.elements:
             structEle = lift_from_address(module, ea, el)
@@ -828,7 +915,7 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
         return lift_intrinsic_function(module, func_name)
 
     func_ea = ida_name.get_name_ea(ida_idaapi.BADADDR, func_name)
-    if func_ea != ida_idaapi.BADADDR and ida_segment.segtype(func_ea) & ida_segment.SEG_XTRN:
+    if func_ea != ida_idaapi.BADADDR and _get_segtype_cached(func_ea) & ida_segment.SEG_XTRN:
         is_declare = True 
 
     if func_ea == ida_idaapi.BADADDR:
@@ -837,6 +924,8 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
     assert func_ea != ida_idaapi.BADADDR
     if tif is None:
         tif = lift_type_from_address(func_ea) 
+    elif tif.is_func() or tif.is_funcptr():
+        function_signature_cache[func_ea] = tif
 
     typ = lift_tif(tif) 
     state_key = _function_state_key(func_name, func_ea)
@@ -976,7 +1065,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
         return blk.parent.blocks[mop.b]
     elif mop.t == ida_hexrays.mop_v: # 全局变量
         ea = mop.g
-        name = ida_name.get_name(ea)
+        name = _get_name_cached(ea)
         if name == "":
             name = f"data_{hex(ea)[2:]}"
 
@@ -988,21 +1077,23 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
             if tif.is_funcptr():
                 tif = tif.get_ptrarr_object()
             # if function is a thunk function, define the actual function instead
-            if ((ida_funcs.get_func(ea) is not None)
-            and (ida_funcs.get_func(ea).flags & ida_funcs.FUNC_THUNK)): 
-                tfunc_ea, ptr = ida_funcs.calc_thunk_func_target(ida_funcs.get_func(ea))
+            func = _get_func_cached(ea)
+            if ((func is not None)
+            and (func.flags & ida_funcs.FUNC_THUNK)):
+                tfunc_ea, ptr = ida_funcs.calc_thunk_func_target(func)
                 if tfunc_ea != ida_idaapi.BADADDR:
                     ea = tfunc_ea
-                    name = ida_name.get_name(ea)
+                    name = _get_name_cached(ea)
                     if name == "":
                         name = f"data_{hex(ea)[2:]}"
                     tif = lift_type_from_address(ea)
+                    func = _get_func_cached(ea)
             # 如果没有函数定义，
-            if ((ida_funcs.get_func(ea) is None)
+            if ((func is None)
             # 或者函数是库函数，
-            or (ida_funcs.get_func(ea).flags & ida_funcs.FUNC_LIB) 
+            or (func.flags & ida_funcs.FUNC_LIB)
             # 或者函数在XTRN段中声明，
-            or ida_segment.segtype(ea) & ida_segment.SEG_XTRN): 
+            or _get_segtype_cached(ea) & ida_segment.SEG_XTRN):
                 # 返回函数声明
                 g = lift_function(blk.parent.parent, name, True, ea, tif)
             else:
@@ -1145,7 +1236,7 @@ def _store_as(l: ir.Value, d: ir.Value, blk: ir.Block, builder: ir.IRBuilder, d_
     with suppress(AttributeError):
         if isinstance(l.type.pointee, ir.IdentifiedStructType) or isinstance(l.type.pointee, ir.ArrayType):
             dest, src = d, l
-            td = llvm.create_target_data("e")
+            td = _get_target_data()
             length = ir.Constant(ir.IntType(64), l.type.pointee.get_abi_size(td))
             memcpy = lift_intrinsic_function(blk.parent.parent, "memcpy")
             src = typecast(src, ir.IntType(8).as_pointer(), builder)
@@ -1307,7 +1398,7 @@ def _handle_float_binary_op(l, r, d, op_func, blk, builder, ida_insn):
     d = storecast(l, d, builder)
     return _store_as(math, d, blk, builder)
  
-def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilder) -> ir.Instruction:
+def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilder, next_blk=None) -> ir.Instruction:
     """
     Lifts a single IDA microcode instruction to LLVM IR.
     
@@ -1336,10 +1427,11 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
     if ida_insn.l.t == ida_hexrays.mop_h and l == None:
         l = create_intrinsic_function(blk.parent.parent, ida_insn.l.helper, ida_insn.d.f)
 
-    blk_itr = iter(blk.parent.blocks)
-    list(itertools.takewhile(lambda x: x.name != blk.name, blk_itr))
-    # 获取下一个块
-    next_blk = next(blk_itr, None)
+    if next_blk is None:
+        blk_itr = iter(blk.parent.blocks)
+        list(itertools.takewhile(lambda x: x.name != blk.name, blk_itr))
+        # 获取下一个块
+        next_blk = next(blk_itr, None)
 
     if ida_insn.opcode == ida_hexrays.m_nop:    # 0x00,  nop    无操作
         return
@@ -1663,24 +1755,17 @@ class BIN2LLVMController():
         self.m = ir.Module()
         self._name_cache = {}
         self._func_cache = {}
+        self._function_eas = []
         if target_mode == "host":
             self._set_module_target_from_host()
         else:
             self._set_module_target_from_ida()
 
     def _get_name(self, ea):
-        name = self._name_cache.get(ea)
-        if name is None:
-            name = ida_name.get_name(ea)
-            self._name_cache[ea] = name
-        return name
+        return _get_name_cached(ea)
 
     def _get_func(self, ea):
-        func = self._func_cache.get(ea, "__missing__")
-        if func == "__missing__":
-            func = ida_funcs.get_func(ea)
-            self._func_cache[ea] = func
-        return func
+        return _get_func_cached(ea)
 
     def _set_module_target_from_host(self):
         """Sets module target triple and data layout based on host LLVM."""
@@ -1748,8 +1833,27 @@ class BIN2LLVMController():
         遍历二进制文件中的所有函数，并将.text段中的函数
         翻译为LLVM IR表示。
         """
-        for f_ea in idautils.Functions():
+        function_eas = self._function_eas or list(idautils.Functions())
+        for f_ea in function_eas:
             self.insertFunctionAtEa(f_ea)
+
+    def _decompile_function(self, ea):
+        no_cache = ea in refreshed_funcs
+        if no_cache:
+            ida_hf = ida_hexrays.hexrays_failure_t()
+            pfunc = ida_hexrays.decompile(ea, ida_hf, ida_hexrays.DECOMP_NO_CACHE)
+        else:
+            pfunc = ida_hexrays.decompile(ea)
+        if pfunc is not None and getattr(pfunc, "type", None) is not None:
+            ptext[ea] = pfunc
+            function_signature_cache[ea] = pfunc.type
+        return pfunc
+
+    def _trim_ptext(self, keep_ea=None):
+        for cached_ea in list(ptext):
+            if cached_ea != keep_ea:
+                with suppress(KeyError):
+                    del ptext[cached_ea]
 
     def insertFunctionAtEa(self, ea):
         """
@@ -1757,13 +1861,25 @@ class BIN2LLVMController():
         
         :param ea: 要提升的函数的有效地址
         """
-        if ea in ptext:
+        try:
             pfunc = ptext.get(ea)
             if pfunc is None or getattr(pfunc, "type", None) is None:
+                with suppress(KeyError):
+                    del ptext[ea]
+                pfunc = self._decompile_function(ea)
+            if pfunc is None or getattr(pfunc, "type", None) is None:
                 return
+
             typ = pfunc.type
+            function_signature_cache[ea] = typ
             func_name = self._get_name(ea)
             lift_function(self.m, func_name, False, ea, typ)
+        except Exception as e:
+            logging.debug(f"在 {hex(ea)} 处提升函数失败: {e}")
+        finally:
+            with suppress(KeyError):
+                del ptext[ea]
+            self._trim_ptext()
 
     def create_global(self, ea, width, str_dict):
         """
@@ -1819,7 +1935,7 @@ class BIN2LLVMController():
             # 或者函数是库函数，
             or (func.flags & ida_funcs.FUNC_LIB) 
             # 或者函数在XTRN段中声明，
-            or ida_segment.segtype(ea) & ida_segment.SEG_XTRN): 
+            or _get_segtype_cached(ea) & ida_segment.SEG_XTRN):
                 # 返回函数声明
                 g = lift_function(self.m, name, True, ea, tif)
 
@@ -1839,22 +1955,21 @@ class BIN2LLVMController():
         2. Collects all string constants identified by IDA
         3. Creates LLVM global variables for all data items in non-executable segments
         
-        The decompiled functions are cached in the global 'ptext' dictionary
-        for later use during function lifting.
+        Function addresses and available type signatures are collected up front.
+        Decompiled function bodies are kept only while each function is lifted.
         
         Note: Decompilation may fail for some functions (e.g., library stubs,
         corrupted code), which are silently skipped.
         """
-        # 步骤1：反编译所有函数并缓存结果
-        for func in idautils.Functions():
+        # 步骤1：收集函数地址和IDA已有签名；函数体按需反编译，避免长期持有所有pfunc/mba。
+        self._function_eas = list(idautils.Functions())
+        for func in self._function_eas:
+            tif = ida_typeinf.tinfo_t()
             try:
-                pfunc = ida_hexrays.decompile(func)
-                if pfunc != None:
-                    ptext[func] = pfunc
+                if ida_nalt.get_tinfo(tif, func) and (tif.is_func() or tif.is_funcptr()):
+                    function_signature_cache[func] = tif
             except Exception as e:
-                # 反编译可能因各种原因失败；跳过并继续
-                logging.debug(f"在 {hex(func)} 处反编译函数失败: {e}")
-                pass
+                logging.debug(f"在 {hex(func)} 处获取函数签名失败: {e}")
 
         # 步骤2：收集所有字符串常量
         str_dict = {}
@@ -1941,10 +2056,7 @@ def lift_binary_to_llvm(
     
     try:
         # Clear global caches to avoid stale entries across multiple binaries.
-        ptext.clear()
-        refreshed_funcs.clear()
-        lifting_funcs.clear()
-        lifted_funcs.clear()
+        _reset_lift_state()
 
         # 打开 IDA 数据库
         idapro.open_database(input_binary, True)
@@ -2006,10 +2118,7 @@ def main(
         logging.basicConfig(level=logging.INFO)
 
     try:
-        ptext.clear()
-        refreshed_funcs.clear()
-        lifting_funcs.clear()
-        lifted_funcs.clear()
+        _reset_lift_state()
 
         idapro.open_database(file, True)
         ida_auto.auto_wait()
