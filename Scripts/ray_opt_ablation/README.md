@@ -59,7 +59,7 @@ sbatch --nodes=3 Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O3
 
 ```bash
 cd /scratch/zhoul0e/ReGraphv2
-DRIVER_EXTRA_ARGS="--task3-chunk-size 500 --max-parquet-files 100000 --command-timeout-seconds 28800" \
+DRIVER_EXTRA_ARGS="--task3-chunk-size 500 --max-parquet-files 100000 --command-timeout-seconds 28800 --final-output-root /scratch/zhoul0e/bandwidth/Dataset-1-O1-fused" \
 DATASET_PATH=/scratch/zhoul0e/Dataset-1 \
 OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O1-fused \
 sbatch --nodes=3 Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O1
@@ -77,6 +77,167 @@ task3 默认使用 `--chunk-manifest-mode worker`，即每个 Ray worker 进程�
 
 task3 的 `llvm-extract` / `opt` 中间 IR、dot 文件默认写到节点本地 `$TMPDIR/task3_<output-name>`，不写到 scratch 的 `task3_fused/.task3_fused_state/tmp`。这是为了避免函数级临时文件触发 scratch 文件数配额；每个 chunk 结束后会清理自己的临时目录。
 
+`RESUME=1` 时，如果 `task3_fused/parquet/{train,validation,test}` 都已经存在且完整，driver 会跳过 Task3，日志里会出现 `stage=task3_fused skipped existing final parquet splits=...`。如果需要强制重建 Task3，必须在 `DRIVER_EXTRA_ARGS` 加 `--force-task3-rebuild`；这会删除旧的 `task3_fused` 后重新跑 Task3。若 Task3 没有重跑且 `hf/{split}_dataset` 已完整，`dataprocess_hf` 也会跳过。final 阶段按 `<split>_final_set/train_dataset_pool` 是否完整判断是否跳过。
+
+Task3 函数级坏样本不会阻断整个 pipeline。失败函数会写入 worker failed manifest，例如 `task3_fused/.task3_fused_state/chunk_manifests/*_failed.jsonl`，后续 parquet/HF/final 会继续使用已成功的函数记录。常见失败包括个别函数的 Graphviz DOT 解析错误，例如 `pygraphviz.agraph.DotError: Invalid Input`。
+
+### final_set 写入 bandwidth 与本地 staging
+
+如果设置 `--final-output-root /scratch/zhoul0e/bandwidth/<output-name>`，最终的 `train_final_set`、`validation_final_set`、`test_final_set` 会真实写入 bandwidth 文件系统；`OUTPUT_PATH` 下保留同名 symlink，训练和评估脚本仍然可以用 `OUTPUT_PATH/<split>_final_set/...` 路径。
+
+final 阶段会先把对应的 HF dataset 从 scratch 复制到节点本地 `$TMPDIR/final_sets/<output-name>/_hf_inputs/<split>_dataset`，再把 `Pretrain.split_train_validation` 的输出写到 `$TMPDIR/final_sets/<output-name>/<split>_final_set`，成功后复制到 `--final-output-root`，最后删除本地 input 和 output。除非传 `--keep-final-local`，本地 `/tmp` 不会同时保留已经完成的 split。这个设计是为了避免 HuggingFace `save_to_disk` 从 scratch 读写时掉到几十 examples/s。
+
+相关参数和环境变量：
+
+- `--final-output-root`：final_set 的真实落盘根目录；默认是 `OUTPUT_PATH`，也可用 `REGRAPH_FINAL_OUTPUT_ROOT` 覆盖。
+- `--final-local-root`：final 阶段本地工作目录；默认在设置了独立 `--final-output-root` 时使用 `$TMPDIR/final_sets/<output-name>`，也可用 `REGRAPH_FINAL_LOCAL_ROOT` 覆盖。
+- `--keep-final-local`：调试用，保留本地 final input/output；正常 Dataset-1 不建议打开。
+
+当前实现中 final 的 `train`、`validation`、`test` 三个 split 仍是串行处理；它们各自只使用 head node 上的一个 Python 进程。理论上可以改成三个 split 分别在三个节点本地 `/tmp` 上并行处理，但这还没有落到当前 driver。
+
+Dataset-1 的 final_set 使用约定：每个外层 split 目录都用内部 `train_*` 文件作为该 split 的有效数据，因为 driver 调 `Pretrain.split_train_validation` 时固定 `--train-ratio 1.0`。例如 evaluation validation 应传：
+
+```text
+/scratch/zhoul0e/Dataset-1-O1-fused/validation_final_set/train_dataset_pool
+/scratch/zhoul0e/Dataset-1-O1-fused/validation_final_set/train_positive_map.pkl
+```
+
+不要传 `validation_final_set/validation_dataset_pool`；该内部目录是空副产物。
+
+### Dataset-1 O0/O1/O2 已验证提交命令
+
+O0 已经有完整 Task3 parquet 时，直接 resume：
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+DATASET_PATH=/scratch/zhoul0e/Dataset-1 \
+OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O0-fused \
+RESUME=1 \
+DRIVER_EXTRA_ARGS="--task3-chunk-size 500 --max-parquet-files 100000 --command-timeout-seconds 28800 --final-output-root /scratch/zhoul0e/bandwidth/Dataset-1-O0-fused" \
+sbatch --nodes=3 --exclude=nid00018,nid00025,nid00026 --job-name=regraph_O0_fused \
+  Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O0
+```
+
+O1/O2 如果需要重建 Task3，使用 `--force-task3-rebuild`：
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+DATASET_PATH=/scratch/zhoul0e/Dataset-1 \
+OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O1-fused \
+RESUME=1 \
+DRIVER_EXTRA_ARGS="--task3-chunk-size 500 --max-parquet-files 100000 --command-timeout-seconds 28800 --final-output-root /scratch/zhoul0e/bandwidth/Dataset-1-O1-fused --force-task3-rebuild" \
+sbatch --nodes=3 --job-name=regraph_O1_fused \
+  Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O1
+
+DATASET_PATH=/scratch/zhoul0e/Dataset-1 \
+OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O2-fused \
+RESUME=1 \
+DRIVER_EXTRA_ARGS="--task3-chunk-size 500 --max-parquet-files 100000 --command-timeout-seconds 28800 --final-output-root /scratch/zhoul0e/bandwidth/Dataset-1-O2-fused --force-task3-rebuild" \
+sbatch --nodes=3 --job-name=regraph_O2_fused \
+  Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O2
+```
+
+这三条在 2026-04-28 已完成：O0 job `11754418`、O1 job `11754415`、O2 job `11754416` 均为 `COMPLETED|0:0`，并在 run log 中出现 `pipeline completed successfully`。
+
+### 2026-04-28 Dataset-1 成功经验复盘
+
+这一节给后续接手的 LLM/工程师看。不要把下面这些现象当成新问题重新排查，除非日志和这里描述的不一致。
+
+本次最终跑通的是 Dataset-1 的 O0/O1/O2 fused pipeline，均使用 3 个 Shaheen 独占节点，即 `1152` Ray CPU。最终状态：
+
+```text
+11754418 regraph_O0_fused COMPLETED 0:0 00:19:40
+11754415 regraph_O1_fused COMPLETED 0:0 02:25:07
+11754416 regraph_O2_fused COMPLETED 0:0 02:20:10
+```
+
+最终数据位置：
+
+```text
+/scratch/zhoul0e/Dataset-1-O0-fused/*_final_set -> /scratch/zhoul0e/bandwidth/Dataset-1-O0-fused/*_final_set
+/scratch/zhoul0e/Dataset-1-O1-fused/*_final_set -> /scratch/zhoul0e/bandwidth/Dataset-1-O1-fused/*_final_set
+/scratch/zhoul0e/Dataset-1-O2-fused/*_final_set -> /scratch/zhoul0e/bandwidth/Dataset-1-O2-fused/*_final_set
+```
+
+#### 成功原因
+
+- Shaheen 单节点 384 CPU，但只支持独占节点；无论申请多少核心都会拿到整个节点。因此多节点跑 Ray 时按 `nodes * 384` 理解资源，不要纠结 `cpus-per-task` 之外的核心数。
+- Task2 默认 `chunk_size=1` 是正确选择。慢 `.ll` 文件只拖住一个 Ray task，不会让大 chunk 堵住单核。
+- Task3 不要用 `chunk_size=20/50` 跑完整 Dataset-1。函数量约 1600 万，chunk 太小会制造几十万到八十万级 raw parquet/manifest 文件，逼近或超过文件数 quota。当前成功配置是 `--task3-chunk-size 500 --max-parquet-files 100000`，raw parquet 峰值约 3.2 万。
+- Task3 的 `.bc` 和函数列表已经做稳定 hash shuffle，并按 `.bc` round-robin 打散。这样 z3/openssl 等大程序不会集中在一个 chunk 或一个核心上。
+- Task3 函数级失败可以继续跑。O2 里出现过少量 `pygraphviz.agraph.DotError: Invalid Input`，失败记录写入 `task3_fused/.task3_fused_state/chunk_manifests/*_failed.jsonl`，pipeline 仍然成功。
+- final 阶段真正的 I/O 瓶颈不是只写 output；`save_to_disk` 也会读 HF input。如果 output 写 `/tmp` 但 input 仍从 scratch 读，速度会掉到几十 examples/s。成功方案是 input 和 output 都先放节点本地 `/tmp`，完成后再复制到 bandwidth。
+- bandwidth 适合放最终大文件。O0 的 train final set 约 21GB，从本地 `/tmp` 复制到 bandwidth 只用了约 11 秒；test HF input 约 42.6GB，从 scratch 复制到 `/tmp` 约 20 秒。
+- 当前 final 阶段仍是串行的，且每个 split 主要吃 head node 上一个 Python 进程。`train/validation/test` 各占一个节点并行处理是可行的后续优化，但本次成功版本还没有实现。
+
+#### 曾经踩过的坑
+
+- O0 第一次 Ray head 曾在 `nid00018,nid00025,nid00026` 上遇到 GCS/port 启动失败。成功重提时使用了 `--exclude=nid00018,nid00025,nid00026`。
+- 中间有一次 resume 曾在 Task3 raw shards 被清理后误把剩余少量 `.bc` 重新 compact，导致 O1/O2 的 train parquet 被小数据覆盖。现在 driver 已加保护：`RESUME=1` 且完整 final parquet 存在时跳过 Task3；需要重建必须显式传 `--force-task3-rebuild`。
+- 不要用 host `/usr/bin/python3` 去检查 `ray_fused_pipeline.py` 语法。登录环境的 Python 太旧，会报 `future feature annotations is not defined`。用 SIF：
+
+```bash
+module load singularity >/dev/null 2>&1
+singularity exec --bind /scratch/zhoul0e:/scratch/zhoul0e \
+  /scratch/zhoul0e/regraph-data-env-llvm18.1.3.sif \
+  python3 -m py_compile /scratch/zhoul0e/ReGraphv2/Scripts/ray_opt_ablation/ray_fused_pipeline.py
+```
+
+- 这个 SIF 有 `datasets`，可以检查 final_set 格式；但没有 `torch`，不能在里面完整跑训练 collator。若要跑训练 smoke test，需要使用训练实际环境或含 PyTorch 的 SIF。
+
+#### 接手时优先看的日志
+
+检查 Slurm 状态：
+
+```bash
+sacct -j <jobid> --format=JobID,JobName%24,State,ExitCode,Elapsed,NodeList%40 -P
+```
+
+检查 pipeline 是否真正完成：
+
+```bash
+grep -E "ray_cluster_cpus|stage=task3_fused skipped|stage=dataprocess_hf skipped|final_set_link|pipeline completed successfully" \
+  /scratch/zhoul0e/Dataset-1-O1-fused/logs/run.log
+```
+
+检查 Task3 进度：
+
+```bash
+grep "Task3 Ray progress" /scratch/zhoul0e/Dataset-1-O1-fused/logs/run.log | tail -10
+```
+
+检查 final_set symlink：
+
+```bash
+find /scratch/zhoul0e/Dataset-1-O1-fused -maxdepth 1 -type l -name '*final_set' -printf '%p -> %l\n' | sort
+```
+
+检查失败函数：
+
+```bash
+find /scratch/zhoul0e/Dataset-1-O1-fused/task3_fused -type f -name '*failed.jsonl' -printf '%p %s\n' 2>/dev/null | sort
+```
+
+#### final_set 格式验证
+
+本次用 SIF 验证过 O0/O1/O2 的 `train_final_set`、`validation_final_set`、`test_final_set`。每个外层 split 都应该使用内部 `train_dataset_pool` 和 `train_positive_map.pkl`：
+
+```text
+<split>_final_set/train_dataset_pool
+<split>_final_set/train_task_dataset
+<split>_final_set/train_positive_map.pkl
+```
+
+不要把内部 `validation_dataset_pool` 传给 evaluation。因为 driver 使用 `--train-ratio 1.0`，内部 validation 是空副产物，`datasets.load_from_disk` 可能对 0-shard dataset 报 `IndexError`。这是预期现象，不是最终数据损坏。
+
+O0/O1/O2 的验证结果摘要：
+
+```text
+每个 opt 的 train_final_set:      train_pool=5,859,275  train_task=5,607,071
+每个 opt 的 validation_final_set: train_pool=103,254    train_task=100,651
+每个 opt 的 test_final_set:       train_pool=10,105,358 train_task=9,103,676
+```
+
 ### Fused 输出
 
 所有输出写入 `OUTPUT_PATH`：
@@ -85,7 +246,7 @@ task3 的 `llvm-extract` / `opt` 中间 IR、dot 文件默认写到节点本地 
 - `task3_fused/parquet/`：最终 parquet，通常包含 `train/`、`validation/`、`test/`。
 - `task3_fused/manifests/`：fused Task3 的 `.bc` 级 success/failed/no-function manifest。
 - `hf/`：由 parquet 保存出的 HuggingFace dataset，例如 `train_dataset`。
-- `train_final_set`、`validation_final_set`、`test_final_set`：最终训练/验证任务数据。
+- `train_final_set`、`validation_final_set`、`test_final_set`：最终训练/验证/测试任务数据。如果设置了 `--final-output-root`，这里是指向 bandwidth 真实目录的 symlink。
 - `logs/run.log`、`logs/events.jsonl`、`logs/stage_failures/*.txt`。
 - `manifests/task2_{success,failed,skipped}.jsonl`。
 
