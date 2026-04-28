@@ -228,13 +228,14 @@ class MoCoPretrainModel(nn.Module):
     def gradient_checkpointing_disable(self):
         self.encoder_q.gradient_checkpointing_disable()
 
-    def forward(self, view1: Dict, view2: Dict):
+    def forward(self, view1: Dict, view2: Dict, return_loss: bool = True):
         q_outputs = self.encoder_q(**view1)
         q_emb = q_outputs["embedding"]
         mlm_loss = q_outputs["loss"]
 
         with torch.no_grad():
-            self._momentum_update_key_encoder()
+            if self.training:
+                self._momentum_update_key_encoder()
             k_outputs = self.encoder_k(**view2)
             k_emb = k_outputs["embedding"]
 
@@ -251,7 +252,9 @@ class MoCoPretrainModel(nn.Module):
         labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
         contrastive_loss = nn.CrossEntropyLoss()(logits, labels)
 
-        self._dequeue_and_enqueue(k_emb, view2["group_ids"])
+        if self.training:
+            self._dequeue_and_enqueue(k_emb, view2["group_ids"])
+
         total_loss = mlm_loss + contrastive_loss
 
         return {

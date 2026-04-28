@@ -1,8 +1,9 @@
 import logging
 import pickle
 import random
+from datetime import datetime
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import typer
@@ -43,6 +44,86 @@ if GPU_AVAILABLE:
     console.print("[green]✓ GPU加速已启用 (PyTorch)[/green]")
 else:
     console.print("[yellow]⚠ 未检测到可用GPU，将使用CPU计算[/yellow]")
+
+
+def _markdown_cell(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\n", "<br>")
+
+
+def _markdown_table(headers: List[str], rows: List[List[object]]) -> str:
+    header_line = "| " + " | ".join(_markdown_cell(header) for header in headers) + " |"
+    separator_line = "| " + " | ".join("---" for _ in headers) + " |"
+    row_lines = [
+        "| " + " | ".join(_markdown_cell(cell) for cell in row) + " |"
+        for row in rows
+    ]
+    return "\n".join([header_line, separator_line, *row_lines])
+
+
+def _write_markdown_report(
+    markdown_output: Path,
+    validation_dataset_pool_path: Path,
+    validation_positive_map_path: Path,
+    model_path: Path,
+    k_values: List[int],
+    results: dict,
+    mrr_values: dict,
+    mrr_pool_values: dict,
+    anchors_evaluated: int,
+    total_pool_size: int,
+    max_length: int,
+    batch_size: int,
+    gpu_batch_size: int,
+    eval_samples: int,
+    pool_samples: int,
+    use_gpu: bool,
+    use_cfg: bool,
+    use_ddg: bool,
+    use_bf16: bool,
+) -> None:
+    recall_rows = [
+        [f"{pool_size:,}"] + [f"{recalls[f'Recall@{k}']:.4f}" for k in k_values]
+        for pool_size, recalls in results.items()
+    ]
+    mrr_pool_rows = [
+        [f"{pool_size:,}", f"{mrr_p:.4f}"]
+        for pool_size, mrr_p in mrr_pool_values.items()
+    ]
+
+    lines = [
+        "# Evaluation Results",
+        "",
+        f"- Generated at: {datetime.now().isoformat(timespec='seconds')}",
+        f"- Dataset pool: `{validation_dataset_pool_path}`",
+        f"- Positive map: `{validation_positive_map_path}`",
+        f"- Model: `{model_path}`",
+        f"- Graph branches: cfg={use_cfg}, ddg={use_ddg}",
+        f"- Max length: {max_length}",
+        f"- Batch size: {batch_size}",
+        f"- GPU batch size: {gpu_batch_size}",
+        f"- GPU enabled: {use_gpu}",
+        f"- BF16 embeddings: {use_bf16}",
+        f"- Retrieval pool size: {total_pool_size:,}",
+        f"- Anchors evaluated: {anchors_evaluated:,}",
+        f"- Eval samples: {eval_samples if eval_samples > 0 else 'all'}",
+        f"- Pool samples: {pool_samples if pool_samples > 0 else 'full'}",
+        "",
+        "## Recall@K",
+        "",
+        _markdown_table(["Pool Size", *[f"Recall@{k}" for k in k_values]], recall_rows),
+        "",
+        "## MRR",
+        "",
+        *[f"- MRR@{cutoff}: {value:.4f}" for cutoff, value in mrr_values.items()],
+        "",
+        "## MRR@P",
+        "",
+        _markdown_table(["Pool Size", "MRR@P"], mrr_pool_rows),
+        "",
+    ]
+
+    markdown_output.parent.mkdir(parents=True, exist_ok=True)
+    markdown_output.write_text("\n".join(lines), encoding="utf-8")
 
 
 @njit
@@ -628,6 +709,7 @@ def main(
     use_cfg: bool = typer.Option(True, "--cfg/--no-cfg", help="是否启用 CFG 图分支。"),
     use_ddg: bool = typer.Option(True, "--ddg/--no-ddg", help="是否启用 DDG 图分支。"),
     use_bf16: bool = typer.Option(False, "--bf16", help="将嵌入以BF16加载到GPU，减少显存与带宽开销。"),
+    markdown_output: Optional[Path] = typer.Option(None, "--markdown-output", "--md-output", help="将评估结果保存为Markdown文件。"),
 ):
     """
     在验证集上评估模型的函数检索性能 (Recall@K)，使用本地模型生成嵌入，GPU加速相似度计算。
@@ -785,6 +867,17 @@ def main(
 
     # --- 6. 打印结果 ---
     console.rule("[bold green]评估结果[/bold green]")
+    mrr_values = {
+        cutoff: total_mrr[cutoff][0] / total_mrr[cutoff][1] if total_mrr[cutoff][1] > 0 else 0
+        for cutoff in MRR_CUTOFFS
+    }
+    mrr_pool_values = {
+        pool_size: total_mrr_by_pool[pool_size][0] / total_mrr_by_pool[pool_size][1]
+        if total_mrr_by_pool[pool_size][1] > 0
+        else 0
+        for pool_size in pool_sizes
+    }
+
     table = Table(title="Recall@K 在不同大小的检索池中的表现")
     table.add_column("Pool Size", justify="right", style="cyan")
     for k in k_values:
@@ -795,17 +888,39 @@ def main(
         table.add_row(*row_data)
         
     console.print(table)
-    for cutoff in MRR_CUTOFFS:
-        mrr_value = total_mrr[cutoff][0] / total_mrr[cutoff][1] if total_mrr[cutoff][1] > 0 else 0
+    for cutoff, mrr_value in mrr_values.items():
         console.print(f"[bold green]MRR@{cutoff}: {mrr_value:.4f}[/bold green]")
 
     mrr_pool_table = Table(title="MRR@P 在不同大小检索池中的表现")
     mrr_pool_table.add_column("Pool Size", justify="right", style="cyan")
     mrr_pool_table.add_column("MRR@P", justify="right", style="green")
-    for pool_size in pool_sizes:
-        mrr_p = total_mrr_by_pool[pool_size][0] / total_mrr_by_pool[pool_size][1] if total_mrr_by_pool[pool_size][1] > 0 else 0
+    for pool_size, mrr_p in mrr_pool_values.items():
         mrr_pool_table.add_row(f"{pool_size:,}", f"{mrr_p:.4f}")
     console.print(mrr_pool_table)
+
+    if markdown_output:
+        _write_markdown_report(
+            markdown_output=markdown_output,
+            validation_dataset_pool_path=validation_dataset_pool_path,
+            validation_positive_map_path=validation_positive_map_path,
+            model_path=model_path,
+            k_values=k_values,
+            results=results,
+            mrr_values=mrr_values,
+            mrr_pool_values=mrr_pool_values,
+            anchors_evaluated=len(anchors_to_evaluate),
+            total_pool_size=len(dataset_for_eval),
+            max_length=max_length,
+            batch_size=batch_size,
+            gpu_batch_size=gpu_batch_size,
+            eval_samples=eval_samples,
+            pool_samples=pool_samples,
+            use_gpu=use_gpu,
+            use_cfg=use_cfg,
+            use_ddg=use_ddg,
+            use_bf16=use_bf16,
+        )
+        console.print(f"[green]Markdown结果已保存到: {markdown_output}[/green]")
 
 
 if __name__ == "__main__":

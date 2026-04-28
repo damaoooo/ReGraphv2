@@ -3,6 +3,8 @@ import os
 import copy
 import ast
 import inspect
+from dataclasses import dataclass
+from pathlib import Path
 from .pretrain_model import MoCoPretrainModel, ReFormerPretrainModel
 import pickle
 import torch
@@ -119,6 +121,253 @@ def _apply_cli_overrides(config: PretrainConfig, overrides: Optional[List[str]])
 def _build_config(overrides: Optional[List[str]] = None) -> PretrainConfig:
     config = copy.deepcopy(DEFAULT_CONFIG)
     return _apply_cli_overrides(config, overrides)
+
+
+@dataclass(frozen=True)
+class DatasetBundlePaths:
+    role: str
+    dataset_dir: str
+    pool_path: str
+    idx_path: str
+    map_path: str
+    prefix: str
+    explicit: bool = False
+
+
+def _has_path_value(value: Optional[str]) -> bool:
+    return value is not None and str(value).strip() != ""
+
+
+def _normalize_path(value: str) -> str:
+    return os.path.abspath(os.path.expandvars(os.path.expanduser(str(value))))
+
+
+def _same_path(left: str, right: str) -> bool:
+    return _normalize_path(left) == _normalize_path(right)
+
+
+def _infer_dataset_dir_from_paths(*paths: Optional[str]) -> Optional[str]:
+    for path in paths:
+        if _has_path_value(path):
+            return str(Path(_normalize_path(path)).parent)
+    return None
+
+
+def _bundle_from_dir(
+    dataset_dir: str,
+    prefix: str,
+    role: str,
+    explicit: bool = False,
+    pool_path: Optional[str] = None,
+    idx_path: Optional[str] = None,
+    map_path: Optional[str] = None,
+) -> DatasetBundlePaths:
+    base_dir = _normalize_path(dataset_dir)
+    return DatasetBundlePaths(
+        role=role,
+        dataset_dir=base_dir,
+        pool_path=_normalize_path(pool_path) if _has_path_value(pool_path) else os.path.join(base_dir, f"{prefix}_dataset_pool"),
+        idx_path=_normalize_path(idx_path) if _has_path_value(idx_path) else os.path.join(base_dir, f"{prefix}_task_dataset"),
+        map_path=_normalize_path(map_path) if _has_path_value(map_path) else os.path.join(base_dir, f"{prefix}_positive_map.pkl"),
+        prefix=prefix,
+        explicit=explicit,
+    )
+
+
+def _missing_bundle_paths(bundle: DatasetBundlePaths) -> List[str]:
+    missing = []
+    if not os.path.isdir(bundle.pool_path):
+        missing.append(f"pool={bundle.pool_path}")
+    if not os.path.isdir(bundle.idx_path):
+        missing.append(f"task={bundle.idx_path}")
+    if not os.path.isfile(bundle.map_path):
+        missing.append(f"map={bundle.map_path}")
+    return missing
+
+
+def _resolve_train_bundle(config: PretrainConfig) -> DatasetBundlePaths:
+    dataset_dir = (
+        config.train_dataset_dir
+        or _infer_dataset_dir_from_paths(
+            config.train_dataset_pool_path,
+            config.train_dataset_idx_path,
+            config.train_dataset_map_path,
+        )
+    )
+    if not _has_path_value(dataset_dir):
+        raise typer.BadParameter(
+            "Training dataset is not configured. Set train_dataset_dir, or set all "
+            "train_dataset_pool_path/train_dataset_idx_path/train_dataset_map_path."
+        )
+
+    bundle = _bundle_from_dir(
+        dataset_dir=dataset_dir,
+        prefix="train",
+        role="train",
+        explicit=any(
+            _has_path_value(path)
+            for path in (
+                config.train_dataset_pool_path,
+                config.train_dataset_idx_path,
+                config.train_dataset_map_path,
+            )
+        ),
+        pool_path=config.train_dataset_pool_path,
+        idx_path=config.train_dataset_idx_path,
+        map_path=config.train_dataset_map_path,
+    )
+    missing = _missing_bundle_paths(bundle)
+    if missing:
+        raise FileNotFoundError(
+            "Training dataset bundle is incomplete. Missing: " + ", ".join(missing)
+        )
+    return bundle
+
+
+def _validation_prefixes_for_dir(dataset_dir: str, train_dataset_dir: str) -> List[str]:
+    if _same_path(dataset_dir, train_dataset_dir):
+        return ["validation"]
+    return ["train", "validation"]
+
+
+def _resolve_validation_candidates(
+    config: PretrainConfig,
+    train_bundle: DatasetBundlePaths,
+) -> List[DatasetBundlePaths]:
+    explicit_paths = any(
+        _has_path_value(path)
+        for path in (
+            config.validation_dataset_pool_path,
+            config.validation_dataset_idx_path,
+            config.validation_dataset_map_path,
+        )
+    )
+
+    if explicit_paths:
+        dataset_dir = (
+            config.validation_dataset_dir
+            or _infer_dataset_dir_from_paths(
+                config.validation_dataset_pool_path,
+                config.validation_dataset_idx_path,
+                config.validation_dataset_map_path,
+            )
+        )
+        if not _has_path_value(dataset_dir):
+            raise typer.BadParameter(
+                "Validation dataset paths are partially configured, but no base directory can be inferred."
+            )
+        return [
+            _bundle_from_dir(
+                dataset_dir=dataset_dir,
+                prefix="validation",
+                role="validation",
+                explicit=True,
+                pool_path=config.validation_dataset_pool_path,
+                idx_path=config.validation_dataset_idx_path,
+                map_path=config.validation_dataset_map_path,
+            )
+        ]
+
+    candidate_dirs: List[Tuple[str, bool]] = []
+    if _has_path_value(config.validation_dataset_dir):
+        candidate_dirs.append((_normalize_path(config.validation_dataset_dir), True))
+    else:
+        train_dir = Path(train_bundle.dataset_dir)
+        sibling_validation_dir = train_dir.parent / "validation_final_set"
+        if train_dir.name == "train_final_set" and sibling_validation_dir.exists():
+            candidate_dirs.append((str(sibling_validation_dir), False))
+        candidate_dirs.append((train_bundle.dataset_dir, False))
+
+    candidates: List[DatasetBundlePaths] = []
+    seen = set()
+    for dataset_dir, explicit in candidate_dirs:
+        for prefix in _validation_prefixes_for_dir(dataset_dir, train_bundle.dataset_dir):
+            key = (_normalize_path(dataset_dir), prefix)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                _bundle_from_dir(
+                    dataset_dir=dataset_dir,
+                    prefix=prefix,
+                    role="validation",
+                    explicit=explicit,
+                )
+            )
+    return candidates
+
+
+def _load_dataset_bundle(
+    bundle: DatasetBundlePaths,
+    allow_empty: bool = False,
+) -> Tuple[Any, Any, Dict[int, List[int]]]:
+    dataset_pool = load_dataset(bundle.pool_path)
+    dataset_idx = load_dataset(bundle.idx_path)
+    with open(bundle.map_path, "rb") as f:
+        positive_map = pickle.load(f)
+
+    if not allow_empty:
+        if len(dataset_idx) == 0:
+            raise ValueError(f"{bundle.role} task dataset is empty: {bundle.idx_path}")
+        if len(positive_map) == 0:
+            raise ValueError(f"{bundle.role} positive map is empty: {bundle.map_path}")
+
+    return dataset_pool, dataset_idx, positive_map
+
+
+def _apply_bundle_to_config(config: PretrainConfig, bundle: DatasetBundlePaths) -> None:
+    if bundle.role == "train":
+        config.train_dataset_dir = bundle.dataset_dir
+        config.train_dataset_pool_path = bundle.pool_path
+        config.train_dataset_idx_path = bundle.idx_path
+        config.train_dataset_map_path = bundle.map_path
+    elif bundle.role == "validation":
+        config.validation_dataset_dir = bundle.dataset_dir
+        config.validation_dataset_pool_path = bundle.pool_path
+        config.validation_dataset_idx_path = bundle.idx_path
+        config.validation_dataset_map_path = bundle.map_path
+
+
+def _load_validation_bundle(
+    config: PretrainConfig,
+    train_bundle: DatasetBundlePaths,
+) -> Tuple[Optional[DatasetBundlePaths], Optional[Any], Optional[Any], Optional[Dict[int, List[int]]]]:
+    candidates = _resolve_validation_candidates(config, train_bundle)
+    explicit_validation = any(candidate.explicit for candidate in candidates)
+    last_error: Optional[Exception] = None
+
+    for candidate in candidates:
+        missing = _missing_bundle_paths(candidate)
+        if missing:
+            last_error = FileNotFoundError(", ".join(missing))
+            if candidate.explicit:
+                continue
+            continue
+
+        try:
+            dataset_pool, dataset_idx, positive_map = _load_dataset_bundle(candidate)
+        except ValueError as exc:
+            last_error = exc
+            if candidate.explicit:
+                raise
+            print(f"Skipping empty validation candidate: {candidate.dataset_dir} ({candidate.prefix})")
+            continue
+
+        return candidate, dataset_pool, dataset_idx, positive_map
+
+    if explicit_validation and last_error is not None:
+        raise FileNotFoundError(f"Validation dataset bundle could not be resolved: {last_error}")
+
+    print("No non-empty validation dataset bundle found; training will run without validation.")
+    return None, None, None, None
+
+
+def _add_eval_strategy_arg(train_args_kwargs: Dict[str, Any], eval_strategy: str) -> None:
+    training_args_params = inspect.signature(TrainingArguments.__init__).parameters
+    if "eval_strategy" in training_args_params:
+        train_args_kwargs["eval_strategy"] = eval_strategy
+    else:
+        train_args_kwargs["evaluation_strategy"] = eval_strategy
 
 
 def _resolve_graph_flags_from_legacy_mode(mode: str) -> Tuple[bool, bool]:
@@ -476,23 +725,52 @@ def profile_extreme_seq_len_memory(
 
 def main(config: PretrainConfig = DEFAULT_CONFIG):
     tokenizer = load_tokenizer(config.tokenizer_path)
-    
-    train_dataset_pool = load_dataset(config.train_dataset_pool_path)
-    
-    train_dataset_idx = load_dataset(config.train_dataset_idx_path)
-    
-    with open(config.train_dataset_map_path, 'rb') as f:
-        train_positive_map = pickle.load(f)
-    
+
+    train_bundle = _resolve_train_bundle(config)
+    _apply_bundle_to_config(config, train_bundle)
+    train_dataset_pool, train_dataset_idx, train_positive_map = _load_dataset_bundle(train_bundle)
+    print(
+        "Train dataset bundle: "
+        f"dir={train_bundle.dataset_dir}, prefix={train_bundle.prefix}, "
+        f"anchors={len(train_dataset_idx):,}"
+    )
+
+    validation_dataset_idx = None
+    validation_collator = None
+    if config.do_eval:
+        (
+            validation_bundle,
+            validation_dataset_pool,
+            validation_dataset_idx,
+            validation_positive_map,
+        ) = _load_validation_bundle(config, train_bundle)
+        if validation_bundle is not None:
+            _apply_bundle_to_config(config, validation_bundle)
+            validation_group_id_mapping = compute_group_ids(validation_positive_map)
+            validation_collator = MoCoDataCollator(
+                tokenizer=tokenizer,
+                dataset_pool=validation_dataset_pool,
+                map_file=validation_positive_map,
+                group_id_mapping=validation_group_id_mapping,
+                config=config,
+            )
+            print(
+                "Validation dataset bundle: "
+                f"dir={validation_bundle.dataset_dir}, prefix={validation_bundle.prefix}, "
+                f"anchors={len(validation_dataset_idx):,}"
+            )
+    else:
+        print("Validation disabled by config.do_eval=False.")
+
     group_id_mapping = compute_group_ids(train_positive_map)
-    
+
     # dataset = dataset.remove_columns({
     #     "cfg_graph": "cfg_adj_list",
     #     "ddg_graph": "ddg_adj_list",
     # })
-    my_collator = MoCoDataCollator(
-        tokenizer=tokenizer, 
-        dataset_pool=train_dataset_pool, 
+    train_collator = MoCoDataCollator(
+        tokenizer=tokenizer,
+        dataset_pool=train_dataset_pool,
         map_file=train_positive_map,
         group_id_mapping=group_id_mapping,
         config=config
@@ -533,33 +811,47 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
                             traceback.print_exc(file=f)
                     return None
 
-        my_collator = SafeDataCollator(my_collator, bad_batch_log_path)
+        train_collator = SafeDataCollator(train_collator, bad_batch_log_path)
 
     model_config = _clone_model_config(config, len(tokenizer.get_vocab()))
     model = MoCoPretrainModel(config=model_config)
-    
-    train_args = TrainingArguments(
-        output_dir=output_dir,
-        max_steps=config.max_steps,  # 使用 max_steps 而不是 num_train_epochs
-        per_device_train_batch_size=config.per_device_train_batch_size,
-        fp16=config.fp16,
-        bf16=config.bf16,
-        remove_unused_columns=config.remove_unused_columns,
-        dataloader_num_workers=config.dataloader_num_workers,
-        torch_compile=config.torch_compile,
-        logging_dir=logging_dir,
-        learning_rate=config.learning_rate,
-        warmup_steps=config.warmup_steps,
-        weight_decay=config.weight_decay,
-        optim=config.optim,
-        save_strategy=config.save_strategy,
-        save_steps=config.save_steps,
-        save_total_limit=config.save_total_limit,
-        # save_safetensors=False,
-        logging_strategy=config.logging_strategy,
-        logging_steps=config.logging_steps,
-        report_to=config.report_to,
-    )
+
+    train_args_kwargs = {
+        "output_dir": output_dir,
+        "max_steps": config.max_steps,  # 使用 max_steps 而不是 num_train_epochs
+        "per_device_train_batch_size": config.per_device_train_batch_size,
+        "fp16": config.fp16,
+        "bf16": config.bf16,
+        "remove_unused_columns": config.remove_unused_columns,
+        "dataloader_num_workers": config.dataloader_num_workers,
+        "torch_compile": config.torch_compile,
+        "logging_dir": logging_dir,
+        "learning_rate": config.learning_rate,
+        "warmup_steps": config.warmup_steps,
+        "weight_decay": config.weight_decay,
+        "optim": config.optim,
+        "save_strategy": config.save_strategy,
+        "save_steps": config.save_steps,
+        "save_total_limit": config.save_total_limit,
+        # "save_safetensors": False,
+        "logging_strategy": config.logging_strategy,
+        "logging_steps": config.logging_steps,
+        "report_to": config.report_to,
+    }
+    if validation_dataset_idx is not None:
+        eval_strategy = str(config.eval_strategy)
+        _add_eval_strategy_arg(train_args_kwargs, eval_strategy)
+        train_args_kwargs["do_eval"] = True
+        train_args_kwargs["per_device_eval_batch_size"] = (
+            config.per_device_eval_batch_size or config.per_device_train_batch_size
+        )
+        if eval_strategy.lower() == "steps":
+            train_args_kwargs["eval_steps"] = config.eval_steps or config.save_steps
+    else:
+        _add_eval_strategy_arg(train_args_kwargs, "no")
+        train_args_kwargs["do_eval"] = False
+
+    train_args = TrainingArguments(**train_args_kwargs)
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable()
     else:
@@ -568,8 +860,21 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
     class SafeTrainer(Trainer):
         def __init__(self, *args, **kwargs):
             self.bad_batch_log_path = kwargs.pop("bad_batch_log_path", None)
+            self.eval_data_collator = kwargs.pop("eval_data_collator", None)
             super().__init__(*args, **kwargs)
             self.skipped_steps = 0
+            self.can_return_loss = True
+
+        def get_eval_dataloader(self, eval_dataset=None):
+            if self.eval_data_collator is None:
+                return super().get_eval_dataloader(eval_dataset)
+
+            original_collator = self.data_collator
+            self.data_collator = self.eval_data_collator
+            try:
+                return super().get_eval_dataloader(eval_dataset)
+            finally:
+                self.data_collator = original_collator
 
         def _save(self, output_dir: Optional[str] = None, state_dict=None):
             """Save with torch bin format to avoid safetensors shared-tensor errors."""
@@ -615,10 +920,12 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         model=model,
         args=train_args,
         train_dataset=train_dataset_idx,
-        data_collator=my_collator,
+        eval_dataset=validation_dataset_idx,
+        data_collator=train_collator,
+        eval_data_collator=validation_collator,
         bad_batch_log_path=bad_batch_log_path,
     )
-    
+
     # 根据配置决定是否从检查点恢复
     last_checkpoint = None
     if config.resume_from_checkpoint:
@@ -655,6 +962,10 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
     metrics = train_result.metrics
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
+    if validation_dataset_idx is not None:
+        validation_metrics = trainer.evaluate(metric_key_prefix="validation")
+        trainer.log_metrics("validation", validation_metrics)
+        trainer.save_metrics("validation", validation_metrics)
     trainer.save_state() # 保存Trainer的状态，包括随机种子等
 
 
@@ -724,6 +1035,26 @@ def profile_gpu_mem_command(
 def train_command(
     use_cfg: bool = typer.Option(True, "--cfg/--no-cfg", help="Enable CFG graph branch."),
     use_ddg: bool = typer.Option(True, "--ddg/--no-ddg", help="Enable DDG graph branch."),
+    dataset_dir: Optional[str] = typer.Option(
+        None,
+        "--dataset-dir",
+        "-d",
+        help="Directory containing train_dataset_pool/train_task_dataset/train_positive_map.pkl.",
+    ),
+    validation_dataset_dir: Optional[str] = typer.Option(
+        None,
+        "--validation-dataset-dir",
+        "--val-dataset-dir",
+        help=(
+            "Validation final_set directory. If omitted, the trainer tries a sibling "
+            "validation_final_set, then validation_* files under --dataset-dir."
+        ),
+    ),
+    validation: bool = typer.Option(
+        True,
+        "--validation/--no-validation",
+        help="Enable validation when a validation dataset bundle is available.",
+    ),
     resume: bool = typer.Option(
         False,
         "--resume",
@@ -740,6 +1071,17 @@ def train_command(
 
     config.use_cfg = use_cfg
     config.use_ddg = use_ddg
+    if dataset_dir is not None:
+        config.train_dataset_dir = dataset_dir
+        config.train_dataset_pool_path = None
+        config.train_dataset_idx_path = None
+        config.train_dataset_map_path = None
+    if validation_dataset_dir is not None:
+        config.validation_dataset_dir = validation_dataset_dir
+        config.validation_dataset_pool_path = None
+        config.validation_dataset_idx_path = None
+        config.validation_dataset_map_path = None
+    config.do_eval = validation
     config.resume_from_checkpoint = resume
     if not resume:
         config.resume_checkpoint_path = None

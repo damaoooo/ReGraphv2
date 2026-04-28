@@ -28,9 +28,14 @@ class PretrainConfig(RoFormerConfig):
         max_seq_length: int = 2048,
         # === 路径配置 ===
         tokenizer_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json",
-        train_dataset_pool_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_dataset_pool",
-        train_dataset_idx_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_task_dataset",
-        train_dataset_map_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set/train_positive_map.pkl",
+        train_dataset_dir: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set",
+        train_dataset_pool_path: Optional[str] = None,
+        train_dataset_idx_path: Optional[str] = None,
+        train_dataset_map_path: Optional[str] = None,
+        validation_dataset_dir: Optional[str] = None,
+        validation_dataset_pool_path: Optional[str] = None,
+        validation_dataset_idx_path: Optional[str] = None,
+        validation_dataset_map_path: Optional[str] = None,
         output_dir: str = "./output",
         final_model_dir: str = "./db1_model",
         logging_dir: str = "./logs",
@@ -65,6 +70,11 @@ class PretrainConfig(RoFormerConfig):
         logging_strategy: str = "steps",
         logging_steps: int = 100,
         report_to: str = "tensorboard",
+        # === 验证配置 ===
+        do_eval: bool = True,
+        eval_strategy: str = "steps",
+        eval_steps: Optional[int] = None,
+        per_device_eval_batch_size: Optional[int] = None,
         # === 断点续训配置 ===
         resume_from_checkpoint: bool = True,
         resume_checkpoint_path: Optional[str] = None,
@@ -99,9 +109,14 @@ class PretrainConfig(RoFormerConfig):
 
         # === 路径配置 ===
         self.tokenizer_path = tokenizer_path
+        self.train_dataset_dir = train_dataset_dir
         self.train_dataset_pool_path = train_dataset_pool_path
         self.train_dataset_idx_path = train_dataset_idx_path
         self.train_dataset_map_path = train_dataset_map_path
+        self.validation_dataset_dir = validation_dataset_dir
+        self.validation_dataset_pool_path = validation_dataset_pool_path
+        self.validation_dataset_idx_path = validation_dataset_idx_path
+        self.validation_dataset_map_path = validation_dataset_map_path
         self.output_dir = output_dir
         self.final_model_dir = final_model_dir
         self.logging_dir = logging_dir
@@ -127,7 +142,7 @@ class PretrainConfig(RoFormerConfig):
         self.warmup_steps = warmup_steps
         self.weight_decay = weight_decay
         self.optim = optim
-        
+
         # === MoCo 配置 ===
         self.moco_buffer_size = moco_buffer_size
         self.moco_momentum = moco_momentum
@@ -142,6 +157,12 @@ class PretrainConfig(RoFormerConfig):
         self.logging_strategy = logging_strategy
         self.logging_steps = logging_steps
         self.report_to = report_to
+
+        # === 验证配置 ===
+        self.do_eval = do_eval
+        self.eval_strategy = eval_strategy
+        self.eval_steps = eval_steps
+        self.per_device_eval_batch_size = per_device_eval_batch_size
 
         # === 断点续训配置 ===
         self.resume_from_checkpoint = resume_from_checkpoint
