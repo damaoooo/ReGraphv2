@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO_ROOT="/home/damaoooo/Downloads/regraphv2"
-PYTHON_CMD=${PYTHON_CMD:-"conda run -n ReLL python"}
+PYTHON_CMD=${PYTHON_CMD:-$(which python)}
 
 steps=300000
 max_length=2048
@@ -48,7 +48,7 @@ Options:
   -h, --help             Show this help.
 
 Environment:
-  PYTHON_CMD             Python runner. Default: "conda run -n ReLL python"
+	PYTHON_CMD             Python runner. Default: output of `which python`
 
 Example:
   bash Scripts/train_test_fused_opt.sh O0
