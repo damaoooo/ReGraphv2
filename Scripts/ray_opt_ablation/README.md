@@ -59,11 +59,23 @@ sbatch --nodes=3 Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O3
 
 ```bash
 cd /scratch/zhoul0e/ReGraphv2
-DRIVER_EXTRA_ARGS="--task2-chunk-size 100 --task3-chunk-size 200 --max-parquet-files 5000 --command-timeout-seconds 600" \
-DATASET_PATH=/scratch/zhoul0e/Dataset-1-lift/Dataset-1 \
-OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O3-fused \
-sbatch Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O3
+DRIVER_EXTRA_ARGS="--task3-chunk-size 500 --max-parquet-files 100000 --command-timeout-seconds 28800" \
+DATASET_PATH=/scratch/zhoul0e/Dataset-1 \
+OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O1-fused \
+sbatch --nodes=3 Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O1
 ```
+
+`task2` 默认 `--task2-chunk-size 1`，也就是每个 `.ll` 文件一个 Ray task。`.ll` 输入队列会按相对路径做稳定 hash shuffle，这样慢文件只拖住自己的 task，不会把同一个目录里的 z3/openssl 文件集中压在少数节点或少数时间段里。只有在 Ray task 数过多、调度开销明显时，才建议手动调大。
+
+`--command-timeout-seconds 28800` 表示单条 `clang` / `llvm-nm` / `llvm-extract` / `opt` 命令最多运行 8 小时。设为 `0` 表示不限制单命令超时，但 Slurm 作业本身仍受 `#SBATCH --time` 或提交时 `--time` 限制。
+
+`task2` 失败文件会写入 `manifests/task2_failed.jsonl` 和 `logs/stage_failures/task2.txt`，并在 `logs/run.log` / Slurm stdout 中列出。fused driver 会继续把已成功生成的 `.bc` 交给 task3 和后续阶段；只有 task2 一个可用 `.bc` 都没生成时才会失败退出。
+
+`task3` 的 `--task3-chunk-size` 控制每个 Ray task 串行处理多少个函数。task3 的 `llvm-nm` 函数枚举阶段也会通过 Ray 按 `.bc` 文件并行运行；枚举完成后，会先按 `.bc` 的相对路径做稳定 hash shuffle，再按 `.bc` 文件 round-robin 打散函数，然后切 chunk，避免 z3 这类大程序的函数集中堵在少数 chunk 里。Dataset-1 O1 当前约 1600 万函数，推荐 `--task3-chunk-size 500 --max-parquet-files 100000`：raw parquet 峰值约 3.3 万个，chunk manifest 默认按 worker 聚合并在成功 compact 后删除。不要再用 `--task3-chunk-size 20/50` 跑完整 Dataset-1，文件数峰值太高。
+
+task3 默认使用 `--chunk-manifest-mode worker`，即每个 Ray worker 进程追加自己的 success/failed manifest，而不是每个 chunk 单独生成两个 manifest 文件。成功 compact 后默认执行 `--cleanup-chunk-manifests` 删除 chunk 级 manifest；如果要保留调试文件，可在 driver 上加 `--keep-task3-chunk-manifests`。
+
+task3 的 `llvm-extract` / `opt` 中间 IR、dot 文件默认写到节点本地 `$TMPDIR/task3_<output-name>`，不写到 scratch 的 `task3_fused/.task3_fused_state/tmp`。这是为了避免函数级临时文件触发 scratch 文件数配额；每个 chunk 结束后会清理自己的临时目录。
 
 ### Fused 输出
 

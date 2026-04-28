@@ -10,6 +10,7 @@ import math
 import multiprocessing
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,26 @@ class WorkItem:
         }
 
 
+@dataclass(frozen=True)
+class FunctionWorkItem:
+    split: Optional[str]
+    bc_path: str
+    binary_name: str
+    function_name: str
+    function_index: int
+    function_count: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "split": self.split,
+            "bc_path": self.bc_path,
+            "binary_name": self.binary_name,
+            "function_name": self.function_name,
+            "function_index": self.function_index,
+            "function_count": self.function_count,
+        }
+
+
 def split_key(split: Optional[str]) -> str:
     return split if split else "__default__"
 
@@ -121,6 +142,10 @@ def manifest_dir(output_root: Path) -> Path:
     return output_root / "manifests"
 
 
+def safe_path_token(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
+
+
 def state_root(output_root: Path) -> Path:
     return output_root / STATE_DIRNAME
 
@@ -133,26 +158,67 @@ def chunk_manifest_root(output_root: Path) -> Path:
     return state_root(output_root) / "chunk_manifests"
 
 
+def cleanup_chunk_manifests(output_root: Path) -> None:
+    chunk_root = chunk_manifest_root(output_root)
+    if chunk_root.exists():
+        shutil.rmtree(chunk_root)
+        console.print(f"[green]Removed chunk-level manifests: {chunk_root}[/green]")
+
+    tmp_root = state_root(output_root) / "tmp"
+    if tmp_root.exists():
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
 def final_parquet_root(output_root: Path) -> Path:
     return output_root / "parquet"
 
 
 def load_completed_bc_paths(output_root: Path) -> set[str]:
-    completed: set[str] = set()
-    candidate_files = [
-        manifest_dir(output_root) / "task3_success.jsonl",
-        manifest_dir(output_root) / "task3_no_functions.jsonl",
-    ]
+    success_counts: Dict[str, int] = {}
+    expected_counts: Dict[str, int] = {}
+    failed_paths: set[str] = set()
+    completed_no_functions: set[str] = set()
+
+    success_files = [manifest_dir(output_root) / "task3_success.jsonl"]
+    failed_files = [manifest_dir(output_root) / "task3_failed.jsonl"]
+    no_function_files = [manifest_dir(output_root) / "task3_no_functions.jsonl"]
     chunk_root = chunk_manifest_root(output_root)
     if chunk_root.exists():
-        candidate_files.extend(chunk_root.glob("*_success.jsonl"))
-        candidate_files.extend(chunk_root.glob("*_no_functions.jsonl"))
+        success_files.extend(chunk_root.glob("*_success.jsonl"))
+        failed_files.extend(chunk_root.glob("*_failed.jsonl"))
+        no_function_files.extend(chunk_root.glob("*_no_functions.jsonl"))
 
-    for path in candidate_files:
+    for path in no_function_files:
         for row in jsonl_read(path):
             bc_path = row.get("bc_path")
             if bc_path:
-                completed.add(os.path.abspath(bc_path))
+                completed_no_functions.add(os.path.abspath(bc_path))
+
+    for path in failed_files:
+        for row in jsonl_read(path):
+            bc_path = row.get("bc_path")
+            if bc_path:
+                failed_paths.add(os.path.abspath(bc_path))
+
+    for path in success_files:
+        for row in jsonl_read(path):
+            bc_path = row.get("bc_path")
+            if not bc_path:
+                continue
+            abs_bc_path = os.path.abspath(bc_path)
+            status = row.get("status")
+            function_count = int(row.get("function_count") or 0)
+            if function_count > 0:
+                expected_counts[abs_bc_path] = max(expected_counts.get(abs_bc_path, 0), function_count)
+            if status == "function_success":
+                success_counts[abs_bc_path] = success_counts.get(abs_bc_path, 0) + 1
+            elif status == "success" and int(row.get("function_failed") or 0) == 0:
+                completed_no_functions.add(abs_bc_path)
+
+    completed = set(completed_no_functions)
+    for bc_path, expected in expected_counts.items():
+        if expected > 0 and success_counts.get(bc_path, 0) >= expected and bc_path not in failed_paths:
+            completed.add(bc_path)
     return completed
 
 
@@ -180,7 +246,7 @@ def discover_work_items(input_root: Path) -> List[WorkItem]:
     if split_dirs:
         for split in split_dirs:
             split_root = input_root / split
-            for bc_path in sorted(split_root.rglob("*.bc")):
+            for bc_path in split_root.rglob("*.bc"):
                 binary_name = os.path.splitext(os.path.relpath(bc_path, input_root))[0]
                 items.append(
                     WorkItem(
@@ -189,9 +255,12 @@ def discover_work_items(input_root: Path) -> List[WorkItem]:
                         binary_name=binary_name,
                     )
                 )
-        return items
+        return sorted(
+            items,
+            key=lambda item: hashlib.sha1(item.binary_name.encode("utf-8")).hexdigest(),
+        )
 
-    for bc_path in sorted(input_root.rglob("*.bc")):
+    for bc_path in input_root.rglob("*.bc"):
         binary_name = os.path.splitext(os.path.relpath(bc_path, input_root))[0]
         items.append(
             WorkItem(
@@ -200,7 +269,10 @@ def discover_work_items(input_root: Path) -> List[WorkItem]:
                 binary_name=binary_name,
             )
         )
-    return items
+    return sorted(
+        items,
+        key=lambda item: hashlib.sha1(item.binary_name.encode("utf-8")).hexdigest(),
+    )
 
 
 def group_by_split(items: List[WorkItem]) -> Dict[Optional[str], List[WorkItem]]:
@@ -227,6 +299,340 @@ def choose_chunk_size(total_items: int, requested_chunk_size: int, max_parquet_f
 
 def chunk_items(items: List[WorkItem], chunk_size: int) -> List[List[WorkItem]]:
     return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+def chunk_function_items(items: List[FunctionWorkItem], chunk_size: int) -> List[List[FunctionWorkItem]]:
+    return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+def interleave_function_items_by_bc(items: List[FunctionWorkItem]) -> List[FunctionWorkItem]:
+    """Spread functions from large binaries across chunks to reduce long-tail Ray tasks."""
+    grouped: Dict[str, List[FunctionWorkItem]] = {}
+    for item in items:
+        grouped.setdefault(item.bc_path, []).append(item)
+    if len(grouped) <= 1:
+        return items
+
+    group_entries = sorted(
+        grouped.items(),
+        key=lambda pair: hashlib.sha1(pair[0].encode("utf-8")).hexdigest(),
+    )
+    groups = [group_items for _, group_items in group_entries]
+    interleaved: List[FunctionWorkItem] = []
+    position = 0
+    remaining = len(items)
+    while remaining > 0:
+        progressed = False
+        for group in groups:
+            if position < len(group):
+                interleaved.append(group[position])
+                remaining -= 1
+                progressed = True
+        if not progressed:
+            break
+        position += 1
+    return interleaved
+
+
+def enumerate_function_work_items(
+    items: List[WorkItem],
+    timeout_seconds: int,
+    output_root: Path,
+    progress_summary_interval_s: int,
+    backend: str = "local",
+) -> List[FunctionWorkItem]:
+    if backend == "ray":
+        return enumerate_function_work_items_ray(
+            items=items,
+            timeout_seconds=timeout_seconds,
+            output_root=output_root,
+            progress_summary_interval_s=progress_summary_interval_s,
+        )
+
+    function_items: List[FunctionWorkItem] = []
+    failed_rows: List[Dict[str, Any]] = []
+    no_function_rows: List[Dict[str, Any]] = []
+    chunk_root = chunk_manifest_root(output_root)
+    started = time.time()
+    next_summary = started + max(1, progress_summary_interval_s)
+
+    def emit_summary(completed: int, current_item: Optional[WorkItem], reason: str, force: bool = False) -> None:
+        nonlocal next_summary
+        now = time.time()
+        if not force and now < next_summary:
+            return
+        elapsed = now - started
+        rate = completed / elapsed if elapsed > 0 else 0.0
+        remaining = max(0, len(items) - completed)
+        eta = remaining / rate if rate > 0 else None
+        pct = (100.0 * completed / len(items)) if items else 100.0
+        current = current_item.bc_path if current_item is not None else ""
+        console.print(
+            f"[cyan]Task3 enumerate progress {progress_bar(completed, len(items))} "
+            f"bc={completed}/{len(items)} pct={pct:.1f}% "
+            f"functions={len(function_items)} no_function_bc={len(no_function_rows)} "
+            f"llvm_nm_failed={len(failed_rows)} rate_bc_s={rate:.2f} "
+            f"eta={format_duration(eta)} current={current} reason={reason}[/cyan]"
+        )
+        progress_event(
+            output_root,
+            "enumerate_summary",
+            reason=reason,
+            completed_bc=completed,
+            total_bc=len(items),
+            functions=len(function_items),
+            no_function_bc=len(no_function_rows),
+            llvm_nm_failed=len(failed_rows),
+            rate_bc_s=round(rate, 3),
+            eta_s=round(eta, 3) if eta is not None else None,
+            current_bc=current,
+        )
+        next_summary = now + max(1, progress_summary_interval_s)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("[cyan]{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("[cyan]Enumerating functions", total=len(items))
+        for completed, item in enumerate(items, start=1):
+            row = item.to_dict()
+            try:
+                functions = list_defined_functions(Path(item.bc_path), timeout_seconds)
+            except Exception as exc:
+                failed_rows.append(
+                    {
+                        **row,
+                        "status": "failed",
+                        "stage": "llvm-nm",
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+                progress.update(task, advance=1)
+                emit_summary(completed, item, "bc_complete")
+                continue
+
+            if not functions:
+                no_function_rows.append({**row, "status": "no_functions", "function_count": 0})
+                progress.update(task, advance=1)
+                emit_summary(completed, item, "bc_complete")
+                continue
+
+            function_count = len(functions)
+            for function_index, function_name in enumerate(functions):
+                function_items.append(
+                    FunctionWorkItem(
+                        split=item.split,
+                        bc_path=item.bc_path,
+                        binary_name=item.binary_name,
+                        function_name=function_name,
+                        function_index=function_index,
+                        function_count=function_count,
+                    )
+                )
+            progress.update(task, advance=1)
+            emit_summary(completed, item, "bc_complete")
+
+    jsonl_append(chunk_root / "enumeration_failed.jsonl", failed_rows)
+    jsonl_append(chunk_root / "enumeration_no_functions.jsonl", no_function_rows)
+    emit_summary(len(items), None, "complete", force=True)
+    console.print(
+        f"[cyan]Enumerated {len(function_items)} functions; "
+        f"no_function_bc={len(no_function_rows)} llvm_nm_failed={len(failed_rows)}[/cyan]"
+    )
+    return function_items
+
+
+def enumerate_single_work_item(item: Dict[str, Any], timeout_seconds: int) -> Dict[str, Any]:
+    try:
+        functions = list_defined_functions(Path(item["bc_path"]), timeout_seconds)
+    except Exception as exc:
+        return {
+            "item": item,
+            "status": "failed",
+            "functions": [],
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+    if not functions:
+        return {
+            "item": item,
+            "status": "no_functions",
+            "functions": [],
+        }
+    return {
+        "item": item,
+        "status": "success",
+        "functions": functions,
+    }
+
+
+def add_enumeration_result(
+    result: Dict[str, Any],
+    function_items: List[FunctionWorkItem],
+    failed_rows: List[Dict[str, Any]],
+    no_function_rows: List[Dict[str, Any]],
+) -> int:
+    item = result["item"]
+    status = result.get("status")
+    functions = list(result.get("functions") or [])
+    if status == "failed":
+        failed_rows.append(
+            {
+                **item,
+                "status": "failed",
+                "stage": "llvm-nm",
+                "error": result.get("error", ""),
+                "traceback": result.get("traceback", ""),
+            }
+        )
+        return 0
+    if not functions:
+        no_function_rows.append({**item, "status": "no_functions", "function_count": 0})
+        return 0
+
+    function_count = len(functions)
+    for function_index, function_name in enumerate(functions):
+        function_items.append(
+            FunctionWorkItem(
+                split=item.get("split"),
+                bc_path=item["bc_path"],
+                binary_name=item["binary_name"],
+                function_name=function_name,
+                function_index=function_index,
+                function_count=function_count,
+            )
+        )
+    return function_count
+
+
+def enumerate_function_work_items_ray(
+    items: List[WorkItem],
+    timeout_seconds: int,
+    output_root: Path,
+    progress_summary_interval_s: int,
+) -> List[FunctionWorkItem]:
+    try:
+        import ray
+    except ImportError as exc:
+        raise RuntimeError("Ray backend requested but ray is not installed in this environment") from exc
+
+    address = os.environ.get("RAY_ADDRESS")
+    if address:
+        ray.init(address=address, log_to_driver=False)
+    else:
+        ray.init(log_to_driver=False)
+
+    function_items: List[FunctionWorkItem] = []
+    failed_rows: List[Dict[str, Any]] = []
+    no_function_rows: List[Dict[str, Any]] = []
+    chunk_root = chunk_manifest_root(output_root)
+    started = time.time()
+    next_summary = started + max(1, progress_summary_interval_s)
+    completed = 0
+    cluster_cpus = int(ray.cluster_resources().get("CPU", 0))
+
+    @ray.remote
+    def ray_enumerate_single_work_item(item: Dict[str, Any], worker_timeout_seconds: int) -> Dict[str, Any]:
+        return enumerate_single_work_item(item, worker_timeout_seconds)
+
+    pending = [
+        ray_enumerate_single_work_item.remote(item.to_dict(), timeout_seconds)
+        for item in items
+    ]
+    pending_meta = {
+        ref: {"bc_path": item.bc_path, "start": time.time()}
+        for ref, item in zip(pending, items)
+    }
+
+    def emit_summary(reason: str, force: bool = False) -> None:
+        nonlocal next_summary
+        now = time.time()
+        if not force and now < next_summary:
+            return
+        elapsed = now - started
+        rate = completed / elapsed if elapsed > 0 else 0.0
+        remaining = max(0, len(items) - completed)
+        eta = remaining / rate if rate > 0 else None
+        oldest = max((now - meta["start"] for meta in pending_meta.values()), default=0.0)
+        pct = (100.0 * completed / len(items)) if items else 100.0
+        console.print(
+            f"[cyan]Task3 enumerate progress {progress_bar(completed, len(items))} "
+            f"bc={completed}/{len(items)} pct={pct:.1f}% "
+            f"functions={len(function_items)} no_function_bc={len(no_function_rows)} "
+            f"llvm_nm_failed={len(failed_rows)} pending={len(pending)} "
+            f"rate_bc_s={rate:.2f} eta={format_duration(eta)} "
+            f"oldest_pending={format_duration(oldest)} reason={reason}[/cyan]"
+        )
+        progress_event(
+            output_root,
+            "enumerate_summary",
+            reason=reason,
+            completed_bc=completed,
+            total_bc=len(items),
+            functions=len(function_items),
+            no_function_bc=len(no_function_rows),
+            llvm_nm_failed=len(failed_rows),
+            pending_bc=len(pending),
+            rate_bc_s=round(rate, 3),
+            eta_s=round(eta, 3) if eta is not None else None,
+            oldest_pending_s=round(oldest, 3),
+            cluster_cpus=cluster_cpus,
+        )
+        next_summary = now + max(1, progress_summary_interval_s)
+
+    progress_event(output_root, "enumerate_ray_start", bc_files=len(items), cluster_cpus=cluster_cpus)
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("[cyan]{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("[cyan]Enumerating functions on Ray", total=len(items))
+            while pending:
+                ready, pending = ray.wait(pending, num_returns=1, timeout=min(5, max(1, progress_summary_interval_s)))
+                if not ready:
+                    emit_summary("wait_timeout")
+                    continue
+                for ref in ready:
+                    pending_meta.pop(ref, None)
+                    try:
+                        result = ray.get(ref)
+                        add_enumeration_result(result, function_items, failed_rows, no_function_rows)
+                    except Exception as exc:
+                        failed_rows.append(
+                            {
+                                "status": "failed",
+                                "stage": "llvm-nm-ray",
+                                "error": str(exc),
+                                "traceback": traceback.format_exc(),
+                            }
+                        )
+                    completed += 1
+                    progress.update(task, advance=1)
+                    emit_summary("bc_complete")
+    finally:
+        ray.shutdown()
+
+    jsonl_append(chunk_root / "enumeration_failed.jsonl", failed_rows)
+    jsonl_append(chunk_root / "enumeration_no_functions.jsonl", no_function_rows)
+    emit_summary("complete", force=True)
+    console.print(
+        f"[cyan]Enumerated {len(function_items)} functions; "
+        f"no_function_bc={len(no_function_rows)} llvm_nm_failed={len(failed_rows)}[/cyan]"
+    )
+    return function_items
 
 
 def run_command(command: List[str], cwd: Optional[Path] = None, timeout_seconds: int = 0) -> subprocess.CompletedProcess[str]:
@@ -454,7 +860,7 @@ def write_records_to_parquet(records: List[Dict[str, Any]], path: Path) -> None:
     os.replace(tmp_path, path)
 
 
-def process_bc_chunk(chunk_id: str, items: List[Dict[str, Any]], context: Dict[str, Any]) -> Dict[str, Any]:
+def process_function_chunk(chunk_id: str, items: List[Dict[str, Any]], context: Dict[str, Any]) -> Dict[str, Any]:
     start = time.time()
     repo_root = context["repo_root"]
     if repo_root not in sys.path:
@@ -484,74 +890,35 @@ def process_bc_chunk(chunk_id: str, items: List[Dict[str, Any]], context: Dict[s
     records: List[Dict[str, Any]] = []
     success_rows: List[Dict[str, Any]] = []
     failed_rows: List[Dict[str, Any]] = []
-    no_function_rows: List[Dict[str, Any]] = []
 
     try:
         for item in items:
             bc_path = item["bc_path"]
+            function_name = item["function_name"]
+            function_index = int(item["function_index"])
             try:
-                functions = list_defined_functions(Path(bc_path), timeout_seconds)
+                record = build_function_record(
+                    item=item,
+                    function_name=function_name,
+                    function_index=function_index,
+                    tokenizer=tokenizer,
+                    max_seq_length=max_seq_length,
+                    timeout_seconds=timeout_seconds,
+                    temp_root=chunk_temp_root / hashlib.sha1(bc_path.encode("utf-8")).hexdigest()[:16],
+                )
+                records.append(record)
+                success_rows.append({**item, "status": "function_success", "chunk_id": chunk_id})
             except Exception as exc:
                 failed_rows.append(
                     {
                         **item,
-                        "status": "failed",
-                        "stage": "llvm-nm",
+                        "status": "function_failed",
+                        "stage": "function",
+                        "chunk_id": chunk_id,
                         "error": str(exc),
                         "traceback": traceback.format_exc(),
                     }
                 )
-                continue
-
-            if not functions:
-                no_function_rows.append(
-                    {
-                        **item,
-                        "status": "no_functions",
-                        "function_count": 0,
-                    }
-                )
-                continue
-
-            function_success = 0
-            function_failed = 0
-            for function_index, function_name in enumerate(functions):
-                try:
-                    record = build_function_record(
-                        item=item,
-                        function_name=function_name,
-                        function_index=function_index,
-                        tokenizer=tokenizer,
-                        max_seq_length=max_seq_length,
-                        timeout_seconds=timeout_seconds,
-                        temp_root=chunk_temp_root / hashlib.sha1(bc_path.encode("utf-8")).hexdigest()[:16],
-                    )
-                    records.append(record)
-                    function_success += 1
-                except Exception as exc:
-                    function_failed += 1
-                    failed_rows.append(
-                        {
-                            **item,
-                            "status": "function_failed",
-                            "function_name": function_name,
-                            "function_index": function_index,
-                            "stage": "function",
-                            "error": str(exc),
-                            "traceback": traceback.format_exc(),
-                        }
-                    )
-
-            bc_row = {
-                **item,
-                "function_count": len(functions),
-                "function_success": function_success,
-                "function_failed": function_failed,
-            }
-            if function_success > 0:
-                success_rows.append({**bc_row, "status": "success"})
-            else:
-                failed_rows.append({**bc_row, "status": "bc_failed", "error": "no function records succeeded"})
 
         raw_shard_path = None
         if records:
@@ -560,25 +927,31 @@ def process_bc_chunk(chunk_id: str, items: List[Dict[str, Any]], context: Dict[s
             for row in success_rows:
                 row["raw_shard"] = str(raw_shard_path)
 
-        success_manifest = chunk_manifest_dir / f"{chunk_id}_success.jsonl"
-        failed_manifest = chunk_manifest_dir / f"{chunk_id}_failed.jsonl"
-        no_functions_manifest = chunk_manifest_dir / f"{chunk_id}_no_functions.jsonl"
+        manifest_mode = str(context.get("chunk_manifest_mode") or "worker")
+        if manifest_mode == "chunk":
+            manifest_stem = chunk_id
+        elif manifest_mode == "worker":
+            run_id = safe_path_token(str(context.get("run_id") or "run"))
+            hostname = safe_path_token(socket.gethostname())
+            manifest_stem = f"worker_{run_id}_{hostname}_{os.getpid()}"
+        else:
+            raise RuntimeError(f"Unsupported chunk manifest mode: {manifest_mode}")
+
+        success_manifest = chunk_manifest_dir / f"{manifest_stem}_success.jsonl"
+        failed_manifest = chunk_manifest_dir / f"{manifest_stem}_failed.jsonl"
         jsonl_append(success_manifest, success_rows)
         jsonl_append(failed_manifest, failed_rows)
-        jsonl_append(no_functions_manifest, no_function_rows)
 
         return {
             "chunk_id": chunk_id,
             "split": split,
-            "items": len(items),
+            "functions": len(items),
             "records": len(records),
-            "success_bc": len(success_rows),
+            "success_functions": len(success_rows),
             "failed_entries": len(failed_rows),
-            "no_function_bc": len(no_function_rows),
             "raw_shard": str(raw_shard_path) if raw_shard_path else None,
             "success_manifest": str(success_manifest) if success_rows else None,
             "failed_manifest": str(failed_manifest) if failed_rows else None,
-            "no_functions_manifest": str(no_functions_manifest) if no_function_rows else None,
             "elapsed_seconds": time.time() - start,
         }
     finally:
@@ -766,7 +1139,7 @@ def compact_all_splits(
         raise RuntimeError(f"Compaction failed for {len(compaction_failed)} split(s)")
 
 
-def run_local_backend(chunks: List[tuple[str, List[WorkItem]]], context: Dict[str, Any], workers: int) -> List[Dict[str, Any]]:
+def run_local_backend(chunks: List[tuple[str, List[FunctionWorkItem]]], context: Dict[str, Any], workers: int) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     with Progress(
         SpinnerColumn(),
@@ -778,11 +1151,11 @@ def run_local_backend(chunks: List[tuple[str, List[WorkItem]]], context: Dict[st
         TimeRemainingColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("[cyan]Processing bc chunks", total=len(chunks))
+        task = progress.add_task("[cyan]Processing function chunks", total=len(chunks))
 
         if workers <= 1:
             for chunk_id, chunk_items_list in chunks:
-                result = process_bc_chunk(chunk_id, [item.to_dict() for item in chunk_items_list], context)
+                result = process_function_chunk(chunk_id, [item.to_dict() for item in chunk_items_list], context)
                 results.append(result)
                 progress.update(task, advance=1)
             return results
@@ -790,7 +1163,7 @@ def run_local_backend(chunks: List[tuple[str, List[WorkItem]]], context: Dict[st
         with ProcessPoolExecutor(max_workers=workers) as executor:
             future_to_chunk = {
                 executor.submit(
-                    process_bc_chunk,
+                    process_function_chunk,
                     chunk_id,
                     [item.to_dict() for item in chunk_items_list],
                     context,
@@ -815,7 +1188,34 @@ def run_local_backend(chunks: List[tuple[str, List[WorkItem]]], context: Dict[st
     return results
 
 
-def run_ray_backend(chunks: List[tuple[str, List[WorkItem]]], context: Dict[str, Any]) -> List[Dict[str, Any]]:
+def progress_event(output_root: Path, event: str, **payload: Any) -> None:
+    jsonl_append(
+        manifest_dir(output_root) / "task3_progress.jsonl",
+        [{"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event, **payload}],
+    )
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None or not math.isfinite(seconds):
+        return "unknown"
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes:d}m{secs:02d}s"
+    return f"{secs:d}s"
+
+
+def progress_bar(completed: int, total: int, width: int = 28) -> str:
+    if total <= 0:
+        return "[" + "-" * width + "]"
+    filled = min(width, max(0, int(width * completed / total)))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def run_ray_backend(chunks: List[tuple[str, List[FunctionWorkItem]]], context: Dict[str, Any]) -> List[Dict[str, Any]]:
     try:
         import ray
     except ImportError as exc:
@@ -832,14 +1232,95 @@ def run_ray_backend(chunks: List[tuple[str, List[WorkItem]]], context: Dict[str,
         console.print(f"[green]Ray cluster CPUs: {cluster_cpus}[/green]")
 
         @ray.remote
-        def ray_process_bc_chunk(chunk_id: str, chunk_items_list: List[Dict[str, Any]], worker_context: Dict[str, Any]):
-            return process_bc_chunk(chunk_id, chunk_items_list, worker_context)
+        def ray_process_function_chunk(chunk_id: str, chunk_items_list: List[Dict[str, Any]], worker_context: Dict[str, Any]):
+            return process_function_chunk(chunk_id, chunk_items_list, worker_context)
 
-        pending = [
-            ray_process_bc_chunk.remote(chunk_id, [item.to_dict() for item in chunk_items_list], context)
-            for chunk_id, chunk_items_list in chunks
-        ]
+        output_root = Path(context["output_root"])
+        pending: List[Any] = []
+        pending_meta: Dict[Any, Dict[str, Any]] = {}
         results: List[Dict[str, Any]] = []
+        completed = 0
+        completed_functions = 0
+        completed_records = 0
+        failed_entries = 0
+        total_functions = sum(len(chunk_items_list) for _, chunk_items_list in chunks)
+        total_chunks = len(chunks)
+        configured_max_in_flight = int(context.get("ray_max_in_flight_chunks") or 0)
+        if configured_max_in_flight > 0:
+            max_in_flight = configured_max_in_flight
+        else:
+            max_in_flight = max(1024, cluster_cpus * 4 if cluster_cpus > 0 else 1024)
+        max_in_flight = max(1, min(total_chunks, max_in_flight))
+        next_chunk_index = 0
+        run_started = time.time()
+        summary_interval_s = max(1, int(context.get("progress_summary_interval_s", 30)))
+        wait_timeout_s = min(5, summary_interval_s)
+        next_summary = run_started + summary_interval_s
+
+        def submit_until_full() -> None:
+            nonlocal next_chunk_index
+            while next_chunk_index < total_chunks and len(pending) < max_in_flight:
+                chunk_id, chunk_items_list = chunks[next_chunk_index]
+                ref = ray_process_function_chunk.remote(
+                    chunk_id,
+                    [item.to_dict() for item in chunk_items_list],
+                    context,
+                )
+                pending.append(ref)
+                pending_meta[ref] = {
+                    "chunk_id": chunk_id,
+                    "functions": len(chunk_items_list),
+                    "start": time.time(),
+                }
+                next_chunk_index += 1
+
+        submit_until_full()
+        progress_event(
+            output_root,
+            "ray_start",
+            chunks=len(chunks),
+            functions=total_functions,
+            cluster_cpus=cluster_cpus,
+            max_in_flight=max_in_flight,
+        )
+
+        def emit_summary(reason: str, force: bool = False) -> None:
+            nonlocal next_summary
+            now = time.time()
+            if not force and now < next_summary:
+                return
+            elapsed = now - run_started
+            rate = completed_functions / elapsed if elapsed > 0 else 0.0
+            remaining = max(0, total_functions - completed_functions)
+            eta = remaining / rate if rate > 0 else None
+            oldest = max((now - meta["start"] for meta in pending_meta.values()), default=0.0)
+            pct = (100.0 * completed_functions / total_functions) if total_functions else 100.0
+            console.print(
+                f"[cyan]Task3 Ray progress {progress_bar(completed_functions, total_functions)} "
+                f"functions={completed_functions}/{total_functions} pct={pct:.1f}% "
+                f"records={completed_records} failed={failed_entries} "
+                f"chunks={completed}/{total_chunks} submitted={next_chunk_index} "
+                f"in_flight={len(pending)} "
+                f"rate_functions_s={rate:.2f} eta={format_duration(eta)} "
+                f"oldest_pending={format_duration(oldest)} reason={reason}[/cyan]"
+            )
+            progress_event(
+                output_root,
+                "ray_summary",
+                reason=reason,
+                completed_chunks=completed,
+                total_chunks=total_chunks,
+                submitted_chunks=next_chunk_index,
+                pending_chunks=len(pending),
+                completed_functions=completed_functions,
+                total_functions=total_functions,
+                records=completed_records,
+                failed_entries=failed_entries,
+                rate_functions_s=round(rate, 3),
+                eta_s=round(eta, 3) if eta is not None else None,
+                oldest_pending_s=round(oldest, 3),
+            )
+            next_summary = now + summary_interval_s
 
         with Progress(
             SpinnerColumn(),
@@ -851,25 +1332,55 @@ def run_ray_backend(chunks: List[tuple[str, List[WorkItem]]], context: Dict[str,
             TimeRemainingColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task("[cyan]Processing bc chunks on Ray", total=len(pending))
+            task = progress.add_task("[cyan]Processing function chunks on Ray", total=total_chunks)
             while pending:
-                ready, pending = ray.wait(pending, num_returns=1, timeout=30)
+                ready, pending = ray.wait(pending, num_returns=1, timeout=wait_timeout_s)
                 if not ready:
-                    console.print(f"[yellow]Ray pending chunks: {len(pending)}[/yellow]")
+                    oldest = max((time.time() - meta["start"] for meta in pending_meta.values()), default=0)
+                    progress_event(
+                        output_root,
+                        "ray_pending",
+                        completed_chunks=completed,
+                        submitted_chunks=next_chunk_index,
+                        pending_chunks=len(pending),
+                        unsubmitted_chunks=total_chunks - next_chunk_index,
+                        oldest_age_s=round(oldest, 1),
+                    )
+                    emit_summary("wait_timeout")
                     continue
                 for ref in ready:
+                    meta = pending_meta.pop(ref, {"chunk_id": None, "functions": 0, "start": time.time()})
                     try:
-                        results.append(ray.get(ref))
+                        result = ray.get(ref)
+                        results.append(result)
+                        completed_functions += int(result.get("functions") or 0)
+                        completed_records += int(result.get("records") or 0)
+                        failed_entries += int(result.get("failed_entries") or 0)
+                        progress_event(
+                            output_root,
+                            "ray_chunk_complete",
+                            chunk_id=result.get("chunk_id"),
+                            functions=result.get("functions"),
+                            records=result.get("records"),
+                            failed_entries=result.get("failed_entries"),
+                            elapsed_seconds=round(float(result.get("elapsed_seconds") or 0), 3),
+                        )
                     except Exception as exc:
                         error_row = {
+                            "chunk_id": meta.get("chunk_id"),
                             "status": "chunk_failed",
                             "error": str(exc),
                             "traceback": traceback.format_exc(),
                         }
                         jsonl_append(manifest_dir(Path(context["output_root"])) / "task3_failed.jsonl", [error_row])
                         console.print(f"[red]Ray chunk failed: {exc}[/red]")
+                        progress_event(output_root, "ray_chunk_failed", chunk_id=meta.get("chunk_id"), error=repr(exc))
                     finally:
+                        completed += 1
                         progress.update(task, advance=1)
+                        submit_until_full()
+                        emit_summary("chunk_complete")
+        emit_summary("complete", force=True)
         return results
     finally:
         ray.shutdown()
@@ -895,8 +1406,24 @@ def main(
         "--max-parquet-files",
         help="Upper budget for raw plus final parquet files",
     ),
-    chunk_size: int = typer.Option(0, "--chunk-size", help="Number of .bc files per chunk; 0 chooses from file budget"),
+    chunk_size: int = typer.Option(0, "--chunk-size", help="Number of functions per Ray/local chunk; 0 chooses from file budget"),
+    chunk_manifest_mode: str = typer.Option(
+        "worker",
+        "--chunk-manifest-mode",
+        help="Chunk manifest layout: worker writes one manifest per worker process; chunk writes one manifest per chunk",
+    ),
+    cleanup_chunk_manifest_files: bool = typer.Option(
+        True,
+        "--cleanup-chunk-manifests/--keep-chunk-manifests",
+        help="Remove chunk-level manifest files after they have been collected and compaction succeeds",
+    ),
+    ray_max_in_flight_chunks: int = typer.Option(
+        0,
+        "--ray-max-in-flight-chunks",
+        help="Maximum Ray chunk tasks submitted at once; 0 chooses about 4x cluster CPUs with a floor of 1024",
+    ),
     command_timeout_seconds: int = typer.Option(0, "--command-timeout-seconds", help="Per LLVM/opt command timeout; 0 disables timeout"),
+    progress_summary_interval_s: int = typer.Option(30, "--progress-summary-interval-s", help="Emit Slurm-friendly text progress every N seconds"),
 ):
     """Run fused Task 3."""
     normalized_backend = backend.lower()
@@ -906,9 +1433,20 @@ def main(
         raise typer.BadParameter("--max-seq-length must be greater than 1")
     if max_parquet_files < 2:
         raise typer.BadParameter("--max-parquet-files must be at least 2")
+    normalized_chunk_manifest_mode = chunk_manifest_mode.lower()
+    if normalized_chunk_manifest_mode not in {"worker", "chunk"}:
+        raise typer.BadParameter("--chunk-manifest-mode must be either worker or chunk")
+    if ray_max_in_flight_chunks < 0:
+        raise typer.BadParameter("--ray-max-in-flight-chunks must be non-negative")
 
     input_root = Path(input_path).resolve()
     output_root = Path(output).resolve()
+    task_tmp_base = Path(
+        os.environ.get("REGRAPH_TASK3_TMPDIR")
+        or os.environ.get("TMPDIR")
+        or tempfile.gettempdir()
+    )
+    task_tmp_root = task_tmp_base / f"task3_{safe_path_token(output_root.name)}"
     if not input_root.exists() or not input_root.is_dir():
         console.print(f"[red]Input directory not found: {input_root}[/red]")
         raise typer.Exit(code=1)
@@ -923,6 +1461,11 @@ def main(
     console.print(f"[green]Tokenizer: {tokenizer_path}[/green]")
     console.print(f"[green]Max seq length: {max_seq_length}[/green]")
     console.print(f"[green]Max parquet files: {max_parquet_files}[/green]")
+    console.print(
+        f"[green]Chunk manifest mode: {normalized_chunk_manifest_mode}; "
+        f"cleanup={int(cleanup_chunk_manifest_files)}[/green]"
+    )
+    console.print(f"[green]Task temp root: {task_tmp_root}[/green]")
 
     all_items = discover_work_items(input_root)
     all_splits = list(group_by_split(all_items).keys()) or [None]
@@ -942,16 +1485,62 @@ def main(
             target_shard_size_bytes=target_shard_size_bytes,
             max_parquet_files=max_parquet_files,
         )
+        if cleanup_chunk_manifest_files:
+            cleanup_chunk_manifests(output_root)
         return
 
-    grouped = group_by_split(items)
-    chunks: List[tuple[str, List[WorkItem]]] = []
-    for split, split_items in grouped.items():
-        split_chunk_size = choose_chunk_size(len(split_items), chunk_size, max_parquet_files)
-        console.print(
-            f"[cyan]Split={split_label(split)} files={len(split_items)} chunk_size={split_chunk_size}[/cyan]"
+    function_items = enumerate_function_work_items(
+        items,
+        command_timeout_seconds,
+        output_root,
+        progress_summary_interval_s,
+        normalized_backend,
+    )
+    collect_chunk_manifests(output_root)
+    if not function_items:
+        console.print("[yellow]No functions to process[/yellow]")
+        compact_all_splits(
+            output_root=output_root,
+            splits=all_splits,
+            target_shard_size_bytes=target_shard_size_bytes,
+            max_parquet_files=max_parquet_files,
         )
-        for index, chunk in enumerate(chunk_items(split_items, split_chunk_size)):
+        if cleanup_chunk_manifest_files:
+            cleanup_chunk_manifests(output_root)
+        return
+
+    grouped_functions: Dict[Optional[str], List[FunctionWorkItem]] = {}
+    for item in function_items:
+        grouped_functions.setdefault(item.split, []).append(item)
+
+    chunks: List[tuple[str, List[FunctionWorkItem]]] = []
+    active_splits = list(grouped_functions.items())
+    raw_shard_budget = max(1, max_parquet_files // 2)
+    if len(active_splits) > raw_shard_budget:
+        console.print(
+            f"[red]Active split count {len(active_splits)} exceeds raw shard budget {raw_shard_budget}[/red]"
+        )
+        raise typer.Exit(code=1)
+    remaining_raw_budget = raw_shard_budget
+    total_functions = len(function_items)
+
+    for split_index, (split, split_items) in enumerate(active_splits):
+        active_remaining = len(active_splits) - split_index
+        if active_remaining == 1:
+            split_raw_budget = remaining_raw_budget
+        else:
+            proportional = max(1, math.floor(raw_shard_budget * len(split_items) / total_functions))
+            split_raw_budget = min(proportional, remaining_raw_budget - active_remaining + 1)
+        remaining_raw_budget -= split_raw_budget
+
+        split_items = interleave_function_items_by_bc(split_items)
+        split_chunk_size = choose_chunk_size(len(split_items), chunk_size, split_raw_budget * 2)
+        console.print(
+            f"[cyan]Split={split_label(split)} functions={len(split_items)} "
+            f"chunk_size={split_chunk_size} raw_shard_budget={split_raw_budget} "
+            f"interleave_by_bc=1[/cyan]"
+        )
+        for index, chunk in enumerate(chunk_function_items(split_items, split_chunk_size)):
             chunks.append((safe_chunk_id(split, index), chunk))
 
     if len(chunks) > max_parquet_files // 2:
@@ -959,18 +1548,28 @@ def main(
             f"[red]Planned raw shard count {len(chunks)} exceeds raw shard budget {max_parquet_files // 2}[/red]"
         )
         raise typer.Exit(code=1)
+    estimated_manifest_files = "worker processes" if normalized_chunk_manifest_mode == "worker" else str(len(chunks) * 2)
+    console.print(
+        f"[cyan]Planned task3 chunks={len(chunks)} raw_parquet_peak={len(chunks)} "
+        f"chunk_manifest_files={estimated_manifest_files} "
+        f"ray_max_in_flight={ray_max_in_flight_chunks or 'auto'}[/cyan]"
+    )
 
     context = {
         "repo_root": str(REPO_ROOT),
         "output_root": str(output_root),
         "raw_shard_root": str(raw_shard_root(output_root)),
         "chunk_manifest_root": str(chunk_manifest_root(output_root)),
-        "temp_root": str(state_root(output_root) / "tmp"),
+        "temp_root": str(task_tmp_root),
         "debug_root": str(state_root(output_root) / "debug"),
         "tokenizer_path": tokenizer_path,
         "max_seq_length": max_seq_length,
         "timeout_seconds": command_timeout_seconds,
         "debug": debug,
+        "progress_summary_interval_s": progress_summary_interval_s,
+        "chunk_manifest_mode": normalized_chunk_manifest_mode,
+        "ray_max_in_flight_chunks": ray_max_in_flight_chunks,
+        "run_id": f"{int(time.time())}_{os.getpid()}",
     }
 
     run_started = time.time()
@@ -985,10 +1584,12 @@ def main(
 
     compact_all_splits(
         output_root=output_root,
-        splits=grouped.keys(),
+        splits=grouped_functions.keys(),
         target_shard_size_bytes=target_shard_size_bytes,
         max_parquet_files=max_parquet_files,
     )
+    if cleanup_chunk_manifest_files:
+        cleanup_chunk_manifests(output_root)
 
     final_shard_count = sum(1 for _ in final_parquet_root(output_root).glob("**/*.parquet"))
     raw_shard_count_after = sum(1 for _ in raw_shard_root(output_root).glob("**/*.parquet"))

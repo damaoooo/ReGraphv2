@@ -198,6 +198,31 @@ if [ ! -f "${DRIVER}" ]; then
     exit 1
 fi
 
+required_pass_libs=(
+    "${REPO_ROOT}/GraphBuilder/meta_remover/build/libStripAllMetadataPass.so"
+    "${REPO_ROOT}/GraphBuilder/cfg_exporter/build/libMyCFGPrinterPass.so"
+    "${REPO_ROOT}/GraphBuilder/ddg_exporter/build/libDDGPrinter.so"
+)
+missing_pass_lib=0
+for pass_lib in "${required_pass_libs[@]}"; do
+    if [ ! -f "${pass_lib}" ]; then
+        missing_pass_lib=1
+        log "missing GraphBuilder pass library: ${pass_lib}"
+    fi
+done
+if [ "${missing_pass_lib}" -eq 1 ]; then
+    log "building GraphBuilder LLVM pass libraries inside container"
+    singularity exec --bind "${BIND_ROOT}" "${IMAGE}" /bin/bash -lc "
+set -euo pipefail
+cd '${REPO_ROOT}'
+for d in GraphBuilder/meta_remover GraphBuilder/cfg_exporter GraphBuilder/ddg_exporter; do
+    echo \"[build-pass] \${d}\"
+    cmake -S \"\${d}\" -B \"\${d}/build\" -G Ninja -DLLVM_DIR=\$(llvm-config --cmakedir)
+    cmake --build \"\${d}/build\" -j 8
+done
+"
+fi
+
 nodes=$(scontrol show hostnames "${SLURM_JOB_NODELIST}")
 readarray -t nodes_array <<<"${nodes}"
 EXPECTED_NODES="${#nodes_array[@]}"
