@@ -7,7 +7,7 @@ PYTHON_CMD=${PYTHON_CMD:-$(which python)}
 
 steps=300000
 max_length=2048
-eval_steps=1000
+eval_steps=30000
 save_steps=1000
 batch_size=16
 gpu_batch_size=256
@@ -35,7 +35,7 @@ What it does:
 Options:
   --steps N              Max training steps. Default: 300000
   --max-length N         Train/eval max sequence length. Default: 2048
-  --eval-steps N         Validation loss interval. Default: 1000
+  --eval-steps N         Validation loss interval. Default: 30000
   --save-steps N         Checkpoint save interval. Default: 1000
   --batch-size N         Evaluation embedding batch size. Default: 16
   --gpu-batch-size N     Evaluation similarity GPU batch size. Default: 256

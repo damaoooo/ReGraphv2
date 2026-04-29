@@ -876,6 +876,42 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
             finally:
                 self.data_collator = original_collator
 
+        def _init_training_state(
+            self,
+            max_steps,
+            num_update_steps_per_epoch,
+            num_train_epochs,
+            resume_from_checkpoint,
+            trial,
+        ):
+            result = super()._init_training_state(
+                max_steps,
+                num_update_steps_per_epoch,
+                num_train_epochs,
+                resume_from_checkpoint,
+                trial,
+            )
+
+            old_steps = {
+                "logging_steps": self.state.logging_steps,
+                "eval_steps": self.state.eval_steps,
+                "save_steps": self.state.save_steps,
+            }
+            self.state.compute_steps(self.args, max_steps)
+            new_steps = {
+                "logging_steps": self.state.logging_steps,
+                "eval_steps": self.state.eval_steps,
+                "save_steps": self.state.save_steps,
+            }
+
+            if resume_from_checkpoint is not None and old_steps != new_steps:
+                print(
+                    "Checkpoint trainer_state step intervals were overridden by current args: "
+                    f"{old_steps} -> {new_steps}"
+                )
+
+            return result
+
         def _save(self, output_dir: Optional[str] = None, state_dict=None):
             """Save with torch bin format to avoid safetensors shared-tensor errors."""
             output_dir = output_dir if output_dir is not None else self.args.output_dir
