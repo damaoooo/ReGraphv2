@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Task 1: Lift binary files to LLVM IR using IDA idalib or the legacy .i64 two-step flow
+Task 1: Lift binary files to LLVM IR using IDA Pro (Two-step process)
 
 Step 1: Use IDA Pro to generate .i64 database files from binary files
 Step 2: Use ida2llvm.py to convert .i64 files to LLVM IR
 
-By default this runs ida2llvm.py directly on input binaries. The legacy .i64 flow is still available with --two-step.
+Both steps use parallel processing with separate progress bars for efficiency.
 """
 import os
 import typer
@@ -21,58 +21,31 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from utils import console, ensure_directory, file_exists_and_not_empty
+from ida2llvm import lift_binary_to_llvm
 
 # Configuration
-BINARY_PATH = os.environ.get("REGRAPH_BINARY_ROOT", "/scratch/zhoul0e")
-DEFAULT_INPUT_NAME = os.environ.get("REGRAPH_TASK1_DEFAULT_INPUT", "Dataset-1")
-IDA_PATH = os.environ.get("IDA_PATH", os.environ.get("IDADIR", "/scratch/zhoul0e/ida-pro-9.3"))
-DEFAULT_RELL_PYTHON = "/scratch/zhoul0e/miniconda3/envs/ReLL/bin/python"
-RELL_PYTHON = os.environ.get(
-    "REGRAPH_RELL_PYTHON",
-    DEFAULT_RELL_PYTHON if os.path.exists(DEFAULT_RELL_PYTHON) else sys.executable,
-)
-IDA_HOME = os.environ.get("REGRAPH_IDA_HOME", "/scratch/zhoul0e")
-TASK1_DEFAULT_WORKERS = int(os.environ.get("REGRAPH_TASK1_WORKERS", "16"))
-TASK1_TIMEOUT_SECONDS = int(os.environ.get("REGRAPH_TASK1_TIMEOUT_SECONDS", "600"))
-ALLOW_FAILURES_DEFAULT = os.environ.get("REGRAPH_TASK1_ALLOW_FAILURES", "0").lower() in {"1", "true", "yes", "on"}
+BINARY_PATH = "/home/damaoooo/Downloads/regraphv2/Binaries"
+IDA_PATH = "/home/damaoooo/ida-pro-9.3"  # Update this path to your IDA Pro installation
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lift_task1_log.txt")
-FAILED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lift_task1_failed_files.txt")
-SKIP_INPUT_SUFFIXES = (
-    ".i64", ".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm",
-    ".ll", ".bc", ".c", ".cpp", ".h", ".hpp", ".txt", ".log", ".md", ".py", ".sh",
-)
 
 app = typer.Typer()
-
-
-def build_ida_env() -> dict:
-    env = os.environ.copy()
-    env["HOME"] = IDA_HOME
-    env.setdefault("IDADIR", IDA_PATH)
-    return env
-
-
-def is_candidate_binary(filename: str) -> bool:
-    if filename.startswith("."):
-        return False
-    return not filename.endswith(SKIP_INPUT_SUFFIXES)
 
 def generate_i64(binary_path: str) -> tuple:
     """
     Generate the .i64 file for a given binary file using IDA Pro
-    
+
     :param binary_path: Path to the binary file
     :return: (success, binary_path) tuple
     """
     command_line = [
         os.path.join(IDA_PATH, "idat"),
-        "-A", 
+        "-A",
         "-B",
         binary_path
     ]
     success = False
     try:
-        result = subprocess.run(command_line, capture_output=True, text=True, env=build_ida_env())
+        result = subprocess.run(command_line, capture_output=True, text=True)
         if result.returncode == 0:
             success = True
             # Check if .i64 file was actually created
@@ -98,7 +71,7 @@ def generate_i64(binary_path: str) -> tuple:
             log_file.write("=" * 60 + "\n")
             log_file.write(f"Exception generating .i64 for: {binary_path}\n")
             log_file.write(f"Error: {str(e)}\n")
-    
+
     return (success, binary_path)
 
 
@@ -112,7 +85,11 @@ def lift_single_file(input_binary: str, output_llvm: str) -> tuple:
     """
     ida2llvm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ida2llvm.py")
     cmd = [
-        RELL_PYTHON,
+        "conda",
+        "run",
+        "-n",
+        "ReLL",
+        "python",
         ida2llvm_path,
         "-f",
         input_binary,
@@ -120,75 +97,45 @@ def lift_single_file(input_binary: str, output_llvm: str) -> tuple:
         output_llvm,
         "-v",
     ]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=build_ida_env(),
-            timeout=TASK1_TIMEOUT_SECONDS,
-        )
-        success = result.returncode == 0 and file_exists_and_not_empty(output_llvm)
-        if (not success) or result.stdout or result.stderr:
-            with open(LOG_PATH, "a") as log_file:
-                print("=" * 60, file=log_file)
-                print(f"Command output for: {input_binary}", file=log_file)
-                print(f"Return code: {result.returncode}", file=log_file)
-                if result.returncode < 0:
-                    print(f"Signal: {-result.returncode}", file=log_file)
-                if result.stdout:
-                    print("--- stdout ---", file=log_file)
-                    log_file.write(result.stdout)
-                if result.stderr:
-                    print("--- stderr ---", file=log_file)
-                    log_file.write(result.stderr)
-    except subprocess.TimeoutExpired as exc:
-        success = False
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    success = result.returncode == 0
+    if result.stdout or result.stderr:
         with open(LOG_PATH, "a") as log_file:
-            print("=" * 60, file=log_file)
-            print(f"Timeout lifting: {input_binary}", file=log_file)
-            print(f"Timeout seconds: {TASK1_TIMEOUT_SECONDS}", file=log_file)
-            if exc.stdout:
-                print("--- stdout ---", file=log_file)
-                log_file.write(exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode(errors="replace"))
-            if exc.stderr:
-                print("--- stderr ---", file=log_file)
-                log_file.write(exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode(errors="replace"))
-    if not success and os.path.exists(output_llvm):
-        try:
-            os.remove(output_llvm)
-        except OSError:
-            pass
+            log_file.write("=" * 60 + "\n")
+            log_file.write(f"Command output for: {input_binary}\n")
+            log_file.write(f"Return code: {result.returncode}\n")
+            if result.stdout:
+                log_file.write("--- stdout ---\n")
+                log_file.write(result.stdout)
+                if not result.stdout.endswith("\n"):
+                    log_file.write("\n")
+            if result.stderr:
+                log_file.write("--- stderr ---\n")
+                log_file.write(result.stderr)
+                if not result.stderr.endswith("\n"):
+                    log_file.write("\n")
     return (success, input_binary)
 
 @app.command()
 def main(
     input_path: str = typer.Option("", help="Input directory (defaults to DataProcess-1)"),
     output: str = typer.Option(..., help="Output directory"),
-    workers: int = typer.Option(TASK1_DEFAULT_WORKERS, help="Number of worker processes"),
-    timeout_seconds: int = typer.Option(TASK1_TIMEOUT_SECONDS, help="Per-file ida2llvm timeout in seconds"),
-    allow_failures: bool = typer.Option(ALLOW_FAILURES_DEFAULT, help="Exit 0 after recording failed files"),
+    workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
     resume: bool = typer.Option(False, help="Resume from previous run, skip existing files"),
     start_from_step2: bool = typer.Option(
         False,
         help="Start directly from Step 2 (scan .i64 and lift), skip Step 1 .i64 generation",
     ),
-    ida_path: str = typer.Option("", help="Path to IDA Pro installation"),
-    direct_ida2llvm: bool = typer.Option(
-        True,
-        "--direct-ida2llvm/--two-step",
-        help="Directly run ida2llvm.py on input binaries. Use --two-step for the old .i64 workflow.",
-    ),
 ):
     """
-    Lift binary files to LLVM IR using ida2llvm.py by default.
-    
+    Lift binary files to LLVM IR using IDA Pro (Two-step process).
+
     Step 1: Generate .i64 files from binary files using IDA Pro
     Step 2: Convert .i64 files to LLVM IR format using ida2llvm
-    
+
     This command scans the input directory for binary files, first generates
     .i64 database files using IDA Pro, then converts each .i64 file to LLVM IR.
-    
+
     Features:
     - Two-stage processing with separate progress bars
     - Parallel processing (configurable number of workers) for both stages
@@ -197,12 +144,6 @@ def main(
     - Detailed logging of all failures to lift_task1_log.txt
     - Automatic cleanup of failed IDA temporary files
     """
-    
-    global IDA_PATH
-    if ida_path:
-        IDA_PATH = ida_path
-    if start_from_step2:
-        direct_ida2llvm = False
 
     # Setup logging
     logging.basicConfig(
@@ -213,15 +154,14 @@ def main(
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     logger = logging.getLogger(__name__)
-    
+
     # Log session start
     separator = "="*60
     logger.info(separator)
     logger.info(f"Task 1 started at {datetime.now()}")
-    logger.info(f"Workers: {workers}, Resume: {resume}, StartFromStep2: {start_from_step2}, DirectIda2llvm: {direct_ida2llvm}")
-    logger.info(f"IDA_PATH: {IDA_PATH}, IDA_HOME: {IDA_HOME}, Python: {RELL_PYTHON}")
+    logger.info(f"Workers: {workers}, Resume: {resume}, StartFromStep2: {start_from_step2}")
     logger.info(separator)
-    
+
     # Determine input path
     if input_path:
         db = os.path.basename(input_path.rstrip("/"))
@@ -230,185 +170,170 @@ def main(
             console.print(f"[red]Error: Input path {db_path} does not exist.[/red]")
             raise typer.Exit(code=1)
     else:
-        db = DEFAULT_INPUT_NAME
+        db = "DataProcess-1"
         db_path = os.path.join(BINARY_PATH, db)
         if not os.path.exists(db_path):
-            console.print(f"[red]Error: default input path {db_path} does not exist.[/red]")
+            console.print(f"[red]Error: DataProcess-1 path {db_path} does not exist.[/red]")
             raise typer.Exit(code=1)
 
     output_path = os.path.join(output, db)
     ensure_directory(output_path)
-    
+
     console.print(f"[bold cyan]═══════════════════════════════════════[/bold cyan]")
     console.print(f"[bold cyan]Task 1: Binary to LLVM IR Lifting[/bold cyan]")
     console.print(f"[bold cyan]═══════════════════════════════════════[/bold cyan]")
     console.print(f"[green]Input:  {db_path}[/green]")
     console.print(f"[green]Output: {output_path}[/green]")
     console.print(f"[green]Workers: {workers}[/green]")
-    console.print(f"[green]Mode: {'direct ida2llvm' if direct_ida2llvm else 'two-step .i64'}[/green]")
-    console.print(f"[green]IDA path: {IDA_PATH}[/green]")
-    console.print(f"[green]IDA HOME: {IDA_HOME}[/green]")
-    console.print(f"[green]Python: {RELL_PYTHON}[/green]")
     console.print(f"[green]Log file: {LOG_PATH}[/green]")
     if resume:
         console.print(f"[yellow]Resume mode: skipping existing lifted files[/yellow]")
     if start_from_step2:
         console.print(f"[yellow]Start from Step 2: skipping .i64 generation[/yellow]")
     console.print()
-    
+
     logger.info(f"Input path: {db_path}")
     logger.info(f"Output path: {output_path}")
 
     # Step 1: Generate .i64 files from binaries (optional)
+    if not start_from_step2:
+        console.print("[bold blue]Step 1: Scanning for binary files to generate .i64...[/bold blue]")
+
+        # Clean any failed IDA files first
+        files_to_remove = []
+        for root, dirs, files in os.walk(db_path):
+            for file in files:
+                if file.endswith((".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm")):
+                    files_to_remove.append(os.path.join(root, file))
+        for f in files_to_remove:
+            try:
+                os.remove(f)
+                logger.info(f"Removed failed IDA file: {f}")
+            except Exception as e:
+                logger.warning(f"Could not remove {f}: {str(e)}")
+
+        # Scan for binary files (non-IDA files) that need .i64 generation
+        i64_tasks = []
+        i64_skipped_count = 0
+
+        for root, dirs, files in os.walk(db_path):
+            for file in files:
+                # Skip IDA database files and other temporary files
+                if file.endswith((".i64", ".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm", ".ll", ".bc", ".c", ".cpp", ".h", ".hpp")):
+                    continue
+
+                # Skip hidden files and common non-binary files
+                if file.startswith(".") or file.endswith((".txt", ".log", ".md", ".py", ".sh")):
+                    continue
+
+                file_path = os.path.join(root, file)
+                i64_path = file_path + ".i64"
+
+                # Always skip if .i64 already exists
+                if file_exists_and_not_empty(i64_path):
+                    i64_skipped_count += 1
+                    continue
+
+                i64_tasks.append(file_path)
+
+        if i64_skipped_count > 0:
+            console.print(f"[yellow]Skipping {i64_skipped_count} binaries with existing .i64 files[/yellow]")
+
+        total_i64_tasks = len(i64_tasks)
+        if total_i64_tasks > 0:
+            console.print(f"[bold blue]Found {total_i64_tasks} binary files to process[/bold blue]")
+            console.print()
+
+            logger.info(f"Found {total_i64_tasks} binary files for .i64 generation")
+            if i64_skipped_count > 0:
+                logger.info(f"Skipping {i64_skipped_count} binaries with existing .i64 files")
+
+            # Generate .i64 files in parallel
+            i64_success_count = 0
+            i64_failed_count = 0
+            i64_failed_files = []
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TextColumn("[{task.completed}/{task.total}]"),
+                TimeElapsedColumn(),
+                console=console
+            ) as progress:
+                i64_task = progress.add_task(
+                    "[cyan]Generating .i64 files using IDA Pro",
+                    total=total_i64_tasks
+                )
+
+                with ProcessPoolExecutor(max_workers=workers) as executor:
+                    # Submit all i64 generation tasks
+                    future_to_binary = {
+                        executor.submit(generate_i64, binary_path): binary_path
+                        for binary_path in i64_tasks
+                    }
+
+                    # Process completed tasks as they finish
+                    for future in as_completed(future_to_binary):
+                        binary_path = future_to_binary[future]
+                        try:
+                            success, _ = future.result()
+                            if success:
+                                i64_success_count += 1
+                                logger.debug(f"Successfully generated .i64: {binary_path}")
+                            else:
+                                i64_failed_count += 1
+                                i64_failed_files.append(binary_path)
+                                console.print(f"[red]✗ Failed: {os.path.basename(binary_path)}[/red]")
+                                logger.error(f"Failed to generate .i64: {binary_path}")
+                        except Exception as exc:
+                            i64_failed_count += 1
+                            i64_failed_files.append(binary_path)
+                            error_msg = f"Exception for {binary_path}: {str(exc)}"
+                            console.print(f"[red]✗ Exception: {os.path.basename(binary_path)} - {str(exc)[:100]}[/red]")
+                            logger.error(error_msg)
+                            logger.error(f"Traceback:\n{traceback.format_exc()}")
+                        finally:
+                            progress.update(i64_task, advance=1)
+
+            console.print()
+            console.print(f"[bold cyan]Step 1 Summary:[/bold cyan]")
+            console.print(f"[bold green]✓ .i64 files generated: {i64_success_count}[/bold green]")
+            if i64_failed_count > 0:
+                console.print(f"[bold red]✗ Failed: {i64_failed_count}[/bold red]")
+            console.print()
+
+            logger.info(f"Step 1 Summary: Success={i64_success_count}, Failed={i64_failed_count}")
+        else:
+            console.print(f"[yellow]No binary files need .i64 generation (skipped: {i64_skipped_count})[/yellow]")
+            console.print()
+    else:
+        console.print("[bold blue]Step 1: Skipped .i64 generation[/bold blue]")
+        console.print()
+
+    console.print("[bold blue]Step 2: Scanning for .i64 files to lift to LLVM IR...[/bold blue]")
     lift_tasks = []
     skipped_count = 0
 
-    if direct_ida2llvm:
-        console.print("[bold blue]Step 1: Skipped .i64 generation (direct ida2llvm mode)[/bold blue]")
-        console.print()
-        console.print("[bold blue]Step 2: Scanning binary files to lift directly to LLVM IR...[/bold blue]")
+    for root, dirs, files in os.walk(db_path):
+        for file in files:
+            # Only process .i64 files
+            if not file.endswith(".i64"):
+                continue
 
-        for root, dirs, files in os.walk(db_path):
-            for file in files:
-                if not is_candidate_binary(file):
-                    continue
+            file_path = os.path.join(root, file)
+            relative_path = os.path.relpath(root, db_path)
+            output_dir = os.path.join(output_path, relative_path)
+            ensure_directory(output_dir)
+            output_file_path = os.path.join(output_dir, file.replace(".i64", "")) + ".ll"
 
-                file_path = os.path.join(root, file)
-                relative_path = os.path.relpath(root, db_path)
-                output_dir = os.path.join(output_path, relative_path)
-                ensure_directory(output_dir)
-                output_file_path = os.path.join(output_dir, file) + ".ll"
+            # Check if file already exists and we're resuming
+            if resume and file_exists_and_not_empty(output_file_path):
+                skipped_count += 1
+                continue
 
-                if resume and file_exists_and_not_empty(output_file_path):
-                    skipped_count += 1
-                    continue
-
-                lift_tasks.append((file_path, output_file_path))
-    else:
-        if not start_from_step2:
-            console.print("[bold blue]Step 1: Scanning for binary files to generate .i64...[/bold blue]")
-
-            # Clean any failed IDA files first
-            files_to_remove = []
-            for root, dirs, files in os.walk(db_path):
-                for file in files:
-                    if file.endswith((".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm")):
-                        files_to_remove.append(os.path.join(root, file))
-            for f in files_to_remove:
-                try:
-                    os.remove(f)
-                    logger.info(f"Removed failed IDA file: {f}")
-                except Exception as e:
-                    logger.warning(f"Could not remove {f}: {str(e)}")
-
-            # Scan for binary files that need .i64 generation
-            i64_tasks = []
-            i64_skipped_count = 0
-
-            for root, dirs, files in os.walk(db_path):
-                for file in files:
-                    if not is_candidate_binary(file):
-                        continue
-
-                    file_path = os.path.join(root, file)
-                    i64_path = file_path + ".i64"
-
-                    if file_exists_and_not_empty(i64_path):
-                        i64_skipped_count += 1
-                        continue
-
-                    i64_tasks.append(file_path)
-
-            if i64_skipped_count > 0:
-                console.print(f"[yellow]Skipping {i64_skipped_count} binaries with existing .i64 files[/yellow]")
-
-            total_i64_tasks = len(i64_tasks)
-            if total_i64_tasks > 0:
-                console.print(f"[bold blue]Found {total_i64_tasks} binary files to process[/bold blue]")
-                console.print()
-
-                logger.info(f"Found {total_i64_tasks} binary files for .i64 generation")
-                if i64_skipped_count > 0:
-                    logger.info(f"Skipping {i64_skipped_count} binaries with existing .i64 files")
-
-                i64_success_count = 0
-                i64_failed_count = 0
-                i64_failed_files = []
-
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    BarColumn(),
-                    TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                    TextColumn("[{task.completed}/{task.total}]"),
-                    TimeElapsedColumn(),
-                    console=console
-                ) as progress:
-                    i64_task = progress.add_task(
-                        "[cyan]Generating .i64 files using IDA Pro",
-                        total=total_i64_tasks
-                    )
-
-                    with ProcessPoolExecutor(max_workers=workers) as executor:
-                        future_to_binary = {
-                            executor.submit(generate_i64, binary_path): binary_path
-                            for binary_path in i64_tasks
-                        }
-
-                        for future in as_completed(future_to_binary):
-                            binary_path = future_to_binary[future]
-                            try:
-                                success, _ = future.result()
-                                if success:
-                                    i64_success_count += 1
-                                    logger.debug(f"Successfully generated .i64: {binary_path}")
-                                else:
-                                    i64_failed_count += 1
-                                    i64_failed_files.append(binary_path)
-                                    console.print(f"[red]✗ Failed: {os.path.basename(binary_path)}[/red]")
-                                    logger.error(f"Failed to generate .i64: {binary_path}")
-                            except Exception as exc:
-                                i64_failed_count += 1
-                                i64_failed_files.append(binary_path)
-                                error_msg = f"Exception for {binary_path}: {str(exc)}"
-                                console.print(f"[red]✗ Exception: {os.path.basename(binary_path)} - {str(exc)[:100]}[/red]")
-                                logger.error(error_msg)
-                                logger.error(f"Traceback:\n{traceback.format_exc()}")
-                            finally:
-                                progress.update(i64_task, advance=1)
-
-                console.print()
-                console.print(f"[bold cyan]Step 1 Summary:[/bold cyan]")
-                console.print(f"[bold green]✓ .i64 files generated: {i64_success_count}[/bold green]")
-                if i64_failed_count > 0:
-                    console.print(f"[bold red]✗ Failed: {i64_failed_count}[/bold red]")
-                console.print()
-
-                logger.info(f"Step 1 Summary: Success={i64_success_count}, Failed={i64_failed_count}")
-            else:
-                console.print(f"[yellow]No binary files need .i64 generation (skipped: {i64_skipped_count})[/yellow]")
-                console.print()
-        else:
-            console.print("[bold blue]Step 1: Skipped .i64 generation[/bold blue]")
-            console.print()
-
-        console.print("[bold blue]Step 2: Scanning for .i64 files to lift to LLVM IR...[/bold blue]")
-        for root, dirs, files in os.walk(db_path):
-            for file in files:
-                if not file.endswith(".i64"):
-                    continue
-
-                file_path = os.path.join(root, file)
-                relative_path = os.path.relpath(root, db_path)
-                output_dir = os.path.join(output_path, relative_path)
-                ensure_directory(output_dir)
-                output_file_path = os.path.join(output_dir, file.replace(".i64", "")) + ".ll"
-
-                if resume and file_exists_and_not_empty(output_file_path):
-                    skipped_count += 1
-                    continue
-
-                lift_tasks.append((file_path, output_file_path))
+            lift_tasks.append((file_path, output_file_path))
 
     if resume and skipped_count > 0:
         console.print(f"[yellow]Skipping {skipped_count} already lifted files[/yellow]")
@@ -420,7 +345,7 @@ def main(
 
     console.print(f"[bold blue]Found {total_tasks} files to lift[/bold blue]")
     console.print()
-    
+
     logger.info(f"Found {total_tasks} files to lift")
     if resume and skipped_count > 0:
         logger.info(f"Skipping {skipped_count} already lifted files")
@@ -429,7 +354,7 @@ def main(
     success_count = 0
     failed_count = 0
     failed_files = []
-    
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -440,17 +365,17 @@ def main(
         console=console
     ) as progress:
         lift_task = progress.add_task(
-            "[cyan]Lifting binary files to LLVM IR", 
+            "[cyan]Lifting binary files to LLVM IR",
             total=total_tasks
         )
-        
+
         with ProcessPoolExecutor(max_workers=workers) as executor:
             # Submit all tasks
             future_to_task = {
                 executor.submit(lift_single_file, input_bin, output_llvm): (input_bin, output_llvm)
                 for input_bin, output_llvm in lift_tasks
             }
-        
+
             # Process completed tasks as they finish
             for future in as_completed(future_to_task):
                 input_bin, output_llvm = future_to_task[future]
@@ -492,30 +417,24 @@ def main(
     else:
         console.print(f"[bold green]All files lifted successfully![/bold green]")
     console.print()
-    
+
     # Log summary
     logger.info(separator)
     logger.info(f"Task 1 Final Summary:")
     logger.info(f"  LLVM IR Success: {success_count}")
     logger.info(f"  Lift Failed:  {failed_count}")
     if failed_count > 0:
-        with open(FAILED_PATH, "w") as failed_log:
-            for f in failed_files:
-                print(f, file=failed_log)
-        console.print(f"[yellow]Failed file list: {FAILED_PATH}[/yellow]")
         logger.info(f"Failed files:")
         for f in failed_files:
             logger.info(f"    - {f}")
     logger.info(f"Task 1 completed at {datetime.now()}")
     logger.info(separator)
-    
+
     console.print(f"[cyan]Detailed logs: {LOG_PATH}[/cyan]")
-    
-    if failed_count > 0 and not allow_failures:
+
+    if failed_count > 0:
         console.print("[yellow]To retry failed files, run with the same output directory[/yellow]")
         raise typer.Exit(code=1)
-    if failed_count > 0:
-        console.print("[yellow]Continuing with exit code 0 because --allow-failures is enabled[/yellow]")
     return True
 
 if __name__ == "__main__":
