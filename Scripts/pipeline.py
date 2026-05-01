@@ -63,11 +63,17 @@ def task2(
         "--opt-level",
         help="clang optimization level for Task 2, e.g. O0, O1, O2, O3, Os, Oz",
     ),
+    arch: str = typer.Option(
+        "auto",
+        "--arch",
+        help="Target bitness for Task 2 clang: auto, m32, or m64",
+    ),
 ):
     """Run Task 2: Re-optimize LLVM IR files"""
     normalized_opt_level = normalize_clang_opt_level(opt_level)
     args = ["--input-path", input_path, "--workers", str(workers)]
     args.extend(["--opt-level", normalized_opt_level])
+    args.extend(["--arch", arch])
     if resume:
         args.append("--resume")
     
@@ -101,9 +107,15 @@ def task4(
     input_path: str = typer.Option(..., help="Input directory containing .bc files"),
     workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
     resume: bool = typer.Option(False, help="Resume from previous run"),
+    arch: str = typer.Option(
+        "auto",
+        "--arch",
+        help="Target bitness for Task 4 clang: auto, m32, or m64",
+    ),
 ):
     """Run Task 4: Recompile optimized .bc files to .re artifacts"""
     args = ["--input-path", input_path, "--workers", str(workers)]
+    args.extend(["--arch", arch])
     if resume:
         args.append("--resume")
 
@@ -136,6 +148,11 @@ def pipeline(
         "--opt-level",
         help="clang optimization level for Task 2, e.g. O0, O1, O2, O3, Os, Oz",
     ),
+    arch: str = typer.Option(
+        "auto",
+        "--arch",
+        help="Target bitness for Task 2 clang: auto, m32, or m64",
+    ),
 ):
     """Run the complete pipeline or start from a specific task"""
     normalized_opt_level = normalize_clang_opt_level(opt_level)
@@ -161,6 +178,7 @@ def pipeline(
     console.print(f"[green]Input: {actual_input_path}[/green]")
     console.print(f"[green]Output: {final_output_path}[/green]")
     console.print(f"[green]Task 2 opt level: {normalized_opt_level}[/green]")
+    console.print(f"[green]Task 2 arch mode: {arch}[/green]")
 
     # Task 1: Lift binary files to LLVM IR
     if start_from <= 1:
@@ -190,6 +208,7 @@ def pipeline(
         
         args = ["--input-path", final_output_path, "--workers", str(workers)]
         args.extend(["--opt-level", normalized_opt_level])
+        args.extend(["--arch", arch])
         if resume:
             args.append("--resume")
         
@@ -204,6 +223,7 @@ def pipeline(
         console.print("[bold blue]=" * 60 + "[/bold blue]")
         
         args = ["--input-path", final_output_path, "--workers", str(workers)]
+        args.extend(["--arch", arch])
         if resume:
             args.append("--resume")
         

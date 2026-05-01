@@ -4,6 +4,7 @@ Task 2: Re-optimize LLVM IR files using clang
 """
 import sys
 import os
+import re
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import typer
@@ -20,28 +21,127 @@ from utils import (
 
 app = typer.Typer()
 TASK2_STATE_DIRNAME = ".task2_reoptimize_state"
+TASK2_CLANG_REOPT_FLAGS = (
+    "-fno-inline",
+    "-fno-inline-functions",
+    "-fno-pic",
+    "-fno-pie",
+)
+TASK2_CONFIG_TOKEN = "noinline_noinlinefunc_nopic_nopie"
+ARCH_TO_CLANG_FLAG = {
+    "m32": "-m32",
+    "m64": "-m64",
+}
+ARCH_PATH_PATTERNS = (
+    (
+        re.compile(
+            r"(^|[\\/_.-])(x86[-_]?64|x64|amd64|arm[-_]?64|aarch64|mips[-_]?64)(?=$|[\\/_.-])"
+        ),
+        "m64",
+    ),
+    (
+        re.compile(
+            r"(^|[\\/_.-])(x86[-_]?32|i386|i686|x86|arm[-_]?32|mips[-_]?32)(?=$|[\\/_.-])"
+        ),
+        "m32",
+    ),
+)
 
 
-def opt_level_state_token(opt_level: str) -> str:
-    return opt_level.lstrip("-").replace(os.sep, "_")
+def normalize_arch_mode(arch: str) -> str:
+    value = arch.strip().lower()
+    aliases = {
+        "32": "m32",
+        "64": "m64",
+        "x86": "m32",
+        "i386": "m32",
+        "i686": "m32",
+        "x64": "m64",
+        "x86_64": "m64",
+        "amd64": "m64",
+    }
+    value = aliases.get(value, value)
+    if value not in ("auto", "m32", "m64"):
+        raise typer.BadParameter("arch must be one of: auto, m32, m64")
+    return value
 
 
-def marker_path_for_output(input_root: str, output_path: str, opt_level: str) -> str:
+def _detect_arch_from_text(text: str) -> str | None:
+    normalized = text.lower()
+    for pattern, arch in ARCH_PATH_PATTERNS:
+        if pattern.search(normalized):
+            return arch
+    return None
+
+
+def detect_arch_from_path(file_path: str) -> str | None:
+    return _detect_arch_from_text(os.path.basename(file_path)) or _detect_arch_from_text(file_path)
+
+
+def detect_arch_from_ir_header(file_path: str) -> str | None:
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
+            header = handle.read(65536).lower()
+    except OSError:
+        return None
+
+    if re.search(r'target\s+datalayout\s*=\s*"[^"]*[-_]p:32:32', header):
+        return "m32"
+    if re.search(r'target\s+datalayout\s*=\s*"[^"]*[-_]p:64:64', header):
+        return "m64"
+
+    triple_match = re.search(r'target\s+triple\s*=\s*"([^"]+)"', header)
+    if not triple_match:
+        return None
+
+    triple = triple_match.group(1)
+    if triple == "x86_64-unknown-linux-gnu":
+        return None
+    if re.search(r"(x86_64|amd64|aarch64|arm64|mips64)", triple):
+        return "m64"
+    if re.search(r"(^|[-_])(i386|i486|i586|i686|arm|thumb|mips)([-_]|$)", triple):
+        return "m32"
+    return None
+
+
+def resolve_arch(file_path: str, arch_mode: str) -> str | None:
+    if arch_mode != "auto":
+        return arch_mode
+    return detect_arch_from_path(file_path) or detect_arch_from_ir_header(file_path)
+
+
+def opt_level_state_token(opt_level: str, arch: str) -> str:
+    opt_token = opt_level.lstrip("-").replace(os.sep, "_")
+    return f"{opt_token}_{arch}_{TASK2_CONFIG_TOKEN}"
+
+
+def marker_path_for_output(input_root: str, output_path: str, opt_level: str, arch: str) -> str:
     relative_output_path = os.path.relpath(output_path, input_root)
     return os.path.join(
         input_root,
         TASK2_STATE_DIRNAME,
-        opt_level_state_token(opt_level),
+        opt_level_state_token(opt_level, arch),
         relative_output_path + ".done",
     )
 
 
-def reoptimize_file(file_path: str, output_path: str, opt_level: str, marker_path: str):
+def reoptimize_file(file_path: str, output_path: str, opt_level: str, arch: str, marker_path: str):
     """Re-optimize a single LLVM IR file using clang"""
     if os.path.exists(marker_path):
         os.remove(marker_path)
 
-    command = ["clang", "-m32", opt_level, "-c", "-emit-llvm", "-fno-inline", "-fno-inline-functions", file_path, "-o", output_path]
+    arch_flag = ARCH_TO_CLANG_FLAG[arch]
+    command = [
+        "clang",
+        arch_flag,
+        opt_level,
+        "-c",
+        "-emit-llvm",
+        *TASK2_CLANG_REOPT_FLAGS,
+        file_path,
+        "-o",
+        output_path,
+    ]
     success, stdout, stderr = run_command(command, f"Re-optimizing {file_path} with {opt_level}")
 
     if success and not file_exists_and_not_empty(output_path):
@@ -50,7 +150,10 @@ def reoptimize_file(file_path: str, output_path: str, opt_level: str, marker_pat
     if success:
         ensure_directory(os.path.dirname(marker_path))
         with open(marker_path, "w", encoding="utf-8") as handle:
-            handle.write(f"{opt_level}\n")
+            handle.write(f"opt_level={opt_level}\n")
+            handle.write(f"arch={arch}\n")
+            handle.write(f"arch_flag={arch_flag}\n")
+            handle.write(f"flags={' '.join(TASK2_CLANG_REOPT_FLAGS)}\n")
 
     return success, stdout, stderr
 
@@ -68,11 +171,17 @@ def main(
         "--opt-level",
         help="clang optimization level for Task 2, e.g. O0, O1, O2, O3, Os, Oz",
     ),
+    arch: str = typer.Option(
+        "auto",
+        "--arch",
+        help="Target bitness for clang: auto, m32, or m64. auto infers from dataset-style file names.",
+    ),
 ):
     """Re-optimize LLVM IR files using clang"""
 
     normalized_input_path = os.path.abspath(input_path)
     normalized_opt_level = normalize_clang_opt_level(opt_level)
+    normalized_arch = normalize_arch_mode(arch)
 
     if not os.path.exists(normalized_input_path):
         console.print(f"[red]Error: Input path {normalized_input_path} does not exist.[/red]")
@@ -80,12 +189,16 @@ def main(
 
     console.print(f"[green]Processing directory: {normalized_input_path}[/green]")
     console.print(f"[green]Task 2 opt level: {normalized_opt_level}[/green]")
+    console.print(f"[green]Task 2 arch mode: {normalized_arch}[/green]")
+    console.print(f"[green]Task 2 clang flags: {'/'.join(ARCH_TO_CLANG_FLAG.values())} {' '.join(TASK2_CLANG_REOPT_FLAGS)}[/green]")
 
     # Prepare re-optimization commands
     console.print("[bold blue]Preparing re-optimization tasks...[/bold blue]")
     reopt_commands = []
     skipped_reopt = 0
     rerun_existing = 0
+    arch_counts = {"m32": 0, "m64": 0}
+    unknown_arch_files = []
 
     for root, dirs, files in os.walk(normalized_input_path):
         if TASK2_STATE_DIRNAME in dirs:
@@ -98,11 +211,18 @@ def main(
         for file in files:
             if file.endswith(".ll"):
                 file_path = os.path.join(root, file)
+                resolved_arch = resolve_arch(file_path, normalized_arch)
+                if resolved_arch is None:
+                    unknown_arch_files.append(file_path)
+                    continue
+
+                arch_counts[resolved_arch] += 1
                 output_file_path = os.path.splitext(file_path)[0] + ".bc"
                 marker_path = marker_path_for_output(
                     normalized_input_path,
                     output_file_path,
                     normalized_opt_level,
+                    resolved_arch,
                 )
 
                 # Check if file already exists and we're resuming
@@ -113,14 +233,31 @@ def main(
                 if resume and file_exists_and_not_empty(output_file_path):
                     rerun_existing += 1
 
-                cmd_arg = [file_path, output_file_path, normalized_opt_level, marker_path]
+                cmd_arg = [
+                    file_path,
+                    output_file_path,
+                    normalized_opt_level,
+                    resolved_arch,
+                    marker_path,
+                ]
                 reopt_commands.append(cmd_arg)
+
+    if unknown_arch_files:
+        console.print(
+            f"[red]Error: could not infer 32/64-bit clang mode for {len(unknown_arch_files)} .ll files.[/red]"
+        )
+        for file_path in unknown_arch_files[:10]:
+            console.print(f"[red]  - {file_path}[/red]")
+        console.print("[red]Rename files with x86/x64/arm32/arm64/mips32/mips64, or pass --arch m32/--arch m64.[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(f"[green]Task 2 resolved arches: m32={arch_counts['m32']}, m64={arch_counts['m64']}[/green]")
 
     if resume and skipped_reopt > 0:
         console.print(f"[yellow]Skipping {skipped_reopt} already re-optimized files[/yellow]")
     if resume and rerun_existing > 0:
         console.print(
-            f"[yellow]Re-running {rerun_existing} existing .bc files because opt level changed or no resume marker was found[/yellow]"
+            f"[yellow]Re-running {rerun_existing} existing .bc files because opt level/clang flags changed or no resume marker was found[/yellow]"
         )
 
     # Execute re-optimization

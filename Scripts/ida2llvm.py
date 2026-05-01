@@ -12,7 +12,6 @@ import ida_segment
 import ida_nalt
 import ida_hexrays
 import ida_auto
-import itertools
 import idaapi
 import logging
 import struct
@@ -20,6 +19,8 @@ import numpy as np
 import traceback
 import sys
 import typer
+import re
+import io
 import llvmlite.binding as llvm
 from llvmlite import ir
 
@@ -44,10 +45,12 @@ refreshed_funcs = set()  # 避免重复触发无缓存反编译
 lifting_funcs = set()  # 正在定义函数体的函数，防止递归重入
 lifted_funcs = set()  # 已经完成函数体定义的函数
 function_signature_cache = {}  # 缓存函数签名: {地址: ida_typeinf.tinfo_t}
+function_return_overrides = {}  # 调用点推断出的返回类型: {函数名或地址: ir.Type}
 name_cache = {}
 func_cache = {}
 segtype_cache = {}
 llvm_type_cache = {}
+abi_size_cache = {}
 target_data = None
 _CACHE_MISS = object()
 
@@ -56,6 +59,85 @@ FS_SEGMENT_SIZE = 0x10000  # 64KB
 
 # 浮点数提取失败时的默认值
 DEFAULT_FLOAT_VALUE = 1.0
+ENABLE_SIGNATURE_REFRESH = False
+ENABLE_DATA_TYPE_GUESS = False
+SIZE_MAP = {
+    "byte": 8,
+    "word": 16,
+    "dword": 32,
+    "qword": 64
+}
+FLOAT_RESULT_OPS = {
+    ida_hexrays.m_i2f,
+    ida_hexrays.m_u2f,
+    ida_hexrays.m_f2f,
+    ida_hexrays.m_fneg,
+    ida_hexrays.m_fadd,
+    ida_hexrays.m_fsub,
+    ida_hexrays.m_fmul,
+    ida_hexrays.m_fdiv,
+}
+FLOAT_L_OPS = FLOAT_RESULT_OPS | {ida_hexrays.m_f2i, ida_hexrays.m_f2u}
+FLOAT_R_OPS = {
+    ida_hexrays.m_fadd,
+    ida_hexrays.m_fsub,
+    ida_hexrays.m_fmul,
+    ida_hexrays.m_fdiv,
+}
+LIFTED_INTRINSIC_NAMES = {
+    "sadd_overflow",
+    "__OFSUB__",
+    "_mm_cvtsi128_si32",
+    "_BitScanReverse",
+    "__FYL2X__",
+    "__FYL2P__",
+    "fabs",
+    "fabsf",
+    "fabsl",
+    "memcpy",
+    "_byteswap_ulong",
+    "_byteswap_uint64",
+    "memset",
+    "abs64",
+    "__PAIR64__",
+    "__PAIR128__",
+    "__PAIR32__",
+    "__PAIR16__",
+    "_BitScanReverse64",
+    "_BitScanForward64",
+    "__halt",
+    "is_mul_ok",
+    "va_start",
+    "va_arg",
+    "va_end",
+    "_QWORD",
+    "__ROL8__",
+    "__ROL4__",
+    "__ROR4__",
+    "__ROR8__",
+}
+LIFTED_INTRINSIC_PREFIXES = (
+    "__readfs",
+    "__writefs",
+    "sys_",
+    "_InterlockedCompareExchange",
+    "_InterlockedExchange",
+)
+LLVM_TERMINATOR_PREFIXES = (
+    "br ",
+    "ret ",
+    "switch ",
+    "indirectbr ",
+    "invoke ",
+    "resume ",
+    "unreachable",
+    "cleanupret ",
+    "catchret ",
+    "catchswitch ",
+)
+LLVM_DEFINE_RE = re.compile(r"define\s+(.+?)\s+@")
+LLVM_LABEL_RE = re.compile(r"^[A-Za-z$._-][A-Za-z0-9$._-]*:$")
+LLVM_INT_RE = re.compile(r"i\d+$")
 
 
 def _reset_lift_state():
@@ -66,10 +148,12 @@ def _reset_lift_state():
     lifting_funcs.clear()
     lifted_funcs.clear()
     function_signature_cache.clear()
+    function_return_overrides.clear()
     name_cache.clear()
     func_cache.clear()
     segtype_cache.clear()
     llvm_type_cache.clear()
+    abi_size_cache.clear()
     target_data = None
 
 
@@ -79,6 +163,15 @@ def _get_target_data():
     if target_data is None:
         target_data = llvm.create_target_data("e")
     return target_data
+
+
+def _get_abi_size(typ: ir.Type) -> int:
+    key = id(typ)
+    size = abi_size_cache.get(key, _CACHE_MISS)
+    if size is _CACHE_MISS:
+        size = typ.get_abi_size(_get_target_data())
+        abi_size_cache[key] = size
+    return size
 
 
 def _get_name_cached(ea):
@@ -175,7 +268,7 @@ def _lift_tif_uncached(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
         is_vararg = tif.is_vararg_cc()                               
         llvm_rettype = lift_tif(ida_rettype)                            
         llvm_args = (lift_tif(arg) for arg in ida_args)
-        return ir.FunctionType(i8ptr if isinstance(llvm_rettype, ir.VoidType) else llvm_rettype, llvm_args, var_arg = is_vararg) 
+        return ir.FunctionType(llvm_rettype, llvm_args, var_arg = is_vararg)
 
     elif tif.is_ptr():
         child_tif = tif.get_ptrarr_object()
@@ -283,6 +376,8 @@ def typecast(src: ir.Value, dst_type: ir.Type, builder: ir.IRBuilder, signed: bo
     :return: 类型转换后的值
     :rtype: ir.Value   
     """
+    if isinstance(src.type, ir.VoidType):
+        return _zero_initializer_for_type(dst_type)
     if src.type != dst_type:
         if isinstance(src.type, ir.PointerType) and isinstance(dst_type, ir.PointerType):
             return builder.bitcast(src, dst_type)
@@ -348,10 +443,29 @@ def typecast(src: ir.Value, dst_type: ir.Type, builder: ir.IRBuilder, signed: bo
             return builder.bitcast(src, dst_type)
     return src
 
+
+def _zero_initializer_for_type(typ: ir.Type):
+    if isinstance(typ, (ir.FloatType, ir.DoubleType)):
+        return ir.Constant(typ, 0.0)
+    if isinstance(typ, ir.PointerType):
+        return ir.Constant(typ, None)
+    if isinstance(typ, ir.IntType):
+        return ir.Constant(typ, 0)
+    return ir.Constant(typ, None)
+
+
+def _local_storage_type(typ: ir.Type) -> ir.Type:
+    if isinstance(typ, ir.IntType) and typ.width == 1:
+        return ir.IntType(32)
+    return typ
+
+
 def storecast(src, dst, builder):
     """
     将目标的类型转换为源的指针类型。
     """
+    if src is None or isinstance(src.type, ir.VoidType):
+        return dst
     if dst != None and dst.type != src.type.as_pointer():
         dst = typecast(dst, src.type.as_pointer(), builder) 
     return dst
@@ -367,21 +481,43 @@ def get_offset_to(builder: ir.IRBuilder, arg: ir.Value, off: int = 0) -> ir.Valu
     :return: 按偏移量索引后的值
     :rtype: ir.Value
     """
+    def byte_offset_pointer() -> ir.Value:
+        byte_ptr = typecast(arg, ir.IntType(8).as_pointer(), builder)
+        if off == 0:
+            return byte_ptr
+        return builder.gep(byte_ptr, (ir.Constant(ir.IntType(ptrsize), off),))
+
     if isinstance(arg.type, ir.PointerType) and isinstance(arg.type.pointee, ir.ArrayType):
         arr = arg.type.pointee
-        td = _get_target_data()
-        size = arr.element.get_abi_size(td)
+        size = _get_abi_size(arr.element)
+        if size <= 0 or off % size != 0:
+            return byte_offset_pointer()
         return builder.gep(arg, (ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), off // size),))
     # elif isinstance(arg.type, ir.PointerType) and isinstance(arg.type.pointee, ir.LiteralStructType):
     #     return typecast(arg, ir.IntType(8).as_pointer(), builder)
     elif isinstance(arg.type, ir.PointerType) and isinstance(arg.type.pointee, ir.IdentifiedStructType):
-        return typecast(arg, ir.IntType(8).as_pointer(), builder)
-    elif isinstance(arg.type, ir.PointerType) and off > 0:
-        td = _get_target_data()
-        size = arg.type.pointee.get_abi_size(td)
+        return byte_offset_pointer()
+    elif isinstance(arg.type, ir.PointerType) and off != 0:
+        size = _get_abi_size(arg.type.pointee)
+        if size <= 0 or off % size != 0:
+            return byte_offset_pointer()
         return builder.gep(arg, (ir.Constant(ir.IntType(32), off // size),))
     else:
         return arg
+
+
+def _block_ends_with_terminator(blk: ir.Block) -> bool:
+    term = getattr(blk, "terminator", None)
+    return term is not None and len(blk.instructions) > 0 and blk.instructions[-1] is term
+
+
+def _ensure_fallthrough(builder: ir.IRBuilder, blk: ir.Block, next_blk: ir.Block):
+    if next_blk is None or _block_ends_with_terminator(blk):
+        return
+    if getattr(blk, "terminator", None) is not None:
+        blk.terminator = None
+    with builder.goto_block(blk):
+        builder.branch(next_blk)
 
 def dedereference(arg: ir.Value) -> ir.Value:
     """
@@ -518,6 +654,51 @@ def analyze_insn(module, ida_insn, ea):
         analyze_insn(module, ida_insn.d.d, ea)
     return
 
+
+def _infer_value_type_from_mop(mop):
+    if mop is None or mop.t == ida_hexrays.mop_z or mop.size <= 0:
+        return None
+    if mop.t == ida_hexrays.mop_l:
+        with suppress(Exception):
+            return lift_tif(mop.l.var().tif)
+    if mop.t == ida_hexrays.mop_d:
+        insn = mop.d
+        if insn.opcode in FLOAT_RESULT_OPS:
+            return float_type(mop.size)
+        if insn.opcode == ida_hexrays.m_call and insn.l.t == ida_hexrays.mop_v:
+            with suppress(Exception):
+                tif = lift_type_from_address(insn.l.g)
+                if tif.is_funcptr():
+                    tif = tif.get_ptrarr_object()
+                if tif.is_func():
+                    ida_func_details = ida_typeinf.func_type_data_t()
+                    tif.get_func_details(ida_func_details)
+                    ret_type = lift_tif(ida_func_details.rettype)
+                    if not isinstance(ret_type, ir.VoidType):
+                        return ret_type
+        with suppress(Exception):
+            if insn.is_fpinsn():
+                return float_type(mop.size)
+
+    size_bits = mop.size * 8
+    if 0 < size_bits <= 128:
+        return ir.IntType(size_bits)
+    return ir.IntType(ptrsize)
+
+
+def _infer_return_type_from_mba(mba):
+    for index in range(mba.qty):
+        ida_blk = mba.get_mblock(index)
+        ida_insn = ida_blk.head
+        while ida_insn is not None:
+            if ida_insn.opcode == ida_hexrays.m_ret:
+                for mop in (ida_insn.l, ida_insn.r, ida_insn.d):
+                    ret_type = _infer_value_type_from_mop(mop)
+                    if ret_type is not None and not isinstance(ret_type, ir.VoidType):
+                        return ret_type
+            ida_insn = ida_insn.next
+    return None
+
 def lift_from_address(module: ir.Module, ea: int, typ: ir.Type = None):
     if typ is None:
         tif = lift_type_from_address(ea)
@@ -536,24 +717,41 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
         else:
             return res
 
-        # refresh function call.
-        # some functions caller and signature maybe mismatch. refresh with re-decompile.
-        mba = pfunc.mba
-        for index in range(mba.qty):
-            ida_blk = mba.get_mblock(index)
-            ida_insn = ida_blk.head
-            while ida_insn is not None:
-                analyze_insn(module, ida_insn, ea)
-                ida_insn = ida_insn.next
+        if ENABLE_SIGNATURE_REFRESH:
+            # refresh function call.
+            # some functions caller and signature maybe mismatch. refresh with re-decompile.
+            mba = pfunc.mba
+            for index in range(mba.qty):
+                ida_blk = mba.get_mblock(index)
+                ida_insn = ida_blk.head
+                while ida_insn is not None:
+                    analyze_insn(module, ida_insn, ea)
+                    ida_insn = ida_insn.next
 
-        if ea in ptext:
-            pfunc = ptext[ea]
-        else:
-            return res
+            if ea in ptext:
+                pfunc = ptext[ea]
+            else:
+                return res
         
         mba = pfunc.mba
+        if isinstance(typ.return_type, ir.VoidType):
+            inferred_ret = (
+                function_return_overrides.get(func_name)
+                or function_return_overrides.get(ea)
+                or _infer_return_type_from_mba(mba)
+            )
+            if inferred_ret is not None:
+                typ = ir.FunctionType(inferred_ret, typ.args, var_arg=typ.var_arg)
+                if isinstance(res, ir.Function) and res.is_declaration:
+                    res.ftype = typ
+                    res.type.pointee = typ
+                    res.return_value = ir.ReturnValue(res, typ.return_type)
+                    res.lvars = dict()
+
         for index in range(mba.qty):
             res.append_basic_block(name = f"@{index}")
+        for index, blk in enumerate(res.blocks):
+            blk.next_blk = res.blocks[index + 1] if index + 1 < len(res.blocks) else None
 
         # Map IDA block start addresses to LLVM blocks for jump resolution.
         res.block_by_ea = {}
@@ -576,11 +774,14 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
             # declare function results as stack variable
             if not isinstance(typ.return_type, ir.VoidType):
                 res.lvars["funcresult"] = builder.alloca(typ.return_type, name = "funcresult")
+                builder.store(_zero_initializer_for_type(typ.return_type), res.lvars["funcresult"])
 
             for lvar in list(pfunc.lvars): 
                 if lvar.is_result_var:
+                    if lvar.is_arg_var and "funcresult" in res.lvars:
+                        names.append("funcresult")
                     continue
-                arg_t = lift_tif(lvar.tif)
+                arg_t = _local_storage_type(lift_tif(lvar.tif))
                 res.lvars[lvar.name] = builder.alloca(arg_t, name = lvar.name)
                 if lvar.is_arg_var:
                     names.append(lvar.name)
@@ -598,32 +799,51 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
                 arg = typecast(arg, res.lvars[arg_n].type.pointee, builder) 
                 builder.store(arg, res.lvars[arg_n]) 
 
-        with builder.goto_block(res.blocks[-1]):
-            if isinstance(typ.return_type, ir.VoidType):
-                builder.ret_void() 
-            else:
-                builder.ret(builder.load(res.lvars["funcresult"])) 
-
         # lift each bblk in cfg
         for index, blk in enumerate(res.blocks):
             next_blk = res.blocks[index + 1] if index + 1 < len(res.blocks) else None
             ida_blk = mba.get_mblock(index)
             ida_insn = ida_blk.head
+            last_value = None
             while ida_insn is not None:
-                lift_insn(ida_insn, blk, builder, next_blk)
+                lifted_value = lift_insn(ida_insn, blk, builder, next_blk)
+                if lifted_value is not None:
+                    last_value = lifted_value
+                if _block_ends_with_terminator(blk):
+                    break
                 ida_insn = ida_insn.next
 
-            if not blk.is_terminated and next_blk is not None:
+            if (
+                next_blk is res.blocks[-1]
+                and not _block_ends_with_terminator(blk)
+                and not isinstance(typ.return_type, ir.VoidType)
+                and last_value is not None
+                and not isinstance(last_value.type, ir.VoidType)
+                and "funcresult" in res.lvars
+            ):
                 with builder.goto_block(blk):
-                    builder.branch(next_blk)
+                    _store_as(last_value, res.lvars["funcresult"], blk, builder)
 
-        # if function is variadic, declare va_end intrinsic
-        if tif.is_vararg_cc() and typ.var_arg:
-            ptr = res.lvars["ArgList"]
-            va_end = module.declare_intrinsic('llvm.va_end', fnty=ir.FunctionType(ir.VoidType(), [ir.IntType(8).as_pointer()]))
-            with builder.goto_block(res.blocks[-1]):
-                ptr = builder.load(ptr)
-                builder.call(va_end, (ptr, ))
+            _ensure_fallthrough(builder, blk, next_blk)
+
+        with builder.goto_block(res.blocks[-1]):
+            if not _block_ends_with_terminator(res.blocks[-1]):
+                if tif.is_vararg_cc() and typ.var_arg:
+                    ptr = res.lvars["ArgList"]
+                    va_end = module.declare_intrinsic('llvm.va_end', fnty=ir.FunctionType(ir.VoidType(), [ir.IntType(8).as_pointer()]))
+                    ptr = builder.load(ptr)
+                    builder.call(va_end, (ptr, ))
+                if isinstance(typ.return_type, ir.VoidType):
+                    builder.ret_void()
+                else:
+                    builder.ret(builder.load(res.lvars["funcresult"]))
+        with suppress(AttributeError):
+            del res.block_by_ea
+        with suppress(AttributeError):
+            del res.lvars
+        for blk in res.blocks:
+            with suppress(AttributeError):
+                del blk.next_blk
         return res
 
     elif isinstance(typ, ir.IntType):
@@ -642,19 +862,17 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
         val = ir.Constant(typ, None)
         return val
     elif isinstance(typ, ir.ArrayType):
-        td = _get_target_data()
-        subSize = typ.element.get_abi_size(td)
+        subSize = _get_abi_size(typ.element)
         array = [ lift_from_address(module, sub_ea, typ.element)
             for sub_ea in range(ea, ea + subSize * typ.count, subSize)
         ]
         return ir.Constant.literal_array(array)
     elif isinstance(typ, ir.LiteralStructType) or isinstance(typ, ir.IdentifiedStructType):
-        td = _get_target_data()
         structEles = []
         for el in typ.elements:
             structEle = lift_from_address(module, ea, el)
             structEles.append(structEle)
-            subSize = el.get_abi_size(td)
+            subSize = _get_abi_size(el)
             ea += subSize
         return ir.Constant(typ, structEles)
     else:
@@ -669,15 +887,14 @@ def str2size(str_size: str) -> int:
     :return: 字符串的大小，以位为单位
     :rtype: int
     """
-    size_map = {
-        "byte": 8,
-        "word": 16,
-        "dword": 32,
-        "qword": 64
-    }
-    if str_size not in size_map:
-        raise AssertionError(f"字符串大小必须是 {list(size_map.keys())} 之一，得到的是 '{str_size}'")
-    return size_map[str_size]
+    if str_size not in SIZE_MAP:
+        raise AssertionError(f"字符串大小必须是 {list(SIZE_MAP.keys())} 之一，得到的是 '{str_size}'")
+    return SIZE_MAP[str_size]
+
+
+def _is_lifted_intrinsic_name(func_name: str) -> bool:
+    return func_name in LIFTED_INTRINSIC_NAMES or func_name.startswith(LIFTED_INTRINSIC_PREFIXES)
+
 
 def lift_intrinsic_function(module: ir.Module, func_name: str):
     """
@@ -703,7 +920,9 @@ def lift_intrinsic_function(module: ir.Module, func_name: str):
     """
     # 如果已存在，直接返回
     with suppress(KeyError):
-        return module.get_global(func_name)
+        existing = module.get_global(func_name)
+        if _is_lifted_intrinsic_name(func_name):
+            return existing
 
     if func_name == "sadd_overflow":
         typ = ir.LiteralStructType((ir.IntType(64), ir.IntType(1)))
@@ -821,14 +1040,7 @@ def lift_intrinsic_function(module: ir.Module, func_name: str):
         except KeyError:
             fs_reg_typ = ir.ArrayType(ir.IntType(8), 65536)
             fs_reg = ir.GlobalVariable(module, fs_reg_typ, "virtual_fs")
-            fs_reg.storage_class = "thread_local"
             fs_reg.initializer = fs_reg_typ(None)
-        try:
-            threadlocal_f = module.get_global('llvm.threadlocal.address')
-        except KeyError:
-            f_argty = (i8ptr, )
-            fnty = ir.FunctionType(i8ptr, f_argty)
-            threadlocal_f = module.declare_intrinsic('llvm.threadlocal.address', f_argty, fnty)
 
         fty = ir.FunctionType(ir.IntType(size), [ir.IntType(32),])
 
@@ -837,8 +1049,7 @@ def lift_intrinsic_function(module: ir.Module, func_name: str):
         f.append_basic_block()
         builder = ir.IRBuilder(f.entry_basic_block)
         fs_reg = typecast(fs_reg, ir.IntType(8).as_pointer(), builder)
-        threadlocal_address = builder.call(threadlocal_f, (fs_reg, ))
-        pointer = builder.gep(threadlocal_address, (offset,))
+        pointer = builder.gep(fs_reg, (offset,))
         pointer = typecast(pointer, ir.IntType(size).as_pointer(), builder)
         res = builder.load(pointer)
         builder.ret(res)
@@ -854,14 +1065,7 @@ def lift_intrinsic_function(module: ir.Module, func_name: str):
         except KeyError:
             fs_reg_typ = ir.ArrayType(ir.IntType(8), FS_SEGMENT_SIZE)
             fs_reg = ir.GlobalVariable(module, fs_reg_typ, "virtual_fs")
-            fs_reg.storage_class = "thread_local"
             fs_reg.initializer = fs_reg_typ(None)            
-        try:
-            threadlocal_f = module.get_global('llvm.threadlocal.address')
-        except KeyError:
-            f_argty = (i8ptr, )
-            fnty = ir.FunctionType(i8ptr, f_argty)
-            threadlocal_f = module.declare_intrinsic('llvm.threadlocal.address', f_argty, fnty)
 
         fty = ir.FunctionType(ir.VoidType(), [ir.IntType(32), ir.IntType(size)])
 
@@ -870,8 +1074,7 @@ def lift_intrinsic_function(module: ir.Module, func_name: str):
         f.append_basic_block()
         builder = ir.IRBuilder(f.entry_basic_block)
         fs_reg = typecast(fs_reg, ir.IntType(8).as_pointer(), builder)
-        threadlocal_address = builder.call(threadlocal_f, (fs_reg, ))
-        pointer = builder.gep(threadlocal_address, (offset,))
+        pointer = builder.gep(fs_reg, (offset,))
         pointer = typecast(pointer, ir.IntType(size).as_pointer(), builder)
         builder.store(value, pointer)
         builder.ret_void()
@@ -945,6 +1148,8 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
         ):
             return existing
         res = existing
+        if isinstance(existing.type, ir.PointerType) and isinstance(existing.type.pointee, ir.FunctionType):
+            typ = existing.type.pointee
     else:
         if isinstance(typ, ir.PointerType):
             logging.debug(f"Unexpected pointer type for function {func_name}: {typ}")
@@ -1017,11 +1222,12 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
         res.parent = blk
         return res
     elif mop.t == ida_hexrays.mop_d: # 另一个指令
-        d = lift_insn(mop.d, blk, builder)
+        d = lift_insn(mop.d, blk, builder, result_type=knowntyp)
         if d is None:
             return None
         if isinstance(d.type, ir.VoidType):
-            pass
+            if knowntyp is not None:
+                d = typecast(d, knowntyp, builder)
         elif mop.size == -1:
             pass
         elif isinstance(mop, ida_hexrays.mcallarg_t):
@@ -1236,8 +1442,7 @@ def _store_as(l: ir.Value, d: ir.Value, blk: ir.Block, builder: ir.IRBuilder, d_
     with suppress(AttributeError):
         if isinstance(l.type.pointee, ir.IdentifiedStructType) or isinstance(l.type.pointee, ir.ArrayType):
             dest, src = d, l
-            td = _get_target_data()
-            length = ir.Constant(ir.IntType(64), l.type.pointee.get_abi_size(td))
+            length = ir.Constant(ir.IntType(64), _get_abi_size(l.type.pointee))
             memcpy = lift_intrinsic_function(blk.parent.parent, "memcpy")
             src = typecast(src, ir.IntType(8).as_pointer(), builder)
             dest = typecast(dest, ir.IntType(8).as_pointer(), builder)
@@ -1398,7 +1603,7 @@ def _handle_float_binary_op(l, r, d, op_func, blk, builder, ida_insn):
     d = storecast(l, d, builder)
     return _store_as(math, d, blk, builder)
  
-def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilder, next_blk=None) -> ir.Instruction:
+def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilder, next_blk=None, result_type=None) -> ir.Instruction:
     """
     Lifts a single IDA microcode instruction to LLVM IR.
     
@@ -1417,9 +1622,18 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
     :return: The generated LLVM instruction, or None for no-ops
     """
     builder.position_at_end(blk)
-    l = lift_mop(ida_insn.l, blk, builder)
-    # 加载操作的源始终是地址
-    r = lift_mop(ida_insn.r, blk, builder, ida_insn.opcode == ida_hexrays.m_ldx)
+    l_known_type = (
+        float_type(ida_insn.l.size)
+        if ida_insn.opcode in FLOAT_L_OPS and ida_insn.l.t == ida_hexrays.mop_d and ida_insn.l.size > 0
+        else None
+    )
+    r_known_type = (
+        float_type(ida_insn.r.size)
+        if ida_insn.opcode in FLOAT_R_OPS and ida_insn.r.t == ida_hexrays.mop_d and ida_insn.r.size > 0
+        else None
+    )
+    l = lift_mop(ida_insn.l, blk, builder, knowntyp=l_known_type)
+    r = lift_mop(ida_insn.r, blk, builder, knowntyp=r_known_type)
     # 指令目标始终是地址，除非call指令的目标（参数）
     d = lift_mop(ida_insn.d, blk, builder, True and ida_insn.opcode != ida_hexrays.m_call and ida_insn.opcode != ida_hexrays.m_icall)
 
@@ -1428,10 +1642,12 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         l = create_intrinsic_function(blk.parent.parent, ida_insn.l.helper, ida_insn.d.f)
 
     if next_blk is None:
-        blk_itr = iter(blk.parent.blocks)
-        list(itertools.takewhile(lambda x: x.name != blk.name, blk_itr))
-        # 获取下一个块
-        next_blk = next(blk_itr, None)
+        next_blk = getattr(blk, "next_blk", None)
+        if next_blk is None:
+            blocks = blk.parent.blocks
+            with suppress(ValueError, AttributeError):
+                blk_index = blocks.index(blk)
+                next_blk = blocks[blk_index + 1] if blk_index + 1 < len(blocks) else None
 
     if ida_insn.opcode == ida_hexrays.m_nop:    # 0x00,  nop    无操作
         return
@@ -1523,7 +1739,7 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
     elif ida_insn.opcode == ida_hexrays.m_shl:  # 0x16,  shl  l,   r, d   shift logical left
         return _handle_binary_arithmetic(l, r, d, builder.shl, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_shr:  # 0x17,  shr  l,   r, d   shift logical right
-        return _handle_binary_arithmetic(l, r, d, builder.ashr, blk, builder, ida_insn)
+        return _handle_binary_arithmetic(l, r, d, builder.lshr, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_sar:  # 0x18,  sar  l,   r, d   shift arithmetic right
         return _handle_binary_arithmetic(l, r, d, builder.ashr, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_cfadd:  # 0x19,  cfadd l,  r,    d=carry    calculate carry    bit of (l+r)
@@ -1567,7 +1783,7 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
     elif ida_insn.opcode == ida_hexrays.m_sets:  # 0x1D,  sets  l,d=byte  SF=1Sign
         l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
         r = ir.Constant(ir.IntType(ida_insn.l.size*8), 0)
-        cond = builder.icmp_unsigned("<", l, r)
+        cond = builder.icmp_signed("<", l, r)
         result = builder.select(cond, ir.IntType(ida_insn.d.size * 8)(1), ir.IntType(ida_insn.d.size * 8)(0))
         return _store_as(result, d, blk, builder)
     elif ida_insn.opcode == ida_hexrays.m_seto:  # 0x1E,  seto  l,  r, d=byte  OF=1Overflow of (l-r)
@@ -1667,13 +1883,32 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
             for (i, arg) in enumerate(args):
                 argtype.append(arg.type)
 
-            new_func_type = ir.FunctionType(i8ptr, argtype, var_arg=False).as_pointer()
+            call_ret_type = result_type if result_type is not None else i8ptr
+            new_func_type = ir.FunctionType(call_ret_type, argtype, var_arg=False).as_pointer()
             l = typecast(l, new_func_type, builder)
 
             ret = builder.call(l, args)
             for dst in rets:
                 _store_as(ret, dst, blk, builder) 
             return ret
+
+        if (
+            result_type is not None
+            and not isinstance(result_type, ir.VoidType)
+            and isinstance(l.type.pointee.return_type, ir.VoidType)
+        ):
+            if ida_insn.l.t == ida_hexrays.mop_v:
+                target_ea = ida_insn.l.g
+                target_name = _get_name_cached(target_ea)
+                if target_name == "":
+                    target_name = f"data_{hex(target_ea)[2:]}"
+                function_return_overrides[target_name] = result_type
+                function_return_overrides[target_ea] = result_type
+            l = typecast(
+                l,
+                ir.FunctionType(result_type, l.type.pointee.args, var_arg=l.type.pointee.var_arg).as_pointer(),
+                builder,
+            )
 
         for (i, llvmtype) in enumerate(l.type.pointee.args):
             if i >= len(args):
@@ -1700,6 +1935,20 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         f = typecast(r, ftype.as_pointer(), builder)
         return builder.call(f, args)
     elif ida_insn.opcode == ida_hexrays.m_ret:  # 0x3A,  ret  返回
+        func = blk.parent
+        ret_type = func.type.pointee.return_type
+        if (
+            not isinstance(ret_type, ir.VoidType)
+            and l is not None
+            and not isinstance(l.type, ir.VoidType)
+            and "funcresult" in func.lvars
+        ):
+            _store_as(l, func.lvars["funcresult"], blk, builder)
+        exit_blk = func.blocks[-1]
+        if blk is not exit_blk:
+            if getattr(blk, "terminator", None) is not None and not _block_ends_with_terminator(blk):
+                blk.terminator = None
+            return builder.branch(exit_blk)
         return
     elif ida_insn.opcode == ida_hexrays.m_push:  # 0x3B,  push   l  入栈
         return
@@ -1756,6 +2005,9 @@ class BIN2LLVMController():
         self._name_cache = {}
         self._func_cache = {}
         self._function_eas = []
+        self._stream_file = None
+        self._streamed_functions = set()
+        self._streamed_types = set()
         if target_mode == "host":
             self._set_module_target_from_host()
         else:
@@ -1873,7 +2125,8 @@ class BIN2LLVMController():
             typ = pfunc.type
             function_signature_cache[ea] = typ
             func_name = self._get_name(ea)
-            lift_function(self.m, func_name, False, ea, typ)
+            lifted = lift_function(self.m, func_name, False, ea, typ)
+            self._stream_function_if_enabled(lifted)
         except Exception as e:
             logging.debug(f"在 {hex(ea)} 处提升函数失败: {e}")
         finally:
@@ -1904,8 +2157,11 @@ class BIN2LLVMController():
 
         # 如果数据项是字符串，创建字符串全局变量
         if ea in str_dict:
-            str_csnt = str_dict[ea][0]
-            strType = ir.ArrayType(ir.IntType(8), str_dict[ea][1])
+            strlen = str_dict[ea]
+            str_csnt = ida_bytes.get_bytes(ea, strlen) or b""
+            if len(str_csnt) < strlen:
+                str_csnt = str_csnt + b"\x00" * (strlen - len(str_csnt))
+            strType = ir.ArrayType(ir.IntType(8), strlen)
             g = ir.GlobalVariable(self.m, strType, name=name)
             g.initializer = ir.Constant(strType, bytearray(str_csnt))
             g.linkage = "private"
@@ -1914,10 +2170,12 @@ class BIN2LLVMController():
 
         tif = ida_typeinf.tinfo_t()
         if not ida_nalt.get_tinfo(tif, ea):
+            if not ENABLE_DATA_TYPE_GUESS:
+                return
             ida_typeinf.guess_tinfo(tif, ea)
 
         # 如果数据项是外部函数，创建声明
-        elif tif.is_func() or tif.is_funcptr():
+        if tif.is_func() or tif.is_funcptr():
             if tif.is_funcptr():
                 tif = tif.get_ptrarr_object()
             # if function is a thunk function, define the actual function instead
@@ -1974,7 +2232,7 @@ class BIN2LLVMController():
         # 步骤2：收集所有字符串常量
         str_dict = {}
         for s in idautils.Strings():
-            str_dict[s.ea] = [ida_bytes.get_bytes(s.ea, s.length), s.length]
+            str_dict[s.ea] = s.length
 
         # 步骤3：为非执行段中的所有数据项创建全局变量
         for i in range(idaapi.get_segm_qty()):
@@ -1989,6 +2247,43 @@ class BIN2LLVMController():
                     continue
                 self.create_global(head, end - head, str_dict)
 
+    def begin_stream_to_file(self, filename):
+        self._stream_file = open(filename, 'w')
+        _write_module_header(self.m, self._stream_file)
+
+    def _stream_function_if_enabled(self, func):
+        if self._stream_file is None:
+            return
+        if not isinstance(func, ir.Function) or func.is_declaration:
+            return
+        if func.name in self._streamed_functions:
+            return
+
+        self._stream_new_type_declarations()
+        _write_sanitized_llvm_ir(str(func), self._stream_file)
+        self._stream_file.write("\n")
+        self._streamed_functions.add(func.name)
+        func.blocks.clear()
+        func._streamed_definition = True
+
+    def _stream_new_type_declarations(self):
+        if self._stream_file is None:
+            return
+        for type_name, typ in self.m.get_identified_types().items():
+            if type_name in self._streamed_types:
+                continue
+            _write_sanitized_llvm_ir(typ.get_declaration(), self._stream_file)
+            self._streamed_types.add(type_name)
+
+    def finish_stream_to_file(self):
+        if self._stream_file is None:
+            return
+        try:
+            _write_module_remainder(self.m, self._stream_file, self._streamed_types)
+        finally:
+            self._stream_file.close()
+            self._stream_file = None
+
     def save_to_file(self, filename):
         """
         将LLVM IR模块以文本格式保存到文件。
@@ -2001,7 +2296,115 @@ class BIN2LLVMController():
         :param filename: 输出.ll文件的路径
         """
         with open(filename, 'w') as f:
-            f.write(str(self.m))
+            _write_module_sanitized(self.m, f)
+
+
+def _is_llvm_terminator(line: str) -> bool:
+    return line.strip().startswith(LLVM_TERMINATOR_PREFIXES)
+
+
+def _is_llvm_label(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped.endswith(":"):
+        return False
+    return stripped.startswith('"') or LLVM_LABEL_RE.match(stripped) is not None
+
+
+def _llvm_label_ref(label_line: str) -> str:
+    label = label_line.strip()[:-1]
+    return f"%{label}"
+
+
+def _default_ret_for_type(ret_type: str) -> str:
+    ret_type = ret_type.strip()
+    if ret_type == "void":
+        return "  ret void"
+    if ret_type in ("float", "double"):
+        return f"  ret {ret_type} 0.000000e+00"
+    if ret_type.endswith("*"):
+        return f"  ret {ret_type} null"
+    if LLVM_INT_RE.match(ret_type):
+        return f"  ret {ret_type} 0"
+    return f"  ret {ret_type} zeroinitializer"
+
+
+def _sanitize_llvm_ir(text: str) -> str:
+    out = io.StringIO()
+    _write_sanitized_llvm_ir(text, out)
+    return out.getvalue()
+
+
+def _write_module_header(module: ir.Module, output):
+    output.write(f'; ModuleID = "{module.name}"\n')
+    output.write(f'target triple = "{module.triple}"\n')
+    output.write(f'target datalayout = "{module.data_layout}"\n\n')
+
+
+def _write_module_remainder(module: ir.Module, output, skip_type_names=None):
+    skip_type_names = skip_type_names or set()
+    for type_name, typ in module.get_identified_types().items():
+        if type_name in skip_type_names:
+            continue
+        _write_sanitized_llvm_ir(typ.get_declaration(), output)
+
+    for global_value in module.globals.values():
+        if isinstance(global_value, ir.Function) and getattr(global_value, "_streamed_definition", False):
+            continue
+        _write_sanitized_llvm_ir(str(global_value), output)
+
+    for metadata_line in module._get_metadata_lines():
+        _write_sanitized_llvm_ir(metadata_line, output)
+
+
+def _write_module_sanitized(module: ir.Module, output):
+    _write_module_header(module, output)
+    _write_module_remainder(module, output)
+
+
+def _write_sanitized_llvm_ir(text: str, output):
+    in_func = False
+    ret_type = None
+    prev_nonempty = None
+
+    for raw_line in io.StringIO(text):
+        line = raw_line.rstrip("\n")
+        stripped = line.strip()
+        define_match = LLVM_DEFINE_RE.match(stripped)
+        if define_match is not None:
+            in_func = True
+            ret_type = define_match.group(1)
+            prev_nonempty = stripped
+            output.write(line)
+            output.write("\n")
+            continue
+
+        if in_func and _is_llvm_label(line):
+            if (
+                prev_nonempty
+                and not prev_nonempty.endswith("{")
+                and not _is_llvm_terminator(prev_nonempty)
+            ):
+                output.write(f"  br label {_llvm_label_ref(line)}\n")
+            output.write(line)
+            output.write("\n")
+            prev_nonempty = stripped
+            continue
+
+        if in_func and stripped == "}":
+            if prev_nonempty and not _is_llvm_terminator(prev_nonempty):
+                output.write(_default_ret_for_type(ret_type or "void"))
+                output.write("\n")
+            output.write(line)
+            output.write("\n")
+            in_func = False
+            ret_type = None
+            prev_nonempty = None
+            continue
+
+        output.write(line)
+        output.write("\n")
+        if in_func and stripped:
+            prev_nonempty = stripped
 
 
 # ============================================================================
@@ -2065,8 +2468,9 @@ def lift_binary_to_llvm(
         # 创建控制器并执行提升
         bin2llvm = BIN2LLVMController(target_mode=target_mode)
         bin2llvm.initialize()
+        bin2llvm.begin_stream_to_file(output_llvm_ir)
         bin2llvm.insertAllFunctions()
-        bin2llvm.save_to_file(output_llvm_ir)
+        bin2llvm.finish_stream_to_file()
         
         logging.info(f"Successfully lifted binary to LLVM IR: {output_llvm_ir}")
         return True
@@ -2124,8 +2528,9 @@ def main(
         ida_auto.auto_wait()
         bin2llvm = BIN2LLVMController(target_mode=target)
         bin2llvm.initialize()
+        bin2llvm.begin_stream_to_file(output)
         bin2llvm.insertAllFunctions()
-        bin2llvm.save_to_file(output)
+        bin2llvm.finish_stream_to_file()
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
