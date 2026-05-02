@@ -73,8 +73,9 @@ case "${opt_level}" in
 	0|O0|o0) opt_level="O0" ;;
 	1|O1|o1) opt_level="O1" ;;
 	2|O2|o2) opt_level="O2" ;;
+	3|O3|o3) opt_level="O3" ;;
 	*)
-		echo "Error: OPT_LEVEL must be one of O0/O1/O2 or 0/1/2."
+		echo "Error: OPT_LEVEL must be one of O0/O1/O2/O3 or 0/1/2/3."
 		exit 1
 		;;
 esac
