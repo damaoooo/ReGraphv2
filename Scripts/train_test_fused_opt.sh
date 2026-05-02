@@ -5,10 +5,10 @@ set -euo pipefail
 REPO_ROOT="/home/damaoooo/Downloads/regraphv2"
 PYTHON_CMD=${PYTHON_CMD:-$(which python)}
 
-steps=300000
+steps=""
 max_length=2048
-eval_steps=30000
-save_steps=1000
+eval_steps=""
+save_steps=10000
 batch_size=16
 gpu_batch_size=256
 eval_samples=0
@@ -33,10 +33,10 @@ What it does:
   4. Save the test result as Markdown.
 
 Options:
-  --steps N              Max training steps. Default: 300000
+  --steps N              Optional max training steps. Default: disabled; train 1 epoch.
   --max-length N         Train/eval max sequence length. Default: 2048
-  --eval-steps N         Validation loss interval. Default: 30000
-  --save-steps N         Checkpoint save interval. Default: 1000
+  --eval-steps N         Validation loss interval. Default: same as save steps.
+  --save-steps N         Checkpoint save interval. Default: 10000
   --batch-size N         Evaluation embedding batch size. Default: 16
   --gpu-batch-size N     Evaluation similarity GPU batch size. Default: 256
   --eval-samples N       Test anchors to sample. 0 means all. Default: 0
@@ -52,7 +52,7 @@ Environment:
 
 Example:
   bash Scripts/train_test_fused_opt.sh O0
-  bash Scripts/train_test_fused_opt.sh O2 --steps 50000 --max-length 4096
+  bash Scripts/train_test_fused_opt.sh O2 --max-length 4096
 EOF
 }
 
@@ -144,6 +144,9 @@ done
 
 for numeric_arg in steps max_length eval_steps save_steps batch_size gpu_batch_size eval_samples pool_samples; do
 	value="${!numeric_arg}"
+	if [[ -z "${value}" ]]; then
+		continue
+	fi
 	if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
 		echo "Error: --${numeric_arg//_/-} must be a non-negative integer."
 		exit 1
@@ -188,7 +191,7 @@ echo "[INFO] output_root=${output_root}"
 echo "[INFO] model_dir=${model_dir}"
 echo "[INFO] markdown_result=${markdown_result}"
 echo "[INFO] cfg=true, ddg=true"
-echo "[INFO] max_length=${max_length}, steps=${steps}, eval_steps=${eval_steps}"
+echo "[INFO] max_length=${max_length}, max_steps=${steps:-disabled}, eval_steps=${eval_steps:-save_steps}, save_steps=${save_steps}"
 
 read -r -a PYTHON <<< "${PYTHON_CMD}"
 
@@ -197,15 +200,20 @@ if [[ "${skip_train}" == "0" ]]; then
 		"${PYTHON[@]}" -m Pretrain.run_pretrain train
 		--dataset-dir "${train_dir}"
 		--validation-dataset-dir "${validation_dir}"
-		--set "max_steps=${steps}"
 		--set "max_seq_length=${max_length}"
-		--set "eval_steps=${eval_steps}"
 		--set "save_steps=${save_steps}"
 		--set "output_dir=${checkpoint_prefix}"
 		--set "logging_dir=${tensorboard_prefix}"
 		--set "final_model_dir=${model_prefix}"
 		--set "report_to=tensorboard"
 	)
+
+	if [[ -n "${steps}" ]]; then
+		train_cmd+=(--set "max_steps=${steps}")
+	fi
+	if [[ -n "${eval_steps}" ]]; then
+		train_cmd+=(--set "eval_steps=${eval_steps}")
+	fi
 
 	if [[ "${resume}" == "1" ]]; then
 		train_cmd+=(--resume)

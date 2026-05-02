@@ -6,7 +6,7 @@ cd "/home/damaoooo/Downloads/regraphv2"
 
 use_cfg=1
 use_ddg=1
-steps=30000
+steps=""
 output_file=""
 
 build_graph_tag() {
@@ -30,12 +30,12 @@ Options:
 												Default: enabled
 	--ddg / --no-ddg      Enable or disable DDG graph branch.
 												Default: enabled
-	--steps N             Max training steps.
-												Default: 30000
+	--steps N             Optional max training steps.
+												Default: disabled; train 1 epoch.
 	--output_file FILE    Write evaluation output (stdout/stderr) to FILE.
 								Training output stays in terminal.
 												If omitted, defaults to
-												./logs_ablation<steps>_<graph_tag>.log
+												./logs_ablation<step_tag>_<graph_tag>.log
 	-h, --help            Show this help message and exit.
 
 Example:
@@ -91,12 +91,12 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-if ! [[ "${steps}" =~ ^[0-9]+$ ]]; then
+if [[ -n "${steps}" && ! "${steps}" =~ ^[0-9]+$ ]]; then
 	echo "Error: --steps must be a positive integer."
 	exit 1
 fi
 
-step_tag="${steps}"
+step_tag="${steps:-1epoch}"
 graph_tag="$(build_graph_tag)"
 if [[ -z "${output_file}" ]]; then
 	output_file="./logs_ablation${step_tag}_${graph_tag}.log"
@@ -104,7 +104,7 @@ fi
 
 mkdir -p "$(dirname "${output_file}")"
 
-echo "[INFO] cfg=${use_cfg}, ddg=${use_ddg}, steps=${steps}"
+echo "[INFO] cfg=${use_cfg}, ddg=${use_ddg}, max_steps=${steps:-disabled}"
 echo "[INFO] evaluation output_file=${output_file}"
 
 run_tag="ablation${step_tag}_${graph_tag}"
@@ -127,7 +127,17 @@ else
 	eval_graph_flags+=(--no-ddg)
 fi
 
-python -m Pretrain.run_pretrain train "${train_graph_flags[@]}" --set max_steps=${steps} --set output_dir=./output_${run_tag} --set final_model_dir=${model_dir} --set logging_dir=./logs_${run_tag} --set report_to=tensorboard
+train_cmd=(
+	python -m Pretrain.run_pretrain train "${train_graph_flags[@]}"
+	--set output_dir=./output_${run_tag}
+	--set final_model_dir=${model_dir}
+	--set logging_dir=./logs_${run_tag}
+	--set report_to=tensorboard
+)
+if [[ -n "${steps}" ]]; then
+	train_cmd+=(--set max_steps=${steps})
+fi
+"${train_cmd[@]}"
 
 if [[ -f "./db1_${graph_tag}_test.pkl.npy" ]]; then
     echo "[INFO] Removing existing evaluation results: ./db1_${graph_tag}_test.pkl.npy"

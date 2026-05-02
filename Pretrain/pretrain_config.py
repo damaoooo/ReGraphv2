@@ -50,7 +50,7 @@ class PretrainConfig(RoFormerConfig):
         graph_dropout: float = 0.1,
         # === 训练配置 ===
         num_train_epochs: int = 1,
-        max_steps: int = 300000,
+        max_steps: int = -1,
         per_device_train_batch_size: int = 4,
         fp16: bool = False,
         bf16: bool = True,
@@ -64,8 +64,8 @@ class PretrainConfig(RoFormerConfig):
         moco_temperature: float = 0.07,
         # === 保存配置 ===
         save_strategy: str = "steps",
-        save_steps: int = 1000,
-        save_total_limit: int = 3,
+        save_steps: int = 10000,
+        save_total_limit: Optional[int] = None,
         # === 日志配置 ===
         logging_strategy: str = "steps",
         logging_steps: int = 100,

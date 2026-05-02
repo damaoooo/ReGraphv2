@@ -1,60 +1,37 @@
-# 预训练步数配置建议
+# 预训练轮数与 checkpoint 配置
 
 ## 当前默认配置
-- max_steps: 10000 (约等于之前的短时间训练)
-- save_steps: 1000 (每1000步保存一次)
-- warmup_steps: 1000 (前1000步进行学习率预热)
-- logging_steps: 100 (每100步记录一次日志)
 
-## 根据训练时间调整步数的建议
+- `num_train_epochs = 1`：默认训练 1 个 epoch。
+- `max_steps = -1`：不再用固定 step 截断训练。
+- `save_steps = 10000`：每 10K step 保存一次常规 checkpoint。
+- `eval_steps = None`：有验证集时默认跟随 `save_steps`，也就是每 10K step 验证一次。
+- `save_total_limit = None`：默认不删除历史 checkpoint。
 
-### 短期测试 (1-2小时)
-```python
-max_steps = 1000
-save_steps = 200
-warmup_steps = 100
+训练结束时会额外维护 3 个命名 checkpoint：
+
+- `checkpoint-last`：最后一次训练状态。
+- `checkpoint-best-validation-loss`：validation loss 最低的 checkpoint。
+- `checkpoint-best-train-loss`：train loss 最低的 checkpoint。
+
+这些目录里会写入 `named_checkpoint_info.json`，记录来源 checkpoint、step 和对应 loss。
+
+## 常用覆盖方式
+
+通常不需要再设置 `max_steps`。如果想多训几轮，优先改 epoch：
+
+```bash
+python -m Pretrain.run_pretrain train --set num_train_epochs=2
 ```
 
-### 中期训练 (8-12小时)
-```python
-max_steps = 5000
-save_steps = 500
-warmup_steps = 500
+如果只是想调整保存频率：
+
+```bash
+python -m Pretrain.run_pretrain train --set save_steps=20000
 ```
 
-### 长期训练 (24-48小时)
-```python
-max_steps = 20000
-save_steps = 2000
-warmup_steps = 1000
+只有在做很短的 smoke test 时，才建议临时设置 `max_steps`：
+
+```bash
+python -m Pretrain.run_pretrain train --set max_steps=1000
 ```
-
-### 完整训练 (多天)
-```python
-max_steps = 50000
-save_steps = 5000
-warmup_steps = 2000
-```
-
-## 如何修改配置
-
-1. 直接在 pretrain_config.py 中修改 max_steps 的值
-2. 或者在运行时通过代码覆盖:
-
-```python
-from Pretrain.pretrain_config import DEFAULT_CONFIG
-
-# 创建自定义配置
-config = DEFAULT_CONFIG
-config.max_steps = 5000  # 你想要的步数
-config.save_steps = 500  # 调整保存频率
-
-# 使用自定义配置运行
-main(config)
-```
-
-## 步数与时间的估算
-- 每步大约需要 1-3 秒 (取决于硬件和批次大小)
-- 1000步 ≈ 30分钟 - 1小时
-- 5000步 ≈ 3-5小时
-- 10000步 ≈ 6-10小时

@@ -3,6 +3,8 @@ import os
 import copy
 import ast
 import inspect
+import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from .pretrain_model import MoCoPretrainModel, ReFormerPretrainModel
@@ -10,7 +12,7 @@ import pickle
 import torch
 import typer
 from transformers import Trainer, TrainingArguments
-from transformers.trainer_utils import get_last_checkpoint
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoint
 from transformers.trainer import unwrap_model
 from Model.graph_utils import build_batched_span_graph_tensors
 from Pretrain.pretrain_dataset import MoCoDataCollator, load_dataset, compute_group_ids
@@ -818,7 +820,8 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
 
     train_args_kwargs = {
         "output_dir": output_dir,
-        "max_steps": config.max_steps,  # 使用 max_steps 而不是 num_train_epochs
+        "num_train_epochs": config.num_train_epochs,
+        "max_steps": config.max_steps,  # -1 表示按 num_train_epochs 训练，默认 1 个 epoch
         "per_device_train_batch_size": config.per_device_train_batch_size,
         "fp16": config.fp16,
         "bf16": config.bf16,
@@ -864,6 +867,189 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
             super().__init__(*args, **kwargs)
             self.skipped_steps = 0
             self.can_return_loss = True
+            self._latest_train_loss: Optional[float] = None
+            self._latest_train_loss_step: Optional[int] = None
+            self._latest_train_metric_name: Optional[str] = None
+            self._latest_validation_loss: Optional[float] = None
+            self._latest_validation_loss_step: Optional[int] = None
+            self._latest_validation_metric_name: Optional[str] = None
+            self.best_train_loss: Optional[float] = None
+            self.best_train_loss_step: Optional[int] = None
+            self.best_validation_loss: Optional[float] = None
+            self.best_validation_loss_step: Optional[int] = None
+
+        @staticmethod
+        def _as_float(value: Any) -> Optional[float]:
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _checkpoint_dir_for_current_step(self, trial=None) -> str:
+            run_dir = self._get_output_dir(trial=trial)
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+            return os.path.join(run_dir, checkpoint_folder)
+
+        def _write_named_checkpoint_metadata(
+            self,
+            checkpoint_dir: str,
+            *,
+            alias: str,
+            source_checkpoint: str,
+            metric_name: Optional[str] = None,
+            metric_value: Optional[float] = None,
+        ) -> None:
+            metadata = {
+                "alias": alias,
+                "source_checkpoint": os.path.basename(source_checkpoint),
+                "global_step": int(self.state.global_step),
+            }
+            if metric_name is not None:
+                metadata["metric_name"] = metric_name
+            if metric_value is not None:
+                metadata["metric_value"] = metric_value
+
+            with open(os.path.join(checkpoint_dir, "named_checkpoint_info.json"), "w") as f:
+                json.dump(metadata, f, indent=2, sort_keys=True)
+                f.write("\n")
+
+        def _replace_named_checkpoint(
+            self,
+            source_checkpoint: str,
+            alias: str,
+            *,
+            metric_name: Optional[str] = None,
+            metric_value: Optional[float] = None,
+        ) -> Optional[str]:
+            if not self.args.should_save or not os.path.isdir(source_checkpoint):
+                return None
+
+            run_dir = os.path.dirname(source_checkpoint)
+            target_dir = os.path.join(run_dir, alias)
+            if os.path.abspath(source_checkpoint) == os.path.abspath(target_dir):
+                return target_dir
+
+            tmp_dir = os.path.join(run_dir, f".{alias}.tmp-{os.getpid()}")
+            if os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            try:
+                shutil.copytree(source_checkpoint, tmp_dir, symlinks=True)
+                self._write_named_checkpoint_metadata(
+                    tmp_dir,
+                    alias=alias,
+                    source_checkpoint=source_checkpoint,
+                    metric_name=metric_name,
+                    metric_value=metric_value,
+                )
+                if os.path.exists(target_dir):
+                    shutil.rmtree(target_dir)
+                os.replace(tmp_dir, target_dir)
+                return target_dir
+            finally:
+                if os.path.exists(tmp_dir):
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        def _maybe_update_best_train_checkpoint(self, source_checkpoint: str) -> None:
+            loss = self._latest_train_loss
+            step = self._latest_train_loss_step
+            if loss is None or step != self.state.global_step:
+                return
+
+            if self.best_train_loss is None or loss < self.best_train_loss:
+                self.best_train_loss = loss
+                self.best_train_loss_step = int(self.state.global_step)
+                self._replace_named_checkpoint(
+                    source_checkpoint,
+                    "checkpoint-best-train-loss",
+                    metric_name=self._latest_train_metric_name or "loss",
+                    metric_value=loss,
+                )
+
+        def _maybe_update_best_validation_checkpoint(self, source_checkpoint: str) -> None:
+            loss = self._latest_validation_loss
+            step = self._latest_validation_loss_step
+            if loss is None or step != self.state.global_step:
+                return
+
+            if self.best_validation_loss is None or loss < self.best_validation_loss:
+                self.best_validation_loss = loss
+                self.best_validation_loss_step = int(self.state.global_step)
+                self._replace_named_checkpoint(
+                    source_checkpoint,
+                    "checkpoint-best-validation-loss",
+                    metric_name=self._latest_validation_metric_name or "eval_loss",
+                    metric_value=loss,
+                )
+
+        def _sync_best_checkpoints(self, source_checkpoint: str) -> None:
+            self._maybe_update_best_train_checkpoint(source_checkpoint)
+            self._maybe_update_best_validation_checkpoint(source_checkpoint)
+
+        def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
+            train_loss = self._as_float(logs.get("loss"))
+            if train_loss is not None:
+                self._latest_train_loss = train_loss
+                self._latest_train_loss_step = int(self.state.global_step)
+                self._latest_train_metric_name = "loss"
+            return super().log(logs, *args, **kwargs)
+
+        def evaluate(self, *args, **kwargs):
+            metrics = super().evaluate(*args, **kwargs)
+            loss_key = None
+            for key in ("eval_loss", "validation_loss"):
+                if key in metrics:
+                    loss_key = key
+                    break
+            if loss_key is None:
+                loss_key = next((key for key in metrics if key.endswith("_loss")), None)
+
+            if loss_key is not None:
+                validation_loss = self._as_float(metrics.get(loss_key))
+                if validation_loss is not None:
+                    self._latest_validation_loss = validation_loss
+                    self._latest_validation_loss_step = int(self.state.global_step)
+                    self._latest_validation_metric_name = loss_key
+            return metrics
+
+        def _save_checkpoint(self, *args, **kwargs):
+            trial = kwargs.get("trial")
+            if trial is None and len(args) >= 2:
+                trial = args[1]
+
+            result = super()._save_checkpoint(*args, **kwargs)
+            checkpoint_dir = self._checkpoint_dir_for_current_step(trial=trial)
+            self._sync_best_checkpoints(checkpoint_dir)
+            return result
+
+        def note_final_train_metrics(self, metrics: Dict[str, float]) -> None:
+            if self.best_train_loss is not None:
+                return
+            train_loss = self._as_float(metrics.get("train_loss"))
+            if train_loss is not None:
+                self._latest_train_loss = train_loss
+                self._latest_train_loss_step = int(self.state.global_step)
+                self._latest_train_metric_name = "train_loss"
+
+        def save_final_checkpoint(self) -> Optional[str]:
+            if self.state.global_step <= 0:
+                return None
+
+            checkpoint_dir = self._checkpoint_dir_for_current_step()
+            if not os.path.isdir(checkpoint_dir):
+                self._save_checkpoint(self.model, trial=None)
+                checkpoint_dir = self._checkpoint_dir_for_current_step()
+            else:
+                self._sync_best_checkpoints(checkpoint_dir)
+
+            self._replace_named_checkpoint(checkpoint_dir, "checkpoint-last")
+            return checkpoint_dir
+
+        def update_best_validation_from_checkpoint(self, source_checkpoint: Optional[str]) -> None:
+            if source_checkpoint is not None:
+                self._maybe_update_best_validation_checkpoint(source_checkpoint)
 
         def get_eval_dataloader(self, eval_dataset=None):
             if self.eval_data_collator is None:
@@ -979,7 +1165,7 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
 
     if trainer.skipped_steps:
         print(f"Skipped steps due to bad batches: {trainer.skipped_steps}")
-        if trainer.skipped_steps >= train_args.max_steps:
+        if train_args.max_steps > 0 and trainer.skipped_steps >= train_args.max_steps:
             raise RuntimeError(
                 "All training steps were skipped due to bad batches. "
                 "Please check bad_batches.log and dataset/collator integrity."
@@ -989,17 +1175,21 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
 
     # --- 训练完成后 ---
 
+    # 记录训练过程中的一些指标，并确保最后一步也有可恢复的 checkpoint。
+    metrics = train_result.metrics
+    trainer.note_final_train_metrics(metrics)
+    final_checkpoint_dir = trainer.save_final_checkpoint()
+
     # 保存最终的模型、分词器和配置
     # 这会创建一个干净的、可以被 from_pretrained 加载的最终模型文件夹
     trainer.save_model(final_model_dir)
     tokenizer.save_pretrained(final_model_dir)
 
-    # 记录训练过程中的一些指标
-    metrics = train_result.metrics
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
     if validation_dataset_idx is not None:
         validation_metrics = trainer.evaluate(metric_key_prefix="validation")
+        trainer.update_best_validation_from_checkpoint(final_checkpoint_dir)
         trainer.log_metrics("validation", validation_metrics)
         trainer.save_metrics("validation", validation_metrics)
     trainer.save_state() # 保存Trainer的状态，包括随机种子等
@@ -1025,7 +1215,7 @@ def debug_command(
         None,
         "--set",
         "-s",
-        help="Override config item, repeatable. Example: --set max_steps=2000 --set bf16=false",
+        help="Override config item, repeatable. Example: --set num_train_epochs=2 --set bf16=false",
     ),
 ):
     device = device.lower()
@@ -1100,7 +1290,7 @@ def train_command(
         None,
         "--set",
         "-s",
-        help="Override config item, repeatable. Example: --set max_steps=5000 --set learning_rate=1e-4",
+        help="Override config item, repeatable. Example: --set num_train_epochs=2 --set learning_rate=1e-4",
     ),
 ):
     config = _build_config(overrides=override)

@@ -96,8 +96,9 @@ debug_gpu(config)
 - `max_seq_length`: 最大序列长度（默认4096）
 - `per_device_train_batch_size`: 每设备批次大小（默认1）
 - `learning_rate`: 学习率（默认5e-5）
-- `num_train_epochs`: 训练轮数（默认3）
-- `save_steps`: 保存间隔步数（默认500000）
+- `num_train_epochs`: 训练轮数（默认1）
+- `max_steps`: 最大训练步数（默认-1，表示不按固定step截断）
+- `save_steps`: 保存间隔步数（默认10000）
 
 ### 路径配置
 所有路径都可以在配置文件中修改，包括：
