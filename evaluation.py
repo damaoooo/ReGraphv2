@@ -693,9 +693,9 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets
 
 @app.command()
 def main(
-    validation_dataset_pool_path: Path = typer.Argument(..., help="验证集数据池的路径。", exists=True, dir_okay=True),
     validation_positive_map_path: Path = typer.Argument(..., help="验证集正样本映射.pkl文件路径。", exists=True, file_okay=True),
-    model_path: Path = typer.Argument(..., help="训练好的模型路径。", exists=True, dir_okay=True),
+    validation_dataset_pool_path: Optional[Path] = typer.Option(None, "--dataset-path", "-d", help="验证集数据池的路径（已有embedding且使用全量池时可不传）。", exists=False, dir_okay=True),
+    model_path: Optional[Path] = typer.Option(None, "--model-path", "-m", help="训练好的模型路径（已有embedding时可不传）。", exists=False, dir_okay=True),
     ks_str: str = typer.Option("1,5,10,15,20,25,30,35,40,45,50", "--ks", "-k", help="要评估的K值，以逗号分隔。"),
     batch_size: int = typer.Option(16, "--batch-size", "-b", help="模型推理的批量大小。"),
     max_length: int = typer.Option(2048, "--max-length", help="将'文本'整体截断到的最大token长度。"),
@@ -712,88 +712,138 @@ def main(
     markdown_output: Optional[Path] = typer.Option(None, "--markdown-output", "--md-output", help="将评估结果保存为Markdown文件。"),
 ):
     """
-    在验证集上评估模型的函数检索性能 (Recall@K)，使用本地模型生成嵌入，GPU加速相似度计算。
+    在验证集上评估模型的函数检索性能 (Recall@K)。
+
+    已缓存嵌入向量时，只需提供 embedding 文件和 positive_map 文件即可评估，
+    无需原始数据集和模型，方便在不同服务器间迁移。
     """
     console.rule(f"[bold blue]开始使用本地模型进行评估[/bold blue]")
     set_seed(seed)
-    console.print(f"[blue]Graph branches: cfg={use_cfg}, ddg={use_ddg}[/blue]")
-    
+
     # GPU可用性检查
     if use_gpu and not GPU_AVAILABLE:
         console.print("[yellow]⚠ 请求使用GPU但PyTorch CUDA不可用，将回退到CPU计算[/yellow]")
         use_gpu = False
-    
+
     if use_gpu:
         console.print(f"[green]🚀 将使用GPU加速，批量大小: {gpu_batch_size}[/green]")
     else:
         console.print("[blue]💻 使用CPU计算[/blue]")
-    
-    # --- 1. 加载数据和Tokenizer ---
-    logging.info("正在加载数据和Tokenizer...")
+
+    # --- 1. 加载 positive_map（始终需要） ---
+    logging.info("正在加载正样本映射...")
     with open(validation_positive_map_path, 'rb') as f:
         positive_map = pickle.load(f)
-    dataset = load_from_disk(str(validation_dataset_pool_path))
-    
-    # 加载Tokenizer
-    if tokenizer_path:
-        tokenizer = load_tokenizer(str(tokenizer_path))
-    else:
-        # 使用默认的tokenizer路径（假设与测试代码中相同）
-        default_tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
-        tokenizer = load_tokenizer(default_tokenizer_path)
 
+    embeddings_cached = embeddings_path and embeddings_path.exists()
+    need_dataset = not embeddings_cached or pool_samples > 0
 
-    dataset_for_eval, positive_map_for_eval, anchors_to_evaluate = _build_eval_subset(
-        dataset=dataset,
-        positive_map=positive_map,
-        eval_samples=eval_samples,
-        pool_samples=pool_samples,
-    )
+    if need_dataset and not validation_dataset_pool_path:
+        console.print("[red]ERROR: 数据集路径为必填项（未缓存embedding 或 启用了 --pool-samples）[/red]")
+        raise typer.Exit(code=1)
 
-    if pool_samples > 0:
-        logging.info(
-            f"快速评估模式: 检索池从 {len(dataset):,} 缩小到 {len(dataset_for_eval):,}，"
-            f"锚点数 {len(anchors_to_evaluate):,}"
-        )
-        if embeddings_path:
-            logging.warning("启用了 --pool-samples 时，请确保 embeddings_path 不与全量评估缓存混用。")
-    else:
-        logging.info(f"全量评估模式: 检索池 {len(dataset_for_eval):,}，锚点数 {len(anchors_to_evaluate):,}")
-
-    # --- 2. 生成或加载所有嵌入向量 ---
-    if embeddings_path and embeddings_path.exists():
+    # --- 2. 加载或生成嵌入向量 ---
+    if embeddings_cached:
         logging.info(f"正在从 [cyan]{embeddings_path}[/cyan] 加载已缓存的嵌入向量...")
-        all_embeddings = np.load(embeddings_path, mmap_mode='r')  # 使用mmap_mode避免全部加载到内存
+        if embeddings_path.suffix == '.pth':
+            all_embeddings = torch.load(str(embeddings_path), map_location='cpu')
+        else:
+            all_embeddings = np.load(embeddings_path, mmap_mode='r')
         logging.info(f"嵌入向量加载完毕，形状为: [green]{all_embeddings.shape}[/green]")
+
+        if pool_samples > 0:
+            dataset = load_from_disk(str(validation_dataset_pool_path))
+            dataset_for_eval, positive_map_for_eval, anchors_to_evaluate = _build_eval_subset(
+                dataset=dataset,
+                positive_map=positive_map,
+                eval_samples=eval_samples,
+                pool_samples=pool_samples,
+            )
+            logging.info(
+                f"快速评估模式: 检索池从 {len(dataset):,} 缩小到 {len(dataset_for_eval):,}，"
+                f"锚点数 {len(anchors_to_evaluate):,}"
+            )
+        else:
+            # 全量评估 + 已缓存 embedding：无需数据集，直接从 embedding 和 positive_map 推导
+            dataset_for_eval = None
+            positive_map_for_eval = positive_map
+            all_anchors = list(positive_map.keys())
+            if eval_samples > 0 and eval_samples < len(all_anchors):
+                anchors_to_evaluate = random.sample(all_anchors, eval_samples)
+            else:
+                anchors_to_evaluate = all_anchors
+            total_size = len(all_embeddings)
+            logging.info(f"全量评估模式（仅用缓存）: 检索池 {total_size:,}，锚点数 {len(anchors_to_evaluate):,}")
     else:
+        # 需要生成 embedding：数据集、模型、tokenizer 都不可缺
+        if not validation_dataset_pool_path:
+            console.print("[red]ERROR: 未缓存 embedding 时数据集路径为必填项[/red]")
+            raise typer.Exit(code=1)
+        if not model_path:
+            console.print("[red]ERROR: 未缓存 embedding 时模型路径为必填项（--model-path）[/red]")
+            raise typer.Exit(code=1)
+
+        dataset = load_from_disk(str(validation_dataset_pool_path))
+
+        if tokenizer_path:
+            tokenizer = load_tokenizer(str(tokenizer_path))
+        else:
+            default_tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
+            tokenizer = load_tokenizer(default_tokenizer_path)
+
+        console.print(f"[blue]Graph branches: cfg={use_cfg}, ddg={use_ddg}[/blue]")
+
+        dataset_for_eval, positive_map_for_eval, anchors_to_evaluate = _build_eval_subset(
+            dataset=dataset,
+            positive_map=positive_map,
+            eval_samples=eval_samples,
+            pool_samples=pool_samples,
+        )
+
+        if pool_samples > 0:
+            logging.info(
+                f"快速评估模式: 检索池从 {len(dataset):,} 缩小到 {len(dataset_for_eval):,}，"
+                f"锚点数 {len(anchors_to_evaluate):,}"
+            )
+            if embeddings_path:
+                logging.warning("启用了 --pool-samples 时，请确保 embeddings_path 不与全量评估缓存混用。")
+        else:
+            logging.info(f"全量评估模式: 检索池 {len(dataset_for_eval):,}，锚点数 {len(anchors_to_evaluate):,}")
+
         all_embeddings = generate_embeddings_with_model(
             dataset_source=dataset_for_eval,
-            batch_size=batch_size, 
-            tokenizer=tokenizer, 
+            batch_size=batch_size,
+            tokenizer=tokenizer,
             model_path=str(model_path),
             max_length=max_length,
             use_cfg=use_cfg,
             use_ddg=use_ddg,
         )
         logging.info(f"嵌入向量生成完毕，形状为: [green]{all_embeddings.shape}[/green]")
-        
+
         if embeddings_path:
             logging.info(f"正在将新生成的嵌入向量缓存到 [cyan]{embeddings_path}[/cyan]...")
             embeddings_path.parent.mkdir(parents=True, exist_ok=True)
-            np.save(embeddings_path, all_embeddings)
+            if embeddings_path.suffix == '.pth':
+                torch.save(torch.from_numpy(all_embeddings), str(embeddings_path))
+            else:
+                np.save(embeddings_path, all_embeddings)
             logging.info("缓存完成。")
-            # 缓存后重新加载为memmap，释放内存
             del all_embeddings
-            all_embeddings = np.load(str(embeddings_path), mmap_mode='r')
-            logging.info(f"已将嵌入向量切换为内存映射模式 (mmap)")
+            if embeddings_path.suffix == '.pth':
+                all_embeddings = torch.load(str(embeddings_path), map_location='cpu')
+            else:
+                all_embeddings = np.load(str(embeddings_path), mmap_mode='r')
+                logging.info(f"已将嵌入向量切换为内存映射模式 (mmap)")
 
     # --- 3. GPU内存预处理 ---
     if use_gpu:
         logging.info("正在将嵌入向量转移到GPU...")
-        # 一次性把全部嵌入加载到GPU，避免每个batch的CPU->GPU拷贝
-        # memmap在mmap_mode='r'下是只读的，先拷贝为可写数组再转成Tensor
         target_dtype = torch.bfloat16 if use_bf16 else torch.float32
-        all_embeddings_gpu = torch.from_numpy(np.array(all_embeddings, copy=True)).to("cuda", dtype=target_dtype, non_blocking=False)
+        if isinstance(all_embeddings, torch.Tensor):
+            all_embeddings_gpu = all_embeddings.to("cuda", dtype=target_dtype, non_blocking=False)
+        else:
+            all_embeddings_gpu = torch.from_numpy(np.array(all_embeddings, copy=True)).to("cuda", dtype=target_dtype, non_blocking=False)
         dtype_label = "BF16" if use_bf16 else "FP32"
         logging.info(f"[green]✓ 已将全部嵌入加载到GPU ({dtype_label}): {all_embeddings_gpu.nbytes / (1024**3):.2f} GB[/green]")
     else:
@@ -909,7 +959,7 @@ def main(
             mrr_values=mrr_values,
             mrr_pool_values=mrr_pool_values,
             anchors_evaluated=len(anchors_to_evaluate),
-            total_pool_size=len(dataset_for_eval),
+            total_pool_size=len(dataset_for_eval) if dataset_for_eval is not None else len(all_embeddings),
             max_length=max_length,
             batch_size=batch_size,
             gpu_batch_size=gpu_batch_size,
