@@ -28,6 +28,8 @@ __pycache__/
 *.ll
 *.npy
 *.bc
+*.pth
+runs/
 *.dot
 **/build
 
