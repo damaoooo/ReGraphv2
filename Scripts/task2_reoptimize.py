@@ -169,7 +169,7 @@ def main(
     opt_level: str = typer.Option(
         "O3",
         "--opt-level",
-        help="clang optimization level for Task 2, e.g. O0, O1, O2, O3, Os, Oz",
+        help="clang optimization level for Task 2, e.g. O0, O1, O2, O3, Os, Og, Oz",
     ),
     arch: str = typer.Option(
         "auto",

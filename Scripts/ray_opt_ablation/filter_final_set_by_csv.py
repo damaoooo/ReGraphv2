@@ -30,7 +30,7 @@ SPLIT_ALIASES = {
     "testing": "test",
     "test": "test",
 }
-OPT_LEVEL_PATTERN = re.compile(r"^(?P<prefix>.+)-(?P<opt>O0|O1|O2|O3|Os|Oz)_(?P<binary>.+)$")
+OPT_LEVEL_PATTERN = re.compile(r"^(?P<prefix>.+)-(?P<opt>O0|O1|O2|O3|Os|Og|Oz)_(?P<binary>.+)$")
 
 
 def normalize_split(split: str) -> str:
@@ -143,7 +143,7 @@ def derive_origin_and_opt(binary_name: str) -> tuple[str, str]:
         return origin, match.group("opt")
 
     legacy_parts = basename.rsplit("-", 2)
-    if len(legacy_parts) == 3 and legacy_parts[1] in {"O0", "O1", "O2", "O3", "Os", "Oz"}:
+    if len(legacy_parts) == 3 and legacy_parts[1] in {"O0", "O1", "O2", "O3", "Os", "Og", "Oz"}:
         origin_basename = legacy_parts[0]
         origin = f"{directory}/{origin_basename}" if directory else origin_basename
         return origin, legacy_parts[1]

@@ -33,8 +33,9 @@ python3 pipeline.py pipeline --output /path/to/output --start-from 2
 # 自定义工作进程数
 python3 pipeline.py pipeline --output /path/to/output --workers 8
 
-# Task 2 使用 Os 而不是默认 O3
+# Task 2 使用 Os 或 Og 而不是默认 O3
 python3 pipeline.py pipeline --output /path/to/output --opt-level Os
+python3 pipeline.py pipeline --output /path/to/output --opt-level Og
 ```
 
 ### 2. 运行单个任务
@@ -99,7 +100,7 @@ python3 -m DataProcess.cli parquet \
 4. **灵活的控制**：可以从任意任务开始运行流水线
 5. **清晰的进度显示**：每个任务都有独立的进度条
 6. **更好的日志**：任务1有独立的日志文件 `lift_task1_log.txt`
-7. **Task 2 优化级别可配置**：支持 `--opt-level O0/O1/O2/O3/Os/Oz/...`，默认 `O3`
+7. **Task 2 优化级别可配置**：支持 `--opt-level O0/O1/O2/O3/Os/Og/Oz/...`，默认 `O3`
 8. **Task 3 fused 输出**：不再保留函数级小文件或 `results.db`，默认输出受控数量的 parquet 分片
 
 ## 典型使用场景

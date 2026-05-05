@@ -2,7 +2,7 @@
 #SBATCH --job-name=regraph_ray_fused
 #SBATCH --partition=workq
 #SBATCH --exclusive
-#SBATCH --nodes=2
+#SBATCH --nodes=3
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=384
 #SBATCH --mem=0
@@ -25,6 +25,7 @@ DEFAULT_SMOKESET_PATH="${DEFAULT_SMOKESET_PATH:-/scratch/zhoul0e/Dataset-smokete
 OUTPUT_PATH="${OUTPUT_PATH:-}"
 RESUME="${RESUME:-0}"
 FORCE_CLEAN="${FORCE_CLEAN:-0}"
+FINAL_CSV_FILTER_DIR="${FINAL_CSV_FILTER_DIR:-${REGRAPH_FINAL_CSV_FILTER_DIR:-}}"
 DRIVER_EXTRA_ARGS="${DRIVER_EXTRA_ARGS:-}"
 WORKER_PORT_SPAN="${WORKER_PORT_SPAN:-900}"
 CACHE_ROOT="${CACHE_ROOT:-/tmp/regraph_${SLURM_JOB_ID}}"
@@ -258,6 +259,7 @@ log "dataset_path=${DATASET_PATH}"
 log "output_path=${OUTPUT_PATH}"
 log "cache_root=${CACHE_ROOT}"
 log "hf_datasets_cache=${HF_DATASETS_CACHE}"
+log "final_csv_filter_dir=${FINAL_CSV_FILTER_DIR:-disabled}"
 log "smoke=${SMOKE} resume=${RESUME} force_clean=${FORCE_CLEAN}"
 log "driver_extra_args=${DRIVER_EXTRA_ARGS}"
 
@@ -342,6 +344,9 @@ fi
 if [ "${FORCE_CLEAN}" = "1" ]; then
     driver_args+=(--force-clean)
 fi
+if [ -n "${FINAL_CSV_FILTER_DIR}" ]; then
+    driver_args+=(--final-csv-filter-dir "${FINAL_CSV_FILTER_DIR}")
+fi
 if [ -n "${DRIVER_EXTRA_ARGS}" ]; then
     # shellcheck disable=SC2206
     extra_args=(${DRIVER_EXTRA_ARGS})
@@ -364,6 +369,7 @@ run_in_container_on_node "${head_node}" \
         RAY_TMPDIR="${RAY_TMPDIR}" \
         TMPDIR="${TMPDIR}" \
         REGRAPH_TOKENIZER_PATH="${REPO_ROOT}/Tokenizer/output_tokenizer/llvm_ir_bpe.json" \
+        REGRAPH_FINAL_CSV_FILTER_DIR="${FINAL_CSV_FILTER_DIR}" \
         python3 "${DRIVER}" "${driver_args[@]}"
 driver_status=$?
 set -e

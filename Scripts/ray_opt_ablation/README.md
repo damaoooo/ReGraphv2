@@ -27,6 +27,8 @@ FORCE_CLEAN=1 \
 sbatch Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O3
 ```
 
+`OPT_LEVEL` 可传 `O0`、`O1`、`O2`、`O3`、`Os`、`Og` 等 clang 风格优化等级。`O0` 的 Task2 只用 `llvm-as` 把 lifted `.ll` assemble 成 `.bc`，不再额外跑一次 `clang -O0`；其他优化等级继续用 `clang -c -emit-llvm` 重新生成 `.bc`。
+
 冒烟测试：
 
 ```bash
@@ -67,7 +69,7 @@ sbatch --nodes=3 Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O1
 
 `task2` 默认 `--task2-chunk-size 1`，也就是每个 `.ll` 文件一个 Ray task。`.ll` 输入队列会按相对路径做稳定 hash shuffle，这样慢文件只拖住自己的 task，不会把同一个目录里的 z3/openssl 文件集中压在少数节点或少数时间段里。只有在 Ray task 数过多、调度开销明显时，才建议手动调大。
 
-`--command-timeout-seconds 28800` 表示单条 `clang` / `llvm-nm` / `llvm-extract` / `opt` 命令最多运行 8 小时。设为 `0` 表示不限制单命令超时，但 Slurm 作业本身仍受 `#SBATCH --time` 或提交时 `--time` 限制。
+`--command-timeout-seconds 28800` 表示单条 `llvm-as` / `clang` / `llvm-nm` / `llvm-extract` / `opt` 命令最多运行 8 小时。设为 `0` 表示不限制单命令超时，但 Slurm 作业本身仍受 `#SBATCH --time` 或提交时 `--time` 限制。
 
 `task2` 失败文件会写入 `manifests/task2_failed.jsonl` 和 `logs/stage_failures/task2.txt`，并在 `logs/run.log` / Slurm stdout 中列出。fused driver 会继续把已成功生成的 `.bc` 交给 task3 和后续阶段；只有 task2 一个可用 `.bc` 都没生成时才会失败退出。
 
@@ -103,8 +105,20 @@ final 阶段会先把对应的 HF dataset 从 scratch 复制到节点本地 `$TM
 - `--final-output-root`：final_set 的真实落盘根目录；默认是 `OUTPUT_PATH`，也可用 `REGRAPH_FINAL_OUTPUT_ROOT` 覆盖。
 - `--final-local-root`：final 阶段本地工作目录；默认在设置了独立 `--final-output-root` 时使用 `$TMPDIR/final_sets/<output-name>`，也可用 `REGRAPH_FINAL_LOCAL_ROOT` 覆盖。
 - `--keep-final-local`：调试用，保留本地 final input/output；正常 Dataset-1 不建议打开。
+- `--final-csv-filter-dir` / `FINAL_CSV_FILTER_DIR`：final_set 生成完成后，用 Dataset-1 CSV 目录 in-place 过滤 `validation_final_set` 和 `test_final_set`；`train_final_set` 不过滤，过滤前 final_set 不会保留为额外输出。
 
-当前实现中 final 的 `train`、`validation`、`test` 三个 split 仍是串行处理；它们各自只使用 head node 上的一个 Python 进程。理论上可以改成三个 split 分别在三个节点本地 `/tmp` 上并行处理，但这还没有落到当前 driver。
+final 的 `train`、`validation`、`test` 三个 split 会作为独立 Ray task 并行处理。driver 会把这些 task 轮流 pin 到 Ray 节点资源上；申请 3 个节点时，三个 split 会分别跑在 3 个节点的本地 `$TMPDIR` staging 目录上。若只申请 2 个节点，则第三个 split 会轮转复用其中一个节点。
+
+只过滤 validation/test final_set 的提交示例：
+
+```bash
+cd /scratch/zhoul0e/ReGraphv2
+FINAL_CSV_FILTER_DIR=/scratch/zhoul0e/ReGraphv2/IR/csv_list \
+DATASET_PATH=/scratch/zhoul0e/Dataset-1 \
+OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O3-fused \
+DRIVER_EXTRA_ARGS="--task3-chunk-size 500 --max-parquet-files 100000 --command-timeout-seconds 28800 --final-output-root /scratch/zhoul0e/bandwidth/Dataset-1-O3-fused" \
+sbatch --nodes=3 Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O3
+```
 
 Dataset-1 的 final_set 使用约定：每个外层 split 目录都用内部 `train_*` 文件作为该 split 的有效数据，因为 driver 调 `Pretrain.split_train_validation` 时固定 `--train-ratio 1.0`。例如 evaluation validation 应传：
 
@@ -179,7 +193,7 @@ sbatch --nodes=3 --job-name=regraph_O2_fused \
 - Task3 函数级失败可以继续跑。O2 里出现过少量 `pygraphviz.agraph.DotError: Invalid Input`，失败记录写入 `task3_fused/.task3_fused_state/chunk_manifests/*_failed.jsonl`，pipeline 仍然成功。
 - final 阶段真正的 I/O 瓶颈不是只写 output；`save_to_disk` 也会读 HF input。如果 output 写 `/tmp` 但 input 仍从 scratch 读，速度会掉到几十 examples/s。成功方案是 input 和 output 都先放节点本地 `/tmp`，完成后再复制到 bandwidth。
 - bandwidth 适合放最终大文件。O0 的 train final set 约 21GB，从本地 `/tmp` 复制到 bandwidth 只用了约 11 秒；test HF input 约 42.6GB，从 scratch 复制到 `/tmp` 约 20 秒。
-- 当前 final 阶段仍是串行的，且每个 split 主要吃 head node 上一个 Python 进程。`train/validation/test` 各占一个节点并行处理是可行的后续优化，但本次成功版本还没有实现。
+- final 阶段现在按 split 并行提交到 Ray；申请 3 个节点时，`train/validation/test` 会分别占用一个节点做本地 staging 和 `split_train_validation`。
 
 #### 曾经踩过的坑
 
@@ -253,7 +267,7 @@ O0/O1/O2 的验证结果摘要：
 
 所有输出写入 `OUTPUT_PATH`：
 
-- `bc/`：Task2 reoptimized `.bc`，按输入 split/相对路径镜像。
+- `bc/`：Task2 生成的 `.bc`，按输入 split/相对路径镜像；`O0` 由 `llvm-as` assemble，其他优化等级由 `clang` reoptimize。
 - `task3_fused/parquet/`：最终 parquet，通常包含 `train/`、`validation/`、`test/`。
 - `task3_fused/manifests/`：fused Task3 的 `.bc` 级 success/failed/no-function manifest。
 - `hf/`：由 parquet 保存出的 HuggingFace dataset，例如 `train_dataset`。
@@ -278,6 +292,7 @@ O0/O1/O2 的验证结果摘要：
 - 每个 Ray 节点显式设置 control ports 和 worker port range。
 - 每个 worker node 使用独立端口段。
 - cache 默认写到 `/tmp/regraph_<slurm-job-id>`，包含 HuggingFace/datasets、Ray temp、XDG cache。
+- fused 脚本默认申请 3 个节点，方便 final 阶段把 `train`、`validation`、`test` 分散到不同机器；提交时仍可用 `sbatch --nodes=<N>` 覆盖。
 - cleanup 先 `ray stop --force`，再终止后台 Ray `srun` step。
 - driver 通过绝对路径提交，不使用 Ray `--working-dir` 打包 repo/dataset。
 

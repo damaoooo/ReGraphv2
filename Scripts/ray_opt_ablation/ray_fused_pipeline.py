@@ -9,6 +9,7 @@ import math
 import os
 import selectors
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -280,21 +281,40 @@ def task2_chunk(chunk_id: str, items: list[dict[str, Any]], context: dict[str, A
         if marker.exists():
             marker.unlink()
 
-        command = [
-            "clang",
-            "-m32",
-            item["opt_level"],
-            "-c",
-            "-emit-llvm",
-            "-fno-inline",
-            "-fno-inline-functions",
-            item["source_ll"],
-            "-o",
-            str(output_bc),
-        ]
+        if item["opt_level"] == "-O0":
+            task2_tool = "llvm-as"
+            command = [
+                "llvm-as",
+                item["source_ll"],
+                "-o",
+                str(output_bc),
+            ]
+        else:
+            task2_tool = "clang"
+            command = [
+                "clang",
+                "-m32",
+                item["opt_level"],
+                "-c",
+                "-emit-llvm",
+                "-fno-inline",
+                "-fno-inline-functions",
+                item["source_ll"],
+                "-o",
+                str(output_bc),
+            ]
         success, stdout, stderr, returncode = run_command(command, timeout=timeout)
         if success and output_bc.exists() and output_bc.stat().st_size > 0:
-            marker.write_text(json.dumps({"source_ll": item["source_ll"], "opt_level": item["opt_level"]}) + "\n")
+            marker.write_text(
+                json.dumps(
+                    {
+                        "source_ll": item["source_ll"],
+                        "opt_level": item["opt_level"],
+                        "task2_tool": task2_tool,
+                    }
+                )
+                + "\n"
+            )
             successes.append(item)
         else:
             if output_bc.exists():
@@ -302,7 +322,7 @@ def task2_chunk(chunk_id: str, items: list[dict[str, Any]], context: dict[str, A
             failures.append(
                 {
                     "item": item,
-                    "error": (stderr or stdout or f"clang failed returncode={returncode}")[:4000],
+                    "error": (stderr or stdout or f"{task2_tool} failed returncode={returncode}")[:4000],
                 }
             )
 
@@ -509,6 +529,62 @@ def run_subprocess_stage(stage: str, command: list[str], repo_root: str, output_
     logger.info(f"stage={stage} complete log={log_path}")
 
 
+def run_subprocess_to_log(
+    command: list[str],
+    cwd: str | Path,
+    log_path: Path,
+    timeout: int = 0,
+    header_lines: Iterable[str] | None = None,
+) -> tuple[bool, int, bool, str]:
+    ensure_dir(log_path.parent)
+    start = time.time()
+    timed_out = False
+    returncode = 0
+    tail_lines: list[str] = []
+
+    def write_line(handle: Any, line: str) -> None:
+        clean = line.rstrip("\n")
+        handle.write(clean + "\n")
+        if clean.strip():
+            tail_lines.append(clean)
+            del tail_lines[:-200]
+
+    with log_path.open("w", encoding="utf-8", buffering=1) as handle:
+        for line in header_lines or []:
+            handle.write(line.rstrip("\n") + "\n")
+        handle.write("command=" + " ".join(command) + "\n")
+        handle.write("[output]\n")
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=os.environ.copy(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while process.poll() is None:
+            if timeout > 0 and time.time() - start > timeout:
+                timed_out = True
+                process.kill()
+                break
+            for key, _ in selector.select(timeout=1):
+                line = key.fileobj.readline()
+                if line:
+                    write_line(handle, line)
+        for line in process.stdout:
+            write_line(handle, line)
+        returncode = process.wait()
+        selector.close()
+        if timed_out:
+            handle.write(f"[timeout] after {format_duration(timeout)}\n")
+
+    return returncode == 0 and not timed_out, returncode, timed_out, "\n".join(tail_lines)
+
+
 def dataset_dir_complete(path: Path) -> bool:
     return (path / "dataset_info.json").exists() and (path / "state.json").exists()
 
@@ -553,7 +629,7 @@ def directory_file_stats(path: Path) -> tuple[int, int]:
     return files, total_bytes
 
 
-def copy_directory_atomic(source: Path, target: Path, logger: RunLogger, label: str) -> None:
+def copy_directory_atomic(source: Path, target: Path, logger: RunLogger | None, label: str) -> dict[str, Any]:
     files, total_bytes = directory_file_stats(source)
     tmp_target = target.with_name(f".{target.name}.copying-{os.getpid()}")
     remove_path(tmp_target)
@@ -561,10 +637,11 @@ def copy_directory_atomic(source: Path, target: Path, logger: RunLogger, label: 
     copied_files = 0
     copied_bytes = 0
     start = time.time()
-    logger.info(
-        f"stage={label} copy_start source={source} target={target} "
-        f"files={files} bytes={total_bytes}"
-    )
+    if logger:
+        logger.info(
+            f"stage={label} copy_start source={source} target={target} "
+            f"files={files} bytes={total_bytes}"
+        )
     try:
         for root, dirs, filenames in os.walk(source):
             root_path = Path(root)
@@ -579,20 +656,30 @@ def copy_directory_atomic(source: Path, target: Path, logger: RunLogger, label: 
                 shutil.copy2(src_file, dst_file)
                 copied_files += 1
                 copied_bytes += src_file.stat().st_size
-                logger.info(
-                    f"stage={label} copy_progress files={copied_files}/{files} "
-                    f"bytes={copied_bytes}/{total_bytes} current={src_file.relative_to(source)}"
-                )
+                if logger:
+                    logger.info(
+                        f"stage={label} copy_progress files={copied_files}/{files} "
+                        f"bytes={copied_bytes}/{total_bytes} current={src_file.relative_to(source)}"
+                    )
         remove_path(target)
         os.replace(tmp_target, target)
     except Exception:
         remove_path(tmp_target)
         raise
     elapsed = time.time() - start
-    logger.info(
-        f"stage={label} copy_complete target={target} files={copied_files} "
-        f"bytes={copied_bytes} elapsed={format_duration(elapsed)}"
-    )
+    stats = {
+        "source": str(source),
+        "target": str(target),
+        "files": copied_files,
+        "bytes": copied_bytes,
+        "elapsed_s": round(elapsed, 3),
+    }
+    if logger:
+        logger.info(
+            f"stage={label} copy_complete target={target} files={copied_files} "
+            f"bytes={copied_bytes} elapsed={format_duration(elapsed)}"
+        )
+    return stats
 
 
 def refresh_directory_symlink(link_path: Path, target: Path, logger: RunLogger) -> None:
@@ -633,13 +720,380 @@ def hf_splits_complete(hf_root: Path, splits: Iterable[str]) -> bool:
     return all(dataset_dir_complete(hf_root / f"{split}_dataset") for split in splits)
 
 
+def ray_node_targets() -> list[dict[str, str]]:
+    targets: list[dict[str, str]] = []
+    for node in ray.nodes():
+        if not node.get("Alive"):
+            continue
+        resources = node.get("Resources", {})
+        address = str(node.get("NodeManagerAddress") or "")
+        preferred_key = f"node:{address}" if address else ""
+        resource_key = preferred_key if preferred_key in resources else ""
+        if not resource_key:
+            node_keys = sorted(key for key in resources if key.startswith("node:"))
+            resource_key = node_keys[0] if node_keys else ""
+        if not resource_key:
+            continue
+        targets.append(
+            {
+                "address": address,
+                "node_id": str(node.get("NodeID") or ""),
+                "resource_key": resource_key,
+            }
+        )
+    return sorted(targets, key=lambda target: (target["address"], target["node_id"]))
+
+
+@ray.remote
+def final_split_task(item: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    start = time.time()
+    repo_root = context["repo_root"]
+    configure_imports(repo_root, context.get("cache_root"))
+    timeout = int(context.get("command_timeout_seconds", 0))
+    keep_final_local = bool(context.get("keep_final_local"))
+    final_local_root = Path(context["final_local_root"]) if context.get("final_local_root") else None
+    output_root = Path(context["output_root"])
+    split = item["split"]
+    stage_name = f"final_{split}"
+    dataset_dir = Path(item["dataset_dir"])
+    final_link_dir = Path(item["final_link_dir"])
+    final_target_dir = Path(item["final_target_dir"])
+    final_work_dir = (final_local_root / f"{split}_final_set") if final_local_root else final_target_dir
+    final_input_dir = dataset_dir
+    local_input_dir: Path | None = None
+    log_path = output_root / "logs" / f"{stage_name}.log"
+    log_header = [
+        f"[{now_ts()}] stage={stage_name} host={socket.gethostname()} start",
+        f"dataset_dir={dataset_dir}",
+        f"work_dir={final_work_dir}",
+        f"target_dir={final_target_dir}",
+    ]
+    log_started = False
+    input_copy_stats: dict[str, Any] | None = None
+    output_copy_stats: dict[str, Any] | None = None
+    returncode = 0
+    timed_out = False
+    output_tail = ""
+
+    def append_log(lines: Iterable[str]) -> None:
+        ensure_dir(log_path.parent)
+        with log_path.open("a", encoding="utf-8") as handle:
+            for line in lines:
+                handle.write(line.rstrip("\n") + "\n")
+
+    try:
+        if not same_path(final_work_dir, final_target_dir):
+            remove_path(final_work_dir)
+            if final_link_dir.exists() or final_link_dir.is_symlink():
+                remove_path(final_link_dir)
+        elif final_work_dir.exists():
+            remove_path(final_work_dir)
+
+        if final_local_root:
+            local_input_dir = final_local_root / "_hf_inputs" / f"{split}_dataset"
+            remove_path(local_input_dir)
+            input_copy_stats = copy_directory_atomic(dataset_dir, local_input_dir, None, f"{stage_name}_input")
+            final_input_dir = local_input_dir
+            log_header.append(f"input_copy={json.dumps(input_copy_stats, ensure_ascii=True, sort_keys=True)}")
+
+        final_command = [
+            sys.executable,
+            "-m",
+            "Pretrain.split_train_validation",
+            str(final_input_dir),
+            "--base-path",
+            str(output_root / "bc" / split),
+            "--train-ratio",
+            "1.0",
+            "--output-dir",
+            str(final_work_dir),
+        ]
+        success, returncode, timed_out, output_tail = run_subprocess_to_log(
+            final_command,
+            cwd=repo_root,
+            log_path=log_path,
+            timeout=timeout,
+            header_lines=log_header,
+        )
+        log_started = True
+        if not success:
+            if timed_out:
+                raise RuntimeError(f"{stage_name} timed out after {format_duration(timeout)}")
+            raise RuntimeError((output_tail or f"{stage_name} failed returncode={returncode}")[-4000:])
+
+        if not dataset_dir_complete(final_work_dir / "train_dataset_pool"):
+            raise RuntimeError(f"{stage_name} did not produce a complete train_dataset_pool at {final_work_dir}")
+
+        log_footer: list[str] = []
+        if not same_path(final_work_dir, final_target_dir):
+            output_copy_stats = copy_directory_atomic(final_work_dir, final_target_dir, None, stage_name)
+            log_footer.append(f"output_copy={json.dumps(output_copy_stats, ensure_ascii=True, sort_keys=True)}")
+            if not keep_final_local:
+                remove_path(final_work_dir)
+                log_footer.append(f"removed_local_final={final_work_dir}")
+
+        if local_input_dir and not keep_final_local:
+            remove_path(local_input_dir)
+            log_footer.append(f"removed_local_input={local_input_dir}")
+
+        elapsed = time.time() - start
+        log_footer.append(f"[{now_ts()}] stage={stage_name} complete elapsed={format_duration(elapsed)}")
+        append_log(log_footer)
+        return {
+            "success": True,
+            "split": split,
+            "stage": stage_name,
+            "host": socket.gethostname(),
+            "elapsed_s": round(elapsed, 3),
+            "log_path": str(log_path),
+            "input_dir": str(final_input_dir),
+            "work_dir": str(final_work_dir),
+            "target_dir": str(final_target_dir),
+            "link_dir": str(final_link_dir),
+            "input_copy": input_copy_stats,
+            "output_copy": output_copy_stats,
+        }
+    except Exception as exc:
+        elapsed = time.time() - start
+        failure_lines: list[str] = []
+        if not log_started:
+            failure_lines.extend(log_header)
+        failure_lines.append(f"[{now_ts()}] stage={stage_name} failed elapsed={format_duration(elapsed)} error={exc}")
+        if output_tail.strip():
+            failure_lines.extend(["[output_tail]", output_tail.rstrip()])
+        failure_lines.extend(["[traceback]", traceback.format_exc()])
+        append_log(failure_lines)
+        return {
+            "success": False,
+            "split": split,
+            "stage": stage_name,
+            "host": socket.gethostname(),
+            "elapsed_s": round(elapsed, 3),
+            "log_path": str(log_path),
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "returncode": returncode,
+            "timed_out": timed_out,
+            "input_dir": str(final_input_dir),
+            "work_dir": str(final_work_dir),
+            "target_dir": str(final_target_dir),
+            "link_dir": str(final_link_dir),
+        }
+
+
+def run_final_splits_parallel(
+    final_datasets: list[tuple[str, Path]],
+    args: argparse.Namespace,
+    task3_ran: bool,
+    repo_root: str,
+    cache_root: str,
+    output_root: Path,
+    final_output_root: Path,
+    final_local_root: Path | None,
+    logger: RunLogger,
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    scheduled: list[dict[str, Any]] = []
+    for split, dataset_dir in final_datasets:
+        final_link_dir = output_root / f"{split}_final_set"
+        final_target_dir = final_output_root / f"{split}_final_set"
+        if args.resume and not task3_ran and dataset_dir_complete(final_target_dir / "train_dataset_pool"):
+            logger.info(f"stage=final split={split} skipped existing {final_target_dir}")
+            if not same_path(final_link_dir, final_target_dir):
+                refresh_directory_symlink(final_link_dir, final_target_dir, logger)
+            continue
+        scheduled.append(
+            {
+                "split": split,
+                "dataset_dir": str(dataset_dir),
+                "final_link_dir": str(final_link_dir),
+                "final_target_dir": str(final_target_dir),
+            }
+        )
+
+    if not scheduled:
+        logger.info("stage=final skipped all splits")
+        return failures
+
+    targets = ray_node_targets()
+    logger.info(
+        "stage=final parallel_start "
+        f"splits={[item['split'] for item in scheduled]} "
+        f"ray_nodes={[target['resource_key'] for target in targets]}"
+    )
+    context = {
+        "repo_root": repo_root,
+        "cache_root": cache_root,
+        "output_root": str(output_root),
+        "final_local_root": str(final_local_root) if final_local_root else "",
+        "command_timeout_seconds": args.command_timeout_seconds,
+        "keep_final_local": args.keep_final_local,
+    }
+    pending: dict[Any, dict[str, Any]] = {}
+    for index, item in enumerate(scheduled):
+        target = targets[index % len(targets)] if targets else None
+        task = final_split_task
+        if target:
+            ref = task.options(resources={target["resource_key"]: 0.001}).remote(item, context)
+            item = {**item, "ray_node": target}
+        else:
+            ref = task.remote(item, context)
+            item = {**item, "ray_node": None}
+        pending[ref] = {"item": item, "start": time.time()}
+        logger.info(
+            f"stage=final split={item['split']} submitted "
+            f"ray_node={item['ray_node']['resource_key'] if item['ray_node'] else 'default'}"
+        )
+
+    summary_interval_s = max(1, int(args.progress_summary_interval_s))
+    wait_timeout_s = min(5, summary_interval_s)
+    next_summary = time.time() + summary_interval_s
+    completed = 0
+
+    def emit_summary(reason: str, force: bool = False) -> None:
+        nonlocal next_summary
+        now = time.time()
+        if not force and now < next_summary:
+            return
+        oldest = max((now - meta["start"] for meta in pending.values()), default=0.0)
+        pending_splits = [meta["item"]["split"] for meta in pending.values()]
+        logger.info(
+            f"stage=final progress {progress_bar(completed, len(scheduled))} "
+            f"splits={completed}/{len(scheduled)} pending={pending_splits} "
+            f"oldest_pending={format_duration(oldest)} reason={reason}"
+        )
+        logger.event(
+            "final_progress",
+            reason=reason,
+            completed_splits=completed,
+            total_splits=len(scheduled),
+            pending_splits=pending_splits,
+            oldest_pending_s=round(oldest, 3),
+        )
+        next_summary = now + summary_interval_s
+
+    while pending:
+        ready, _ = ray.wait(list(pending.keys()), num_returns=1, timeout=wait_timeout_s)
+        if not ready:
+            emit_summary("wait_timeout")
+            continue
+        for ref in ready:
+            meta = pending.pop(ref)
+            split = meta["item"]["split"]
+            try:
+                result = ray.get(ref)
+            except Exception as exc:
+                result = {
+                    "success": False,
+                    "split": split,
+                    "stage": f"final_{split}",
+                    "error": f"Ray task exception: {repr(exc)}",
+                    "traceback": traceback.format_exc(),
+                    "target_dir": meta["item"]["final_target_dir"],
+                    "link_dir": meta["item"]["final_link_dir"],
+                }
+            completed += 1
+            if result.get("success"):
+                logger.info(
+                    f"stage={result['stage']} complete split={split} "
+                    f"host={result.get('host')} elapsed={format_duration(result.get('elapsed_s'))} "
+                    f"log={result.get('log_path')}"
+                )
+                final_link_dir = Path(result["link_dir"])
+                final_target_dir = Path(result["target_dir"])
+                if not same_path(final_link_dir, final_target_dir):
+                    refresh_directory_symlink(final_link_dir, final_target_dir, logger)
+            else:
+                logger.info(
+                    f"stage={result.get('stage', f'final_{split}')} failed split={split} "
+                    f"host={result.get('host')} error={compact_error(result.get('error'))} "
+                    f"log={result.get('log_path')}"
+                )
+                failures.append(result)
+            emit_summary("split_complete")
+
+    emit_summary("complete", force=True)
+    logger.info(f"stage=final complete success={len(scheduled) - len(failures)} failed={len(failures)}")
+    return failures
+
+
+def run_final_csv_filter(
+    final_csv_filter_dir: Path | None,
+    repo_root: str,
+    output_root: Path,
+    final_output_root: Path,
+    logger: RunLogger,
+    timeout: int,
+) -> list[dict[str, Any]]:
+    if final_csv_filter_dir is None:
+        logger.info("stage=final_csv_filter skipped disabled")
+        return []
+
+    failures: list[dict[str, Any]] = []
+    filter_script = Path(repo_root) / "Scripts" / "ray_opt_ablation" / "filter_final_set_by_csv.py"
+    if not filter_script.is_file():
+        return [{"stage": "final_csv_filter", "error": f"filter script not found: {filter_script}"}]
+
+    logger.info(
+        f"stage=final_csv_filter start csv_dir={final_csv_filter_dir} "
+        "splits=['validation', 'test'] mode=in_place"
+    )
+    for split in ("validation", "test"):
+        final_set_dir = final_output_root / f"{split}_final_set"
+        if not dataset_dir_complete(final_set_dir / "train_dataset_pool"):
+            failures.append(
+                {
+                    "stage": f"final_csv_filter_{split}",
+                    "split": split,
+                    "final_set": str(final_set_dir),
+                    "error": f"final_set is incomplete before filtering: {final_set_dir}",
+                }
+            )
+            continue
+
+        command = [
+            sys.executable,
+            str(filter_script),
+            str(final_set_dir),
+            str(final_csv_filter_dir),
+        ]
+        try:
+            run_subprocess_stage(
+                f"final_csv_filter_{split}",
+                command,
+                repo_root,
+                output_root,
+                logger,
+                timeout=timeout,
+            )
+            if not dataset_dir_complete(final_set_dir / "train_dataset_pool"):
+                raise RuntimeError(f"filtered final_set is incomplete: {final_set_dir}")
+        except Exception as exc:
+            failures.append(
+                {
+                    "stage": f"final_csv_filter_{split}",
+                    "split": split,
+                    "final_set": str(final_set_dir),
+                    "csv_dir": str(final_csv_filter_dir),
+                    "error": str(exc),
+                }
+            )
+
+    logger.info(f"stage=final_csv_filter complete filtered_splits=['validation', 'test'] failed={len(failures)}")
+    return failures
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ray fused .ll to final_set pipeline")
     parser.add_argument("--repo-root", default=str(DEFAULT_REPO_ROOT))
     parser.add_argument("--dataset-path", default=str(DEFAULT_DATASET_PATH))
     parser.add_argument("--output-path", default="")
     parser.add_argument("--cache-root", default=os.environ.get("REGRAPH_CACHE_ROOT", str(DEFAULT_CACHE_ROOT)))
-    parser.add_argument("--opt-level", required=True)
+    parser.add_argument(
+        "--opt-level",
+        required=True,
+        help="Task2 optimization level, e.g. O0, O1, O2, O3, Os, Og. O0 uses llvm-as; others use clang.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--force-clean", action="store_true")
     parser.add_argument("--smoke", action="store_true")
@@ -671,6 +1125,14 @@ def parse_args() -> argparse.Namespace:
         "--final-output-root",
         default=os.environ.get("REGRAPH_FINAL_OUTPUT_ROOT", ""),
         help="Root for *_final_set outputs. Defaults to --output-path.",
+    )
+    parser.add_argument(
+        "--final-csv-filter-dir",
+        default=os.environ.get("REGRAPH_FINAL_CSV_FILTER_DIR", ""),
+        help=(
+            "Optional Dataset-1 CSV directory used after final_set generation. "
+            "Only validation_final_set and test_final_set are filtered in place; train_final_set is left unchanged."
+        ),
     )
     parser.add_argument(
         "--final-local-root",
@@ -707,6 +1169,9 @@ def main() -> int:
     task3_csv_filter_dir = Path(args.task3_csv_filter_dir).expanduser().resolve() if args.task3_csv_filter_dir else None
     if task3_csv_filter_dir is not None and not task3_csv_filter_dir.is_dir():
         raise SystemExit(f"Task3 CSV filter directory does not exist: {task3_csv_filter_dir}")
+    final_csv_filter_dir = Path(args.final_csv_filter_dir).expanduser().resolve() if args.final_csv_filter_dir else None
+    if final_csv_filter_dir is not None and not final_csv_filter_dir.is_dir():
+        raise SystemExit(f"Final CSV filter directory does not exist: {final_csv_filter_dir}")
     if args.final_local_root:
         final_local_root: Path | None = Path(args.final_local_root).resolve()
     elif not same_path(final_output_root, output_root):
@@ -723,6 +1188,7 @@ def main() -> int:
         logger.info(f"output_root={output_root}")
         logger.info(f"final_output_root={final_output_root}")
         logger.info(f"task3_csv_filter_dir={task3_csv_filter_dir if task3_csv_filter_dir else 'disabled'}")
+        logger.info(f"final_csv_filter_dir={final_csv_filter_dir if final_csv_filter_dir else 'disabled'}")
         logger.info(f"final_local_root={final_local_root if final_local_root else 'disabled'} keep_final_local={args.keep_final_local}")
         logger.info(f"opt_level={opt_level}")
         for name in sorted(cache_env):
@@ -857,79 +1323,40 @@ def main() -> int:
         else:
             run_subprocess_stage("dataprocess_hf", dataprocess_command, repo_root, output_root, logger)
 
-        final_failures = []
-        for split, dataset_dir in discover_hf_split_datasets(hf_root):
-            stage_name = f"final_{split}"
-            final_link_dir = output_root / f"{split}_final_set"
-            final_target_dir = final_output_root / f"{split}_final_set"
-            final_work_dir = (final_local_root / f"{split}_final_set") if final_local_root else final_target_dir
-            final_input_dir = dataset_dir
-            local_input_dir: Path | None = None
-            if args.resume and not task3_ran and dataset_dir_complete(final_target_dir / "train_dataset_pool"):
-                logger.info(f"stage=final split={split} skipped existing {final_target_dir}")
-                if not same_path(final_link_dir, final_target_dir):
-                    refresh_directory_symlink(final_link_dir, final_target_dir, logger)
-                continue
-            if not same_path(final_work_dir, final_target_dir):
-                remove_path(final_work_dir)
-                if final_link_dir.exists() or final_link_dir.is_symlink():
-                    remove_path(final_link_dir)
-            elif final_work_dir.exists():
-                remove_path(final_work_dir)
-            if final_local_root:
-                local_input_dir = final_local_root / "_hf_inputs" / f"{split}_dataset"
-                remove_path(local_input_dir)
-                copy_directory_atomic(dataset_dir, local_input_dir, logger, f"{stage_name}_input")
-                final_input_dir = local_input_dir
-            final_command = [
-                sys.executable,
-                "-m",
-                "Pretrain.split_train_validation",
-                str(final_input_dir),
-                "--base-path",
-                str(output_root / "bc" / split),
-                "--train-ratio",
-                "1.0",
-                "--output-dir",
-                str(final_work_dir),
-            ]
-            try:
-                logger.info(
-                    f"stage={stage_name} output_target={final_target_dir} "
-                    f"work_dir={final_work_dir}"
-                )
-                run_subprocess_stage(stage_name, final_command, repo_root, output_root, logger, timeout=args.command_timeout_seconds)
-                if not dataset_dir_complete(final_work_dir / "train_dataset_pool"):
-                    raise RuntimeError(f"{stage_name} did not produce a complete train_dataset_pool at {final_work_dir}")
-                if not same_path(final_work_dir, final_target_dir):
-                    copy_directory_atomic(final_work_dir, final_target_dir, logger, stage_name)
-                    if not args.keep_final_local:
-                        remove_path(final_work_dir)
-                        logger.info(f"stage={stage_name} removed local final work dir {final_work_dir}")
-                if local_input_dir and not args.keep_final_local:
-                    remove_path(local_input_dir)
-                    logger.info(f"stage={stage_name} removed local HF input dir {local_input_dir}")
-                if not same_path(final_link_dir, final_target_dir):
-                    refresh_directory_symlink(final_link_dir, final_target_dir, logger)
-            except Exception as exc:
-                final_failures.append(
-                    {
-                        "split": split,
-                        "error": str(exc),
-                        "input_dir": str(final_input_dir),
-                        "work_dir": str(final_work_dir),
-                        "target_dir": str(final_target_dir),
-                    }
-                )
+        final_datasets = discover_hf_split_datasets(hf_root)
+        final_failures = run_final_splits_parallel(
+            final_datasets,
+            args,
+            task3_ran,
+            repo_root,
+            cache_root,
+            output_root,
+            final_output_root,
+            final_local_root,
+            logger,
+        )
 
         write_jsonl(output_root / "manifests" / "final_failed.jsonl", final_failures)
         failed_splits = [
             split
-            for split, _ in discover_hf_split_datasets(hf_root)
+            for split, _ in final_datasets
             if not dataset_dir_complete(final_output_root / f"{split}_final_set" / "train_dataset_pool")
         ]
         if final_failures or failed_splits:
             logger.info(f"pipeline finished with failures final_failures={len(final_failures)} failed_splits={failed_splits}")
+            return 1
+
+        final_csv_filter_failures = run_final_csv_filter(
+            final_csv_filter_dir,
+            repo_root,
+            output_root,
+            final_output_root,
+            logger,
+            args.command_timeout_seconds,
+        )
+        write_jsonl(output_root / "manifests" / "final_csv_filter_failed.jsonl", final_csv_filter_failures)
+        if final_csv_filter_failures:
+            logger.info(f"pipeline finished with failures final_csv_filter_failures={len(final_csv_filter_failures)}")
             return 1
 
         logger.info("pipeline completed successfully")
