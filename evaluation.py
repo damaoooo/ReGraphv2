@@ -37,6 +37,7 @@ logging.basicConfig(
 )
 app = typer.Typer(pretty_exceptions_show_locals=False)
 console = Console()
+TORCH_EMBEDDING_SUFFIXES = {".pth", ".pt"}
 
 # --- GPU加速支持 ---
 GPU_AVAILABLE = torch.cuda.is_available()
@@ -44,6 +45,41 @@ if GPU_AVAILABLE:
     console.print("[green]✓ GPU加速已启用 (PyTorch)[/green]")
 else:
     console.print("[yellow]⚠ 未检测到可用GPU，将使用CPU计算[/yellow]")
+
+
+def _is_torch_embeddings_path(path: Optional[Path]) -> bool:
+    return bool(path and path.suffix.lower() in TORCH_EMBEDDING_SUFFIXES)
+
+
+def _load_cached_embeddings(embeddings_path: Path) -> Union[np.ndarray, torch.Tensor]:
+    if _is_torch_embeddings_path(embeddings_path):
+        embeddings = torch.load(str(embeddings_path), map_location="cpu")
+        if not isinstance(embeddings, torch.Tensor):
+            raise TypeError(f"Torch embedding cache must contain a Tensor: {embeddings_path}")
+        return embeddings
+    return np.load(embeddings_path, mmap_mode="r")
+
+
+def _save_cached_embeddings(embeddings_path: Path, embeddings: Union[np.ndarray, torch.Tensor]) -> None:
+    embeddings_path.parent.mkdir(parents=True, exist_ok=True)
+    if _is_torch_embeddings_path(embeddings_path):
+        if isinstance(embeddings, torch.Tensor):
+            torch.save(embeddings.detach().cpu(), str(embeddings_path))
+        else:
+            torch.save(torch.from_numpy(np.asarray(embeddings)), str(embeddings_path))
+    else:
+        if isinstance(embeddings, torch.Tensor):
+            np.save(embeddings_path, embeddings.detach().cpu().float().numpy())
+        else:
+            np.save(embeddings_path, embeddings)
+
+
+def _embedding_shape_dtype(embeddings: Union[np.ndarray, torch.Tensor]) -> str:
+    return f"shape={tuple(embeddings.shape)}, dtype={embeddings.dtype}"
+
+
+def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    return tensor.nelement() * tensor.element_size()
 
 
 def _markdown_cell(value: object) -> str:
@@ -362,11 +398,12 @@ def generate_embeddings_with_model(
     embedding_size: int = 768,
     use_cfg: bool = True,
     use_ddg: bool = True,
-) -> np.ndarray:
+    output_torch_dtype: Optional[torch.dtype] = None,
+) -> Union[np.ndarray, torch.Tensor]:
     """
     使用本地模型为整个数据集生成嵌入向量。
     使用CUDA和bf16精度进行推理。
-    使用memmap避免内存爆炸。
+    默认使用memmap避免内存爆炸；如果 output_torch_dtype 非空，直接返回CPU torch Tensor。
     """
     import psutil
     import os
@@ -403,13 +440,17 @@ def generate_embeddings_with_model(
     total_samples = len(dataloader.dataset)
     embedding_dim = embedding_size
     
-    # 使用memmap替代list，避免内存峰值翻倍
-    import tempfile
-    temp_memmap = tempfile.NamedTemporaryFile(delete=False, suffix='.npy')
-    temp_memmap_path = temp_memmap.name
-    temp_memmap.close()
-    
-    all_embeddings = np.memmap(temp_memmap_path, dtype=np.float32, mode='w+', shape=(total_samples, embedding_dim))
+    use_torch_output = output_torch_dtype is not None
+    temp_memmap_path: Optional[str] = None
+    if use_torch_output:
+        all_embeddings = torch.empty((total_samples, embedding_dim), dtype=output_torch_dtype, device="cpu")
+    else:
+        # 使用memmap替代list，避免内存峰值翻倍
+        import tempfile
+        temp_memmap = tempfile.NamedTemporaryFile(delete=False, suffix='.npy')
+        temp_memmap_path = temp_memmap.name
+        temp_memmap.close()
+        all_embeddings = np.memmap(temp_memmap_path, dtype=np.float32, mode='w+', shape=(total_samples, embedding_dim))
     failed_batches = []  # 记录失败的batch信息
     
     from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
@@ -476,11 +517,13 @@ def generate_embeddings_with_model(
                         )
                         embeddings = outputs['embedding']
                     
-                    # 转换为CPU numpy数组
-                    batch_embeddings = embeddings.cpu().float().numpy()
+                    if use_torch_output:
+                        batch_embeddings = embeddings.detach().to("cpu", dtype=output_torch_dtype)
+                    else:
+                        batch_embeddings = embeddings.detach().cpu().float().numpy()
                     batch_size_actual = len(batch_embeddings)
                     
-                    # 直接写入memmap，不保留在内存中
+                    # 直接写入预分配缓存，不保留batch中间结果
                     all_embeddings[current_idx:current_idx + batch_size_actual] = batch_embeddings
                     current_idx += batch_size_actual
                     
@@ -517,7 +560,8 @@ def generate_embeddings_with_model(
             console.print(f"  Batch #{failure['batch_idx']}: {failure['error_type']} - {failure['error'][:100]}")
         del model
         del all_embeddings
-        os.unlink(temp_memmap_path)
+        if temp_memmap_path:
+            os.unlink(temp_memmap_path)
         raise RuntimeError(
             "Embedding generation encountered failed batches. "
             "Evaluation has been aborted to avoid computing metrics on incomplete embeddings."
@@ -533,13 +577,20 @@ def generate_embeddings_with_model(
     if current_idx == 0:
         console.print("[bold red]ERROR: 没有成功的batch，无法返回结果[/bold red]")
         # 清理临时文件
-        os.unlink(temp_memmap_path)
+        if temp_memmap_path:
+            os.unlink(temp_memmap_path)
         raise typer.Exit(code=1)
     
+    if use_torch_output:
+        if current_idx == total_samples:
+            return all_embeddings
+        return all_embeddings[:current_idx].clone()
+
     # 将memmap内容转为普通numpy数组并返回（会自动清理临时文件）
     result = np.array(all_embeddings[:current_idx], dtype=np.float32)
     del all_embeddings
-    os.unlink(temp_memmap_path)
+    if temp_memmap_path:
+        os.unlink(temp_memmap_path)
     
     return result
 
@@ -701,7 +752,7 @@ def main(
     max_length: int = typer.Option(2048, "--max-length", help="将'文本'整体截断到的最大token长度。"),
     eval_samples: int = typer.Option(0, "--eval-samples", "-n", help="用于评估的随机锚点样本数量。"),
     pool_samples: int = typer.Option(0, "--pool-samples", help="快速评估时使用的小检索池大小。0 表示全量检索池。"),
-    embeddings_path: Path = typer.Option(None, "--embeddings-path", "-e", help="用于保存/加载嵌入向量Numpy文件的路径。"),
+    embeddings_path: Path = typer.Option(None, "--embeddings-path", "-e", help="用于保存/加载嵌入向量缓存的路径（.npy 或 .pth/.pt）。"),
     seed: int = typer.Option(42, "--seed", "-s", help="用于负采样的随机种子。"),
     use_gpu: bool = typer.Option(True, "--gpu/--no-gpu", help="是否使用GPU加速计算。"),
     gpu_batch_size: int = typer.Option(512, "--gpu-batch-size", help="GPU批量处理的锚点数量。"),
@@ -745,11 +796,8 @@ def main(
     # --- 2. 加载或生成嵌入向量 ---
     if embeddings_cached:
         logging.info(f"正在从 [cyan]{embeddings_path}[/cyan] 加载已缓存的嵌入向量...")
-        if embeddings_path.suffix == '.pth':
-            all_embeddings = torch.load(str(embeddings_path), map_location='cpu')
-        else:
-            all_embeddings = np.load(embeddings_path, mmap_mode='r')
-        logging.info(f"嵌入向量加载完毕，形状为: [green]{all_embeddings.shape}[/green]")
+        all_embeddings = _load_cached_embeddings(embeddings_path)
+        logging.info(f"嵌入向量加载完毕: [green]{_embedding_shape_dtype(all_embeddings)}[/green]")
 
         if pool_samples > 0:
             dataset = load_from_disk(str(validation_dataset_pool_path))
@@ -810,6 +858,10 @@ def main(
         else:
             logging.info(f"全量评估模式: 检索池 {len(dataset_for_eval):,}，锚点数 {len(anchors_to_evaluate):,}")
 
+        torch_cache_dtype = None
+        if _is_torch_embeddings_path(embeddings_path):
+            torch_cache_dtype = torch.bfloat16 if use_bf16 else torch.float32
+
         all_embeddings = generate_embeddings_with_model(
             dataset_source=dataset_for_eval,
             batch_size=batch_size,
@@ -818,22 +870,17 @@ def main(
             max_length=max_length,
             use_cfg=use_cfg,
             use_ddg=use_ddg,
+            output_torch_dtype=torch_cache_dtype,
         )
-        logging.info(f"嵌入向量生成完毕，形状为: [green]{all_embeddings.shape}[/green]")
+        logging.info(f"嵌入向量生成完毕: [green]{_embedding_shape_dtype(all_embeddings)}[/green]")
 
         if embeddings_path:
             logging.info(f"正在将新生成的嵌入向量缓存到 [cyan]{embeddings_path}[/cyan]...")
-            embeddings_path.parent.mkdir(parents=True, exist_ok=True)
-            if embeddings_path.suffix == '.pth':
-                torch.save(torch.from_numpy(all_embeddings), str(embeddings_path))
-            else:
-                np.save(embeddings_path, all_embeddings)
+            _save_cached_embeddings(embeddings_path, all_embeddings)
             logging.info("缓存完成。")
             del all_embeddings
-            if embeddings_path.suffix == '.pth':
-                all_embeddings = torch.load(str(embeddings_path), map_location='cpu')
-            else:
-                all_embeddings = np.load(str(embeddings_path), mmap_mode='r')
+            all_embeddings = _load_cached_embeddings(embeddings_path)
+            if not _is_torch_embeddings_path(embeddings_path):
                 logging.info(f"已将嵌入向量切换为内存映射模式 (mmap)")
 
     # --- 3. GPU内存预处理 ---
@@ -845,7 +892,7 @@ def main(
         else:
             all_embeddings_gpu = torch.from_numpy(np.array(all_embeddings, copy=True)).to("cuda", dtype=target_dtype, non_blocking=False)
         dtype_label = "BF16" if use_bf16 else "FP32"
-        logging.info(f"[green]✓ 已将全部嵌入加载到GPU ({dtype_label}): {all_embeddings_gpu.nbytes / (1024**3):.2f} GB[/green]")
+        logging.info(f"[green]✓ 已将全部嵌入加载到GPU ({dtype_label}): {_tensor_nbytes(all_embeddings_gpu) / (1024**3):.2f} GB[/green]")
     else:
         all_embeddings_gpu = None
 
