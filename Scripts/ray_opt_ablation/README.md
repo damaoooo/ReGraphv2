@@ -77,6 +77,17 @@ task3 默认使用 `--chunk-manifest-mode worker`，即每个 Ray worker 进程�
 
 task3 的 `llvm-extract` / `opt` 中间 IR、dot 文件默认写到节点本地 `$TMPDIR/task3_<output-name>`，不写到 scratch 的 `task3_fused/.task3_fused_state/tmp`。这是为了避免函数级临时文件触发 scratch 文件数配额；每个 chunk 结束后会清理自己的临时目录。
 
+如果只想生成 Dataset-1 CSV 清单里的函数，在 driver 参数里加 `--task3-csv-filter-dir <csv-dir>`。该目录需要包含 `training_Dataset-1.csv`、`validation_Dataset-1.csv`、`testing_Dataset-1.csv`。过滤发生在 `llvm-nm` 枚举之后、`llvm-extract`/建图之前，所以 CSV 外的函数不会进入 graph/tokenizer 阶段。例如：
+
+```bash
+DRIVER_EXTRA_ARGS="--task3-csv-filter-dir /scratch/zhoul0e/ReGraphv2/IR/csv_list --task3-chunk-size 500 --max-parquet-files 100000 --command-timeout-seconds 28800" \
+DATASET_PATH=/scratch/zhoul0e/Dataset-1 \
+OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O1-fused-csv \
+sbatch --nodes=3 Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O1
+```
+
+如果给已有输出目录加 CSV 过滤，必须使用新的 `OUTPUT_PATH`，或者在 `DRIVER_EXTRA_ARGS` 里加 `--force-task3-rebuild`。否则旧的未过滤 parquet 会污染过滤结果；driver 会检测 `task3_fused/manifests/csv_filter_summary.json`，不匹配时直接退出。
+
 `RESUME=1` 时，如果 `task3_fused/parquet/{train,validation,test}` 都已经存在且完整，driver 会跳过 Task3，日志里会出现 `stage=task3_fused skipped existing final parquet splits=...`。如果需要强制重建 Task3，必须在 `DRIVER_EXTRA_ARGS` 加 `--force-task3-rebuild`；这会删除旧的 `task3_fused` 后重新跑 Task3。若 Task3 没有重跑且 `hf/{split}_dataset` 已完整，`dataprocess_hf` 也会跳过。final 阶段按 `<split>_final_set/train_dataset_pool` 是否完整判断是否跳过。
 
 Task3 函数级坏样本不会阻断整个 pipeline。失败函数会写入 worker failed manifest，例如 `task3_fused/.task3_fused_state/chunk_manifests/*_failed.jsonl`，后续 parquet/HF/final 会继续使用已成功的函数记录。常见失败包括个别函数的 Graphviz DOT 解析错误，例如 `pygraphviz.agraph.DotError: Invalid Input`。

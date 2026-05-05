@@ -4,6 +4,7 @@ Task 3: fused function extraction, graph building, tokenization, and parquet out
 """
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import math
@@ -19,7 +20,7 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 import pyarrow.parquet as pq
 import pyarrow as pa
@@ -60,6 +61,12 @@ STATE_DIRNAME = ".task3_fused_state"
 DEFAULT_TARGET_SHARD_SIZE_BYTES = 1024 * 1024 * 1024
 DEFAULT_MAX_PARQUET_FILES = 5000
 DEFAULT_MAX_SEQ_LENGTH = 2048
+CSV_FILTER_SUMMARY = "csv_filter_summary.json"
+CSV_SPLIT_FILENAMES = {
+    "train": ("training_Dataset-1.csv", "train_Dataset-1.csv"),
+    "validation": ("validation_Dataset-1.csv",),
+    "test": ("testing_Dataset-1.csv", "test_Dataset-1.csv"),
+}
 
 
 @dataclass(frozen=True)
@@ -138,6 +145,11 @@ def jsonl_read(path: Path) -> Iterable[Dict[str, Any]]:
     return rows
 
 
+def write_json(path: Path, payload: Dict[str, Any]) -> None:
+    ensure_directory(str(path.parent))
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def manifest_dir(output_root: Path) -> Path:
     return output_root / "manifests"
 
@@ -171,6 +183,10 @@ def cleanup_chunk_manifests(output_root: Path) -> None:
 
 def final_parquet_root(output_root: Path) -> Path:
     return output_root / "parquet"
+
+
+def csv_filter_summary_path(output_root: Path) -> Path:
+    return manifest_dir(output_root) / CSV_FILTER_SUMMARY
 
 
 def load_completed_bc_paths(output_root: Path) -> set[str]:
@@ -280,6 +296,163 @@ def group_by_split(items: List[WorkItem]) -> Dict[Optional[str], List[WorkItem]]
     for item in items:
         grouped.setdefault(item.split, []).append(item)
     return grouped
+
+
+def csv_files_for_split(csv_filter_dir: Path, split: Optional[str]) -> List[Path]:
+    if split is None:
+        candidates = ["Dataset-1.csv"]
+    else:
+        candidates = list(CSV_SPLIT_FILENAMES.get(split, (f"{split}_Dataset-1.csv",)))
+    return [csv_filter_dir / name for name in candidates]
+
+
+def find_csv_file_for_split(csv_filter_dir: Path, split: Optional[str]) -> Path:
+    candidates = csv_files_for_split(csv_filter_dir, split)
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f"No CSV filter file found for split={split_label(split)} under {csv_filter_dir}; "
+        f"tried: {', '.join(str(path) for path in candidates)}"
+    )
+
+
+def binary_name_from_csv_idb_path(idb_path: str, split: Optional[str]) -> Optional[str]:
+    parts = idb_path.replace("\\", "/").split("/")
+    project_index: Optional[int] = None
+    for index in range(len(parts) - 2):
+        if parts[index] == "Dataset-1":
+            project_index = index + 1
+            break
+    if project_index is None:
+        if len(parts) < 2:
+            return None
+        project_index = len(parts) - 2
+    if project_index + 1 >= len(parts):
+        return None
+    project = parts[project_index]
+    stem = parts[project_index + 1]
+    if not project or not stem:
+        return None
+    if stem.endswith(".i64"):
+        stem = stem[:-4]
+    if stem.endswith(".idb"):
+        stem = stem[:-4]
+    if split:
+        return f"{split}/{project}/{stem}"
+    return f"{project}/{stem}"
+
+
+def load_csv_filter(csv_filter_dir: Path, splits: Iterable[Optional[str]]) -> Dict[Optional[str], Set[str]]:
+    csv_filter_dir = csv_filter_dir.resolve()
+    if not csv_filter_dir.is_dir():
+        raise FileNotFoundError(f"CSV filter directory not found: {csv_filter_dir}")
+
+    filter_by_split: Dict[Optional[str], Set[str]] = {}
+    for split in splits:
+        csv_path = find_csv_file_for_split(csv_filter_dir, split)
+        allowed: Set[str] = set()
+        with csv_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames or "idb_path" not in reader.fieldnames or "func_name" not in reader.fieldnames:
+                raise ValueError(f"CSV filter file must contain idb_path and func_name columns: {csv_path}")
+            for row in reader:
+                binary_name = binary_name_from_csv_idb_path(row.get("idb_path", ""), split)
+                function_name = row.get("func_name", "")
+                if not binary_name or not function_name:
+                    continue
+                allowed.add(f"{binary_name}::{function_name}")
+        filter_by_split[split] = allowed
+        console.print(
+            f"[green]CSV filter split={split_label(split)} file={csv_path} allowed_functions={len(allowed)}[/green]"
+        )
+    return filter_by_split
+
+
+def apply_csv_filter(
+    function_items: List[FunctionWorkItem],
+    csv_filter_dir: Optional[Path],
+    active_splits: Iterable[Optional[str]],
+    output_root: Path,
+) -> List[FunctionWorkItem]:
+    if csv_filter_dir is None:
+        return function_items
+
+    filter_by_split = load_csv_filter(csv_filter_dir, active_splits)
+    stats: Dict[str, Dict[str, Any]] = {
+        split_label(split): {
+            "csv_allowed": len(allowed),
+            "enumerated": 0,
+            "kept": 0,
+            "dropped": 0,
+            "matched_unique": 0,
+            "missing_csv_allowed": len(allowed),
+        }
+        for split, allowed in filter_by_split.items()
+    }
+
+    kept_items: List[FunctionWorkItem] = []
+    matched_by_split: Dict[Optional[str], Set[str]] = {split: set() for split in filter_by_split}
+    for item in function_items:
+        split_stats = stats.setdefault(
+            split_label(item.split),
+            {
+                "csv_allowed": 0,
+                "enumerated": 0,
+                "kept": 0,
+                "dropped": 0,
+                "matched_unique": 0,
+                "missing_csv_allowed": 0,
+            },
+        )
+        split_stats["enumerated"] += 1
+        allowed = filter_by_split.get(item.split)
+        key = f"{item.binary_name}::{item.function_name}"
+        if allowed is not None and key in allowed:
+            kept_items.append(item)
+            matched_by_split.setdefault(item.split, set()).add(key)
+            split_stats["kept"] += 1
+        else:
+            split_stats["dropped"] += 1
+
+    total_allowed = 0
+    total_matched = 0
+    for split, matched in matched_by_split.items():
+        label = split_label(split)
+        allowed_count = len(filter_by_split.get(split, set()))
+        stats[label]["matched_unique"] = len(matched)
+        stats[label]["missing_csv_allowed"] = max(0, allowed_count - len(matched))
+        total_allowed += allowed_count
+        total_matched += len(matched)
+
+    summary = {
+        "csv_filter_dir": str(csv_filter_dir.resolve()),
+        "total_enumerated": len(function_items),
+        "total_kept": len(kept_items),
+        "total_dropped": len(function_items) - len(kept_items),
+        "total_csv_allowed": total_allowed,
+        "total_csv_matched_unique": total_matched,
+        "total_missing_csv_allowed": max(0, total_allowed - total_matched),
+        "splits": stats,
+    }
+    write_json(csv_filter_summary_path(output_root), summary)
+    console.print(
+        f"[green]CSV filter kept {len(kept_items)}/{len(function_items)} enumerated functions; "
+        f"matched_unique={total_matched}/{total_allowed} summary={csv_filter_summary_path(output_root)}[/green]"
+    )
+    for split, split_stats in stats.items():
+        console.print(
+            f"[cyan]CSV filter split={split} enumerated={split_stats['enumerated']} "
+            f"kept={split_stats['kept']} dropped={split_stats['dropped']} "
+            f"matched_unique={split_stats['matched_unique']}/{split_stats['csv_allowed']} "
+            f"missing_csv={split_stats['missing_csv_allowed']}[/cyan]"
+        )
+    if function_items and not kept_items:
+        raise RuntimeError(
+            f"CSV filter at {csv_filter_dir} matched zero functions. "
+            "Check that the CSV split files and input .bc split layout correspond."
+        )
+    return kept_items
 
 
 def choose_chunk_size(total_items: int, requested_chunk_size: int, max_parquet_files: int) -> int:
@@ -1422,6 +1595,14 @@ def main(
         "--ray-max-in-flight-chunks",
         help="Maximum Ray chunk tasks submitted at once; 0 chooses about 4x cluster CPUs with a floor of 1024",
     ),
+    csv_filter_dir: str = typer.Option(
+        "",
+        "--csv-filter-dir",
+        help=(
+            "Optional Dataset-1 CSV whitelist directory. Expected files are "
+            "training_Dataset-1.csv, validation_Dataset-1.csv, and testing_Dataset-1.csv."
+        ),
+    ),
     command_timeout_seconds: int = typer.Option(0, "--command-timeout-seconds", help="Per LLVM/opt command timeout; 0 disables timeout"),
     progress_summary_interval_s: int = typer.Option(30, "--progress-summary-interval-s", help="Emit Slurm-friendly text progress every N seconds"),
 ):
@@ -1441,6 +1622,7 @@ def main(
 
     input_root = Path(input_path).resolve()
     output_root = Path(output).resolve()
+    resolved_csv_filter_dir = Path(csv_filter_dir).expanduser().resolve() if csv_filter_dir else None
     task_tmp_base = Path(
         os.environ.get("REGRAPH_TASK3_TMPDIR")
         or os.environ.get("TMPDIR")
@@ -1453,6 +1635,9 @@ def main(
     if not Path(tokenizer_path).exists():
         console.print(f"[red]Tokenizer not found: {tokenizer_path}[/red]")
         raise typer.Exit(code=1)
+    if resolved_csv_filter_dir is not None and not resolved_csv_filter_dir.is_dir():
+        console.print(f"[red]CSV filter directory not found: {resolved_csv_filter_dir}[/red]")
+        raise typer.Exit(code=1)
 
     prepare_output_root(output_root, resume=resume)
     console.print(f"[green]Input: {input_root}[/green]")
@@ -1461,6 +1646,8 @@ def main(
     console.print(f"[green]Tokenizer: {tokenizer_path}[/green]")
     console.print(f"[green]Max seq length: {max_seq_length}[/green]")
     console.print(f"[green]Max parquet files: {max_parquet_files}[/green]")
+    if resolved_csv_filter_dir is not None:
+        console.print(f"[green]CSV filter dir: {resolved_csv_filter_dir}[/green]")
     console.print(
         f"[green]Chunk manifest mode: {normalized_chunk_manifest_mode}; "
         f"cleanup={int(cleanup_chunk_manifest_files)}[/green]"
@@ -1497,6 +1684,7 @@ def main(
         normalized_backend,
     )
     collect_chunk_manifests(output_root)
+    function_items = apply_csv_filter(function_items, resolved_csv_filter_dir, all_splits, output_root)
     if not function_items:
         console.print("[yellow]No functions to process[/yellow]")
         compact_all_splits(

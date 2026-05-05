@@ -686,6 +686,20 @@ def same_path(left: Path, right: Path) -> bool:
         return left.absolute() == right.absolute()
 
 
+def task3_csv_filter_matches(task3_output: Path, csv_filter_dir: Path | None) -> bool:
+    if csv_filter_dir is None:
+        return True
+    summary_path = task3_output / "manifests" / "csv_filter_summary.json"
+    if not summary_path.is_file():
+        return False
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        recorded = summary.get("csv_filter_dir")
+        return bool(recorded) and same_path(Path(recorded), csv_filter_dir)
+    except Exception:
+        return False
+
+
 def directory_file_stats(path: Path) -> tuple[int, int]:
     files = 0
     total_bytes = 0
@@ -809,6 +823,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-failures-to-screen", type=int, default=200)
     parser.add_argument("--task3-chunk-manifest-mode", choices=("worker", "chunk"), default="worker")
     parser.add_argument("--task3-ray-max-in-flight-chunks", type=int, default=0)
+    parser.add_argument(
+        "--task3-csv-filter-dir",
+        default=os.environ.get("REGRAPH_TASK3_CSV_FILTER_DIR", ""),
+        help=(
+            "Optional Dataset-1 CSV whitelist directory passed to Task3. Expected files are "
+            "training_Dataset-1.csv, validation_Dataset-1.csv, and testing_Dataset-1.csv."
+        ),
+    )
     parser.add_argument("--keep-task3-chunk-manifests", action="store_true")
     parser.add_argument("--force-task3-rebuild", action="store_true")
     parser.add_argument("--final-output-root", default=os.environ.get("REGRAPH_FINAL_OUTPUT_ROOT", ""))
@@ -836,6 +858,9 @@ def main() -> int:
     output_root = output_root.resolve()
     prepare_output_root(output_root, args.resume, args.force_clean)
     final_output_root = Path(args.final_output_root).resolve() if args.final_output_root else output_root
+    task3_csv_filter_dir = Path(args.task3_csv_filter_dir).expanduser().resolve() if args.task3_csv_filter_dir else None
+    if task3_csv_filter_dir is not None and not task3_csv_filter_dir.is_dir():
+        raise SystemExit(f"Task3 CSV filter directory does not exist: {task3_csv_filter_dir}")
     if args.final_local_root:
         final_local_root: Path | None = Path(args.final_local_root).resolve()
     elif not same_path(final_output_root, output_root):
@@ -855,6 +880,7 @@ def main() -> int:
         logger.info(f"input_path={input_path}")
         logger.info(f"output_root={output_root}")
         logger.info(f"final_output_root={final_output_root}")
+        logger.info(f"task3_csv_filter_dir={task3_csv_filter_dir if task3_csv_filter_dir else 'disabled'}")
         logger.info(f"final_local_root={final_local_root if final_local_root else 'disabled'} keep_final_local={args.keep_final_local}")
         logger.info(f"opt_level={opt_level}")
         logger.info(f"repll_python={rell_python}")
@@ -1030,6 +1056,12 @@ def main() -> int:
             logger.info(f"stage=task3_fused force_rebuild removing {task3_output}")
             shutil.rmtree(task3_output)
             existing_parquet_splits = []
+        csv_filter_matches = task3_csv_filter_matches(task3_output, task3_csv_filter_dir)
+        if task3_csv_filter_dir is not None and existing_parquet_splits and not csv_filter_matches:
+            raise SystemExit(
+                "Task3 CSV filter was requested, but existing Task3 parquet was not built with the same filter. "
+                "Use --force-task3-rebuild or write to a fresh --output-path."
+            )
         task3_command = [
             sys.executable,
             str(Path(repo_root) / "Scripts" / "task3_extract.py"),
@@ -1054,6 +1086,8 @@ def main() -> int:
             "--ray-max-in-flight-chunks",
             str(args.task3_ray_max_in_flight_chunks),
         ]
+        if task3_csv_filter_dir is not None:
+            task3_command.extend(["--csv-filter-dir", str(task3_csv_filter_dir)])
         if args.keep_task3_chunk_manifests:
             task3_command.append("--keep-chunk-manifests")
         if args.task3_chunk_size > 0:
@@ -1097,7 +1131,7 @@ def main() -> int:
             final_work_dir = (final_local_root / f"{split}_final_set") if final_local_root else final_target_dir
             final_input_dir = dataset_dir
             local_input_dir: Path | None = None
-            if args.resume and dataset_dir_complete(final_target_dir / "train_dataset_pool"):
+            if args.resume and not task3_ran and dataset_dir_complete(final_target_dir / "train_dataset_pool"):
                 logger.info(f"stage=final split={split} skipped existing {final_target_dir}")
                 if not same_path(final_link_dir, final_target_dir):
                     refresh_directory_symlink(final_link_dir, final_target_dir, logger)
