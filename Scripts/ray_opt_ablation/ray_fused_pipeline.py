@@ -1017,25 +1017,28 @@ def run_final_splits_parallel(
     return failures
 
 
-def run_final_csv_filter(
-    final_csv_filter_dir: Path | None,
+def run_final_reference_filter(
+    final_filter_reference: Path | None,
+    final_filter_reference_kind: str,
+    final_filter_match_mode: str,
     repo_root: str,
     output_root: Path,
     final_output_root: Path,
     logger: RunLogger,
     timeout: int,
 ) -> list[dict[str, Any]]:
-    if final_csv_filter_dir is None:
-        logger.info("stage=final_csv_filter skipped disabled")
+    if final_filter_reference is None:
+        logger.info("stage=final_reference_filter skipped disabled")
         return []
 
     failures: list[dict[str, Any]] = []
     filter_script = Path(repo_root) / "Scripts" / "ray_opt_ablation" / "filter_final_set_by_csv.py"
     if not filter_script.is_file():
-        return [{"stage": "final_csv_filter", "error": f"filter script not found: {filter_script}"}]
+        return [{"stage": "final_reference_filter", "error": f"filter script not found: {filter_script}"}]
 
     logger.info(
-        f"stage=final_csv_filter start csv_dir={final_csv_filter_dir} "
+        f"stage=final_reference_filter start reference={final_filter_reference} "
+        f"reference_kind={final_filter_reference_kind} match_mode={final_filter_match_mode} "
         "splits=['validation', 'test'] mode=in_place"
     )
     for split in ("validation", "test"):
@@ -1043,7 +1046,7 @@ def run_final_csv_filter(
         if not dataset_dir_complete(final_set_dir / "train_dataset_pool"):
             failures.append(
                 {
-                    "stage": f"final_csv_filter_{split}",
+                    "stage": f"final_reference_filter_{split}",
                     "split": split,
                     "final_set": str(final_set_dir),
                     "error": f"final_set is incomplete before filtering: {final_set_dir}",
@@ -1055,11 +1058,17 @@ def run_final_csv_filter(
             sys.executable,
             str(filter_script),
             str(final_set_dir),
-            str(final_csv_filter_dir),
+            str(final_filter_reference),
+            "--split",
+            split,
+            "--reference-kind",
+            final_filter_reference_kind,
+            "--match-mode",
+            final_filter_match_mode,
         ]
         try:
             run_subprocess_stage(
-                f"final_csv_filter_{split}",
+                f"final_reference_filter_{split}",
                 command,
                 repo_root,
                 output_root,
@@ -1071,15 +1080,17 @@ def run_final_csv_filter(
         except Exception as exc:
             failures.append(
                 {
-                    "stage": f"final_csv_filter_{split}",
+                    "stage": f"final_reference_filter_{split}",
                     "split": split,
                     "final_set": str(final_set_dir),
-                    "csv_dir": str(final_csv_filter_dir),
+                    "reference": str(final_filter_reference),
+                    "reference_kind": final_filter_reference_kind,
+                    "match_mode": final_filter_match_mode,
                     "error": str(exc),
                 }
             )
 
-    logger.info(f"stage=final_csv_filter complete filtered_splits=['validation', 'test'] failed={len(failures)}")
+    logger.info(f"stage=final_reference_filter complete filtered_splits=['validation', 'test'] failed={len(failures)}")
     return failures
 
 
@@ -1127,12 +1138,29 @@ def parse_args() -> argparse.Namespace:
         help="Root for *_final_set outputs. Defaults to --output-path.",
     )
     parser.add_argument(
+        "--final-filter-reference",
+        default=os.environ.get("REGRAPH_FINAL_FILTER_REFERENCE", ""),
+        help=(
+            "Optional CSV file/dir, final_set, train_dataset_pool, or root containing *_final_set dirs. "
+            "After final_set generation, only validation_final_set and test_final_set are filtered in place."
+        ),
+    )
+    parser.add_argument(
+        "--final-filter-reference-kind",
+        choices=("auto", "csv", "final-set"),
+        default=os.environ.get("REGRAPH_FINAL_FILTER_REFERENCE_KIND", "auto"),
+        help="Reference type for --final-filter-reference.",
+    )
+    parser.add_argument(
+        "--final-filter-match-mode",
+        choices=("exact", "origin"),
+        default=os.environ.get("REGRAPH_FINAL_FILTER_MATCH_MODE", "exact"),
+        help="Function key matching mode for --final-filter-reference.",
+    )
+    parser.add_argument(
         "--final-csv-filter-dir",
         default=os.environ.get("REGRAPH_FINAL_CSV_FILTER_DIR", ""),
-        help=(
-            "Optional Dataset-1 CSV directory used after final_set generation. "
-            "Only validation_final_set and test_final_set are filtered in place; train_final_set is left unchanged."
-        ),
+        help="Deprecated alias for --final-filter-reference.",
     )
     parser.add_argument(
         "--final-local-root",
@@ -1169,9 +1197,10 @@ def main() -> int:
     task3_csv_filter_dir = Path(args.task3_csv_filter_dir).expanduser().resolve() if args.task3_csv_filter_dir else None
     if task3_csv_filter_dir is not None and not task3_csv_filter_dir.is_dir():
         raise SystemExit(f"Task3 CSV filter directory does not exist: {task3_csv_filter_dir}")
-    final_csv_filter_dir = Path(args.final_csv_filter_dir).expanduser().resolve() if args.final_csv_filter_dir else None
-    if final_csv_filter_dir is not None and not final_csv_filter_dir.is_dir():
-        raise SystemExit(f"Final CSV filter directory does not exist: {final_csv_filter_dir}")
+    final_filter_reference_arg = args.final_filter_reference or args.final_csv_filter_dir
+    final_filter_reference = Path(final_filter_reference_arg).expanduser().resolve() if final_filter_reference_arg else None
+    if final_filter_reference is not None and not final_filter_reference.exists():
+        raise SystemExit(f"Final filter reference does not exist: {final_filter_reference}")
     if args.final_local_root:
         final_local_root: Path | None = Path(args.final_local_root).resolve()
     elif not same_path(final_output_root, output_root):
@@ -1188,7 +1217,10 @@ def main() -> int:
         logger.info(f"output_root={output_root}")
         logger.info(f"final_output_root={final_output_root}")
         logger.info(f"task3_csv_filter_dir={task3_csv_filter_dir if task3_csv_filter_dir else 'disabled'}")
-        logger.info(f"final_csv_filter_dir={final_csv_filter_dir if final_csv_filter_dir else 'disabled'}")
+        logger.info(
+            f"final_filter_reference={final_filter_reference if final_filter_reference else 'disabled'} "
+            f"kind={args.final_filter_reference_kind} match_mode={args.final_filter_match_mode}"
+        )
         logger.info(f"final_local_root={final_local_root if final_local_root else 'disabled'} keep_final_local={args.keep_final_local}")
         logger.info(f"opt_level={opt_level}")
         for name in sorted(cache_env):
@@ -1346,17 +1378,19 @@ def main() -> int:
             logger.info(f"pipeline finished with failures final_failures={len(final_failures)} failed_splits={failed_splits}")
             return 1
 
-        final_csv_filter_failures = run_final_csv_filter(
-            final_csv_filter_dir,
+        final_filter_failures = run_final_reference_filter(
+            final_filter_reference,
+            args.final_filter_reference_kind,
+            args.final_filter_match_mode,
             repo_root,
             output_root,
             final_output_root,
             logger,
             args.command_timeout_seconds,
         )
-        write_jsonl(output_root / "manifests" / "final_csv_filter_failed.jsonl", final_csv_filter_failures)
-        if final_csv_filter_failures:
-            logger.info(f"pipeline finished with failures final_csv_filter_failures={len(final_csv_filter_failures)}")
+        write_jsonl(output_root / "manifests" / "final_reference_filter_failed.jsonl", final_filter_failures)
+        if final_filter_failures:
+            logger.info(f"pipeline finished with failures final_reference_filter_failures={len(final_filter_failures)}")
             return 1
 
         logger.info("pipeline completed successfully")

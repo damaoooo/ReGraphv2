@@ -105,18 +105,31 @@ final 阶段会先把对应的 HF dataset 从 scratch 复制到节点本地 `$TM
 - `--final-output-root`：final_set 的真实落盘根目录；默认是 `OUTPUT_PATH`，也可用 `REGRAPH_FINAL_OUTPUT_ROOT` 覆盖。
 - `--final-local-root`：final 阶段本地工作目录；默认在设置了独立 `--final-output-root` 时使用 `$TMPDIR/final_sets/<output-name>`，也可用 `REGRAPH_FINAL_LOCAL_ROOT` 覆盖。
 - `--keep-final-local`：调试用，保留本地 final input/output；正常 Dataset-1 不建议打开。
-- `--final-csv-filter-dir` / `FINAL_CSV_FILTER_DIR`：final_set 生成完成后，用 Dataset-1 CSV 目录 in-place 过滤 `validation_final_set` 和 `test_final_set`；`train_final_set` 不过滤，过滤前 final_set 不会保留为额外输出。
+- `--final-filter-reference` / `FINAL_FILTER_REFERENCE`：final_set 生成完成后，用 CSV 文件/目录、单个 final_set、`train_dataset_pool`，或包含 `train_final_set` / `validation_final_set` / `test_final_set` 的 root 作为 whitelist，in-place 过滤 `validation_final_set` 和 `test_final_set`；`train_final_set` 不过滤，过滤前 final_set 不会保留为额外输出。旧的 `--final-csv-filter-dir` / `FINAL_CSV_FILTER_DIR` 仍作为兼容别名。
+- `--final-filter-reference-kind` / `FINAL_FILTER_REFERENCE_KIND`：`auto`、`csv` 或 `final-set`，默认 `auto`。
+- `--final-filter-match-mode` / `FINAL_FILTER_MATCH_MODE`：`exact` 或 `origin`，默认 `exact`。如果 reference final_set 与目标 final_set 来自不同 opt level，通常用 `origin`。
 
 final 的 `train`、`validation`、`test` 三个 split 会作为独立 Ray task 并行处理。driver 会把这些 task 轮流 pin 到 Ray 节点资源上；申请 3 个节点时，三个 split 会分别跑在 3 个节点的本地 `$TMPDIR` staging 目录上。若只申请 2 个节点，则第三个 split 会轮转复用其中一个节点。
 
-只过滤 validation/test final_set 的提交示例：
+用 CSV 过滤 validation/test final_set 的提交示例：
 
 ```bash
 cd /scratch/zhoul0e/ReGraphv2
-FINAL_CSV_FILTER_DIR=/scratch/zhoul0e/ReGraphv2/IR/csv_list \
+FINAL_FILTER_REFERENCE=/scratch/zhoul0e/ReGraphv2/IR/csv_list \
 DATASET_PATH=/scratch/zhoul0e/Dataset-1 \
 OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O3-fused \
 DRIVER_EXTRA_ARGS="--task3-chunk-size 500 --max-parquet-files 100000 --command-timeout-seconds 28800 --final-output-root /scratch/zhoul0e/bandwidth/Dataset-1-O3-fused" \
+sbatch --nodes=3 Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O3
+```
+
+用另一个 final_set root 过滤 validation/test：
+
+```bash
+FINAL_FILTER_REFERENCE=/scratch/zhoul0e/Dataset-1-O0-fused \
+FINAL_FILTER_REFERENCE_KIND=final-set \
+FINAL_FILTER_MATCH_MODE=origin \
+DATASET_PATH=/scratch/zhoul0e/Dataset-1 \
+OUTPUT_PATH=/scratch/zhoul0e/Dataset-1-O3-fused \
 sbatch --nodes=3 Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch O3
 ```
 
