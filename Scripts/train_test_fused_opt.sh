@@ -24,7 +24,7 @@ Usage:
   bash Scripts/train_test_fused_opt.sh OPT_LEVEL [OPTIONS]
 
 OPT_LEVEL:
-  O0, O1, O2, or just 0/1/2.
+  O0, O1, O2, O3, Os, Og, or aliases 0/1/2/3/s/g.
 
 What it does:
   1. Train with CFG+DDG on IR/Dataset-1-OPT-fused/train_final_set.
@@ -53,6 +53,8 @@ Environment:
 Example:
   bash Scripts/train_test_fused_opt.sh O0
   bash Scripts/train_test_fused_opt.sh O2 --max-length 4096
+  bash Scripts/train_test_fused_opt.sh Os --skip-train
+  bash Scripts/train_test_fused_opt.sh Og --steps 10000
 EOF
 }
 
@@ -74,8 +76,10 @@ case "${opt_level}" in
 	1|O1|o1) opt_level="O1" ;;
 	2|O2|o2) opt_level="O2" ;;
 	3|O3|o3) opt_level="O3" ;;
+	s|S|Os|os|OS) opt_level="Os" ;;
+	g|G|Og|og|OG) opt_level="Og" ;;
 	*)
-		echo "Error: OPT_LEVEL must be one of O0/O1/O2/O3 or 0/1/2/3."
+		echo "Error: OPT_LEVEL must be one of O0/O1/O2/O3/Os/Og or 0/1/2/3/s/g."
 		exit 1
 		;;
 esac
@@ -239,9 +243,9 @@ fi
 
 eval_cmd=(
 	"${PYTHON[@]}" evaluation.py
-	"${test_pool}"
 	"${test_map}"
-	"${model_dir}"
+	--dataset-path "${test_pool}"
+	--model-path "${model_dir}"
 	--max-length "${max_length}"
 	--batch-size "${batch_size}"
 	--gpu-batch-size "${gpu_batch_size}"
