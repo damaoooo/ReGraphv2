@@ -22,7 +22,7 @@ def normalize_clang_opt_level(opt_level: str) -> str:
         raise typer.BadParameter("opt level cannot contain whitespace")
     if not normalized.startswith("-O") or len(normalized) <= 2:
         raise typer.BadParameter(
-            "opt level must look like O0/O1/O2/O3/Os/Og/Oz/Ofast or start with -O"
+            "opt level must look like O0/O1/O2/O3/Os/Og/Oz/Oc/Ofast or start with -O"
         )
 
     return normalized

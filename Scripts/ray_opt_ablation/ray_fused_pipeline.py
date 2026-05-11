@@ -37,6 +37,26 @@ DEFAULT_DATASET_PATH = Path("/scratch/zhoul0e/Dataset-1")
 DEFAULT_SMOKE_DATASET_PATH = Path("/scratch/zhoul0e/Dataset-smoketest")
 DEFAULT_CACHE_ROOT = Path("/scratch/zhoul0e/regraph_cache")
 SPLITS = ("train", "validation", "test")
+CANONICALIZE_OPT_LEVEL = "-Oc"
+CANONICALIZE_PASSES = (
+    "sroa",
+    "mem2reg",
+    "instcombine",
+    "simplifycfg",
+    "early-cse",
+    "sccp",
+    "correlated-propagation",
+    "jump-threading",
+    "simplifycfg",
+    "reassociate",
+    "instcombine",
+    "gvn",
+    "dce",
+    "bdce",
+    "adce",
+    "simplifycfg",
+    "instcombine",
+)
 
 
 def now_ts() -> str:
@@ -281,7 +301,16 @@ def task2_chunk(chunk_id: str, items: list[dict[str, Any]], context: dict[str, A
         if marker.exists():
             marker.unlink()
 
-        if item["opt_level"] == "-O0":
+        if item["opt_level"] == CANONICALIZE_OPT_LEVEL:
+            task2_tool = "opt"
+            command = [
+                "opt",
+                f"-passes={','.join(CANONICALIZE_PASSES)}",
+                item["source_ll"],
+                "-o",
+                str(output_bc),
+            ]
+        elif item["opt_level"] == "-O0":
             task2_tool = "llvm-as"
             command = [
                 "llvm-as",
@@ -311,6 +340,9 @@ def task2_chunk(chunk_id: str, items: list[dict[str, Any]], context: dict[str, A
                         "source_ll": item["source_ll"],
                         "opt_level": item["opt_level"],
                         "task2_tool": task2_tool,
+                        "passes": ",".join(CANONICALIZE_PASSES)
+                        if item["opt_level"] == CANONICALIZE_OPT_LEVEL
+                        else "",
                     }
                 )
                 + "\n"
@@ -1094,6 +1126,85 @@ def run_final_reference_filter(
     return failures
 
 
+def run_final_uninformative_filter(
+    enabled: bool,
+    split_names: list[str],
+    max_stub_tokens: int,
+    collision_min_rows: int,
+    collision_min_groups: int,
+    repo_root: str,
+    output_root: Path,
+    final_output_root: Path,
+    logger: RunLogger,
+    timeout: int,
+) -> list[dict[str, Any]]:
+    if not enabled:
+        logger.info("stage=final_uninformative_filter skipped disabled")
+        return []
+
+    failures: list[dict[str, Any]] = []
+    filter_script = Path(repo_root) / "Scripts" / "ray_opt_ablation" / "filter_uninformative_final_set.py"
+    if not filter_script.is_file():
+        return [{"stage": "final_uninformative_filter", "error": f"filter script not found: {filter_script}"}]
+
+    logger.info(
+        "stage=final_uninformative_filter start "
+        f"splits={split_names} max_stub_tokens={max_stub_tokens} "
+        f"collision_min_rows={collision_min_rows} collision_min_groups={collision_min_groups} "
+        "mode=in_place"
+    )
+    for split in split_names:
+        final_set_dir = final_output_root / f"{split}_final_set"
+        if not final_set_dir.exists():
+            logger.info(f"stage=final_uninformative_filter_{split} skipped missing {final_set_dir}")
+            continue
+        if not dataset_dir_complete(final_set_dir / "train_dataset_pool"):
+            failures.append(
+                {
+                    "stage": f"final_uninformative_filter_{split}",
+                    "split": split,
+                    "final_set": str(final_set_dir),
+                    "error": f"final_set is incomplete before filtering: {final_set_dir}",
+                }
+            )
+            continue
+
+        command = [
+            sys.executable,
+            str(filter_script),
+            str(final_set_dir),
+            "--max-stub-tokens",
+            str(max_stub_tokens),
+            "--drop-collision-min-rows",
+            str(collision_min_rows),
+            "--drop-collision-min-groups",
+            str(collision_min_groups),
+        ]
+        try:
+            run_subprocess_stage(
+                f"final_uninformative_filter_{split}",
+                command,
+                repo_root,
+                output_root,
+                logger,
+                timeout=timeout,
+            )
+            if not dataset_dir_complete(final_set_dir / "train_dataset_pool"):
+                raise RuntimeError(f"filtered final_set is incomplete: {final_set_dir}")
+        except Exception as exc:
+            failures.append(
+                {
+                    "stage": f"final_uninformative_filter_{split}",
+                    "split": split,
+                    "final_set": str(final_set_dir),
+                    "error": str(exc),
+                }
+            )
+
+    logger.info(f"stage=final_uninformative_filter complete splits={split_names} failed={len(failures)}")
+    return failures
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ray fused .ll to final_set pipeline")
     parser.add_argument("--repo-root", default=str(DEFAULT_REPO_ROOT))
@@ -1103,7 +1214,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--opt-level",
         required=True,
-        help="Task2 optimization level, e.g. O0, O1, O2, O3, Os, Og. O0 uses llvm-as; others use clang.",
+        help=(
+            "Task2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oc. "
+            "O0 uses llvm-as, Oc uses a conservative opt canonicalization pipeline, others use clang."
+        ),
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--force-clean", action="store_true")
@@ -1163,6 +1277,35 @@ def parse_args() -> argparse.Namespace:
         help="Deprecated alias for --final-filter-reference.",
     )
     parser.add_argument(
+        "--final-uninformative-filter",
+        action="store_true",
+        default=os.environ.get("REGRAPH_FINAL_UNINFORMATIVE_FILTER", "0") == "1",
+        help="After final_set generation/reference filtering, remove short stubs and large exact collision buckets.",
+    )
+    parser.add_argument(
+        "--final-uninformative-filter-splits",
+        default=os.environ.get("REGRAPH_FINAL_UNINFORMATIVE_FILTER_SPLITS", "train,validation,test"),
+        help="Comma-separated final_set splits filtered by --final-uninformative-filter.",
+    )
+    parser.add_argument(
+        "--final-uninformative-max-stub-tokens",
+        type=int,
+        default=int(os.environ.get("REGRAPH_FINAL_UNINFORMATIVE_MAX_STUB_TOKENS", "128")),
+        help="Maximum token length considered for unreachable/constant-return stub removal.",
+    )
+    parser.add_argument(
+        "--final-uninformative-collision-min-rows",
+        type=int,
+        default=int(os.environ.get("REGRAPH_FINAL_UNINFORMATIVE_COLLISION_MIN_ROWS", "50")),
+        help="Minimum exact input_id collision bucket size to remove.",
+    )
+    parser.add_argument(
+        "--final-uninformative-collision-min-groups",
+        type=int,
+        default=int(os.environ.get("REGRAPH_FINAL_UNINFORMATIVE_COLLISION_MIN_GROUPS", "20")),
+        help="Minimum distinct function groups in an exact input_id collision bucket to remove.",
+    )
+    parser.add_argument(
         "--final-local-root",
         default=os.environ.get("REGRAPH_FINAL_LOCAL_ROOT", ""),
         help=(
@@ -1201,6 +1344,17 @@ def main() -> int:
     final_filter_reference = Path(final_filter_reference_arg).expanduser().resolve() if final_filter_reference_arg else None
     if final_filter_reference is not None and not final_filter_reference.exists():
         raise SystemExit(f"Final filter reference does not exist: {final_filter_reference}")
+    final_uninformative_filter_splits = [
+        split.strip()
+        for split in args.final_uninformative_filter_splits.split(",")
+        if split.strip()
+    ]
+    invalid_uninformative_splits = [split for split in final_uninformative_filter_splits if split not in SPLITS]
+    if invalid_uninformative_splits:
+        raise SystemExit(
+            "Invalid --final-uninformative-filter-splits values: "
+            + ",".join(invalid_uninformative_splits)
+        )
     if args.final_local_root:
         final_local_root: Path | None = Path(args.final_local_root).resolve()
     elif not same_path(final_output_root, output_root):
@@ -1220,6 +1374,13 @@ def main() -> int:
         logger.info(
             f"final_filter_reference={final_filter_reference if final_filter_reference else 'disabled'} "
             f"kind={args.final_filter_reference_kind} match_mode={args.final_filter_match_mode}"
+        )
+        logger.info(
+            f"final_uninformative_filter={args.final_uninformative_filter} "
+            f"splits={final_uninformative_filter_splits} "
+            f"max_stub_tokens={args.final_uninformative_max_stub_tokens} "
+            f"collision_min_rows={args.final_uninformative_collision_min_rows} "
+            f"collision_min_groups={args.final_uninformative_collision_min_groups}"
         )
         logger.info(f"final_local_root={final_local_root if final_local_root else 'disabled'} keep_final_local={args.keep_final_local}")
         logger.info(f"opt_level={opt_level}")
@@ -1391,6 +1552,29 @@ def main() -> int:
         write_jsonl(output_root / "manifests" / "final_reference_filter_failed.jsonl", final_filter_failures)
         if final_filter_failures:
             logger.info(f"pipeline finished with failures final_reference_filter_failures={len(final_filter_failures)}")
+            return 1
+
+        final_uninformative_filter_failures = run_final_uninformative_filter(
+            args.final_uninformative_filter,
+            final_uninformative_filter_splits,
+            args.final_uninformative_max_stub_tokens,
+            args.final_uninformative_collision_min_rows,
+            args.final_uninformative_collision_min_groups,
+            repo_root,
+            output_root,
+            final_output_root,
+            logger,
+            args.command_timeout_seconds,
+        )
+        write_jsonl(
+            output_root / "manifests" / "final_uninformative_filter_failed.jsonl",
+            final_uninformative_filter_failures,
+        )
+        if final_uninformative_filter_failures:
+            logger.info(
+                "pipeline finished with failures "
+                f"final_uninformative_filter_failures={len(final_uninformative_filter_failures)}"
+            )
             return 1
 
         logger.info("pipeline completed successfully")

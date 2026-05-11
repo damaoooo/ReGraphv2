@@ -52,6 +52,7 @@ test.py
 *.o
 *.i64
 *.eps
-
+.codex
+tmp/
 Scripts/ray_opt_ablation/slurm_logs/
 Scripts/task1_lift_slurm_logs/
