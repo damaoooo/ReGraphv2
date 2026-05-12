@@ -32,7 +32,6 @@ TASK2_CANONICALIZE_OPT_LEVEL = "-Oc"
 TASK2_CANONICALIZE_PASSES = (
     "sroa",
     "mem2reg",
-    "instcombine",
     "simplifycfg",
     "early-cse",
     "sccp",
@@ -40,13 +39,11 @@ TASK2_CANONICALIZE_PASSES = (
     "jump-threading",
     "simplifycfg",
     "reassociate",
-    "instcombine",
     "gvn",
     "dce",
     "bdce",
     "adce",
     "simplifycfg",
-    "instcombine",
 )
 TASK2_CANONICALIZE_CONFIG_TOKEN = "canonicalize_v1_noattrs_noinline_noglobal"
 ARCH_TO_CLANG_FLAG = {

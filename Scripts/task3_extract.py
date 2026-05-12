@@ -10,6 +10,7 @@ import json
 import math
 import multiprocessing
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -61,12 +62,25 @@ STATE_DIRNAME = ".task3_fused_state"
 DEFAULT_TARGET_SHARD_SIZE_BYTES = 1024 * 1024 * 1024
 DEFAULT_MAX_PARQUET_FILES = 5000
 DEFAULT_MAX_SEQ_LENGTH = 2048
+DEFAULT_PREFILTER_MAX_STUB_TOKENS = 128
 CSV_FILTER_SUMMARY = "csv_filter_summary.json"
 CSV_SPLIT_FILENAMES = {
     "train": ("training_Dataset-1.csv", "train_Dataset-1.csv"),
     "validation": ("validation_Dataset-1.csv",),
     "test": ("testing_Dataset-1.csv", "test_Dataset-1.csv"),
 }
+CONST_RET_RE = re.compile(
+    r"\bret\s+"
+    r"(?:(?:noundef\s+)?(?:i\d+|ptr|float|double))\s+"
+    r"(?:false|true|null|[-+]?\d+(?:\.\d+)?)\b"
+)
+SEMANTIC_OP_RE = re.compile(
+    r"\b("
+    r"call|invoke|load|store|cmpxchg|atomicrmw|alloca|"
+    r"add|sub|mul|udiv|sdiv|urem|srem|shl|lshr|ashr|and|or|xor|"
+    r"icmp|fcmp|getelementptr|select|phi|switch|br"
+    r")\b"
+)
 
 
 @dataclass(frozen=True)
@@ -101,6 +115,13 @@ class FunctionWorkItem:
             "function_index": self.function_index,
             "function_count": self.function_count,
         }
+
+
+@dataclass(frozen=True)
+class BuildFunctionResult:
+    record: Optional[Dict[str, Any]]
+    skip_reason: Optional[str] = None
+    input_hash: Optional[str] = None
 
 
 def split_key(split: Optional[str]) -> str:
@@ -196,11 +217,13 @@ def load_completed_bc_paths(output_root: Path) -> set[str]:
     completed_no_functions: set[str] = set()
 
     success_files = [manifest_dir(output_root) / "task3_success.jsonl"]
+    skipped_files = [manifest_dir(output_root) / "task3_skipped.jsonl"]
     failed_files = [manifest_dir(output_root) / "task3_failed.jsonl"]
     no_function_files = [manifest_dir(output_root) / "task3_no_functions.jsonl"]
     chunk_root = chunk_manifest_root(output_root)
     if chunk_root.exists():
         success_files.extend(chunk_root.glob("*_success.jsonl"))
+        skipped_files.extend(chunk_root.glob("*_skipped.jsonl"))
         failed_files.extend(chunk_root.glob("*_failed.jsonl"))
         no_function_files.extend(chunk_root.glob("*_no_functions.jsonl"))
 
@@ -216,7 +239,7 @@ def load_completed_bc_paths(output_root: Path) -> set[str]:
             if bc_path:
                 failed_paths.add(os.path.abspath(bc_path))
 
-    for path in success_files:
+    for path in success_files + skipped_files:
         for row in jsonl_read(path):
             bc_path = row.get("bc_path")
             if not bc_path:
@@ -226,7 +249,7 @@ def load_completed_bc_paths(output_root: Path) -> set[str]:
             function_count = int(row.get("function_count") or 0)
             if function_count > 0:
                 expected_counts[abs_bc_path] = max(expected_counts.get(abs_bc_path, 0), function_count)
-            if status == "function_success":
+            if status in {"function_success", "function_skipped"}:
                 success_counts[abs_bc_path] = success_counts.get(abs_bc_path, 0) + 1
             elif status == "success" and int(row.get("function_failed") or 0) == 0:
                 completed_no_functions.add(abs_bc_path)
@@ -949,11 +972,7 @@ def opt_generate_cfg(purified_llvm_ir_path: Path, timeout_seconds: int) -> Path:
 
 
 def truncate_record(record: Dict[str, Any], eos_token_id: Optional[int], max_seq_length: int) -> Dict[str, Any]:
-    input_ids = [int(token_id) for token_id in record["input_ids"]]
-    if len(input_ids) > max_seq_length:
-        eos = eos_token_id if eos_token_id is not None else input_ids[max_seq_length - 1]
-        input_ids = input_ids[: max_seq_length - 1] + [int(eos)]
-    record["input_ids"] = input_ids
+    record["input_ids"] = truncate_input_ids(record["input_ids"], eos_token_id, max_seq_length)
 
     def keep_edge(edge: List[float]) -> bool:
         return bool(edge) and max(edge) < max_seq_length
@@ -971,6 +990,112 @@ def truncate_record(record: Dict[str, Any], eos_token_id: Optional[int], max_seq
     return record
 
 
+def truncate_input_ids(input_ids: Iterable[int], eos_token_id: Optional[int], max_seq_length: int) -> List[int]:
+    ids = [int(token_id) for token_id in input_ids]
+    if len(ids) > max_seq_length:
+        eos = eos_token_id if eos_token_id is not None else ids[max_seq_length - 1]
+        ids = ids[: max_seq_length - 1] + [int(eos)]
+    return ids
+
+
+def hash_input_ids(input_ids: List[int]) -> str:
+    payload = b"".join(int(token_id).to_bytes(4, "little", signed=True) for token_id in input_ids)
+    return f"{len(input_ids)}:{hashlib.blake2b(payload, digest_size=12).hexdigest()}"
+
+
+def decoded_body(decoded: str) -> str:
+    if "{" not in decoded or "}" not in decoded:
+        return decoded
+    return decoded.split("{", 1)[-1].rsplit("}", 1)[0]
+
+
+def is_uninformative_stub(decoded: str, token_len: int, max_tokens: int) -> Optional[str]:
+    if token_len > max_tokens:
+        return None
+
+    text = decoded.replace("\n", " ")
+    padded = f" {text} "
+    if " unreachable " in padded:
+        return "short_unreachable"
+
+    body = decoded_body(text)
+    body_without_ret = body.replace(" ret ", " ")
+    if CONST_RET_RE.search(text) and not SEMANTIC_OP_RE.search(body_without_ret):
+        return "short_constant_return"
+    if " ret void " in padded and not SEMANTIC_OP_RE.search(body_without_ret):
+        return "short_ret_void"
+    return None
+
+
+def claim_input_hash(hash_root: Path, split: Optional[str], input_hash: str, item: Dict[str, Any]) -> Optional[Path]:
+    prefix = safe_path_token(input_hash.split(":", 1)[-1][:2] or "xx")
+    digest = safe_path_token(input_hash.replace(":", "_"))
+    marker_dir = hash_root / split_key(split) / prefix
+    ensure_directory(str(marker_dir))
+    marker_path = marker_dir / digest
+    try:
+        fd = os.open(str(marker_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return None
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "input_hash": input_hash,
+                    "split": split_label(split),
+                    "binary_name": item.get("binary_name"),
+                    "function_name": item.get("function_name"),
+                    "file_path": f"{item.get('bc_path')}::{item.get('function_name')}",
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    return marker_path
+
+
+def seed_input_hashes_from_raw_shards(output_root: Path) -> Dict[str, Any]:
+    hash_root = state_root(output_root) / "input_id_hashes"
+    if hash_root.exists():
+        shutil.rmtree(hash_root)
+
+    raw_root = raw_shard_root(output_root)
+    summary = {"raw_shards": 0, "seeded_hashes": 0, "duplicate_hashes": 0}
+    if not raw_root.exists():
+        return summary
+
+    for shard in sorted(raw_root.glob("*/*.parquet")):
+        split_token = shard.parent.name
+        split = None if split_token == split_key(None) else split_token
+        summary["raw_shards"] += 1
+        try:
+            parquet_file = pq.ParquetFile(str(shard))
+            for batch in parquet_file.iter_batches(columns=["input_ids"], batch_size=10000):
+                for input_ids in batch.column("input_ids").to_pylist():
+                    input_hash = hash_input_ids([int(token_id) for token_id in input_ids])
+                    marker = claim_input_hash(
+                        hash_root,
+                        split,
+                        input_hash,
+                        {
+                            "binary_name": f"seed:{shard.name}",
+                            "function_name": "seed",
+                            "bc_path": str(shard),
+                        },
+                    )
+                    if marker is None:
+                        summary["duplicate_hashes"] += 1
+                    else:
+                        summary["seeded_hashes"] += 1
+        except Exception as exc:
+            jsonl_append(
+                manifest_dir(output_root) / "task3_dedup_seed_failed.jsonl",
+                [{"raw_shard": str(shard), "error": str(exc), "traceback": traceback.format_exc()}],
+            )
+    return summary
+
+
 def build_function_record(
     item: Dict[str, Any],
     function_name: str,
@@ -979,7 +1104,11 @@ def build_function_record(
     max_seq_length: int,
     timeout_seconds: int,
     temp_root: Path,
-) -> Dict[str, Any]:
+    prefilter_uninformative: bool,
+    prefilter_max_stub_tokens: int,
+    dedup_input_ids: bool,
+    dedup_hash_root: Optional[Path],
+) -> BuildFunctionResult:
     bc_path = Path(item["bc_path"])
     function_hash = hashlib.sha1(f"{bc_path}::{function_name}".encode("utf-8")).hexdigest()
     function_dir = temp_root / f"{function_index:06d}_{function_hash[:16]}"
@@ -989,34 +1118,60 @@ def build_function_record(
     extract_function_ir(bc_path, function_name, function_ir, timeout_seconds)
 
     purified_ir = opt_initial_purify(function_ir, timeout_seconds)
-    instrumented_ir, ddg_dot = opt_generate_ddg(purified_ir, timeout_seconds)
-    cfg_dot = opt_generate_cfg(purified_ir, timeout_seconds)
-
-    ddg_builder = DataDependencyGraphBuilder(tokenizer)
-    ddg_graph = ddg_builder.generate_ddg_matrix(str(ddg_dot), str(instrumented_ir), str(purified_ir))
-
-    cfg_builder = CFGGraphBuilder(tokenizer, str(purified_ir), str(cfg_dot))
-    cfg_graph = cfg_builder.build_cfg_edges()
-
     normalized_ir = normalize_file(str(purified_ir))
     tokens = tokenizer(normalized_ir)
     input_ids = tokens.get("input_ids")
     if not input_ids:
         raise RuntimeError("tokenizer returned empty input_ids")
-    if ddg_graph is None:
-        raise RuntimeError("DDG graph builder returned None")
-    if cfg_graph is None:
-        raise RuntimeError("CFG graph builder returned None")
 
-    record = {
-        "binary_name": item["binary_name"],
-        "function_name": function_name,
-        "file_path": f"{bc_path}::{function_name}",
-        "input_ids": input_ids,
-        "cfg_graph": [list(edge) for edge in cfg_graph],
-        "ddg_graph": [list(edge) for edge in ddg_graph],
-    }
-    return truncate_record(record, tokenizer.eos_token_id, max_seq_length)
+    truncated_input_ids = truncate_input_ids(input_ids, tokenizer.eos_token_id, max_seq_length)
+    input_hash = hash_input_ids(truncated_input_ids)
+
+    if prefilter_uninformative:
+        decoded = tokenizer.decode(truncated_input_ids)
+        reason = is_uninformative_stub(decoded, len(truncated_input_ids), prefilter_max_stub_tokens)
+        if reason:
+            return BuildFunctionResult(record=None, skip_reason=reason, input_hash=input_hash)
+
+    claimed_hash_path: Optional[Path] = None
+    if dedup_input_ids:
+        if dedup_hash_root is None:
+            raise RuntimeError("dedup_input_ids enabled without a dedup hash root")
+        claimed_hash_path = claim_input_hash(dedup_hash_root, item.get("split"), input_hash, item)
+        if claimed_hash_path is None:
+            return BuildFunctionResult(record=None, skip_reason="duplicate_input_ids", input_hash=input_hash)
+
+    try:
+        instrumented_ir, ddg_dot = opt_generate_ddg(purified_ir, timeout_seconds)
+        cfg_dot = opt_generate_cfg(purified_ir, timeout_seconds)
+
+        ddg_builder = DataDependencyGraphBuilder(tokenizer)
+        ddg_graph = ddg_builder.generate_ddg_matrix(str(ddg_dot), str(instrumented_ir), str(purified_ir))
+
+        cfg_builder = CFGGraphBuilder(tokenizer, str(purified_ir), str(cfg_dot))
+        cfg_graph = cfg_builder.build_cfg_edges()
+
+        if ddg_graph is None:
+            raise RuntimeError("DDG graph builder returned None")
+        if cfg_graph is None:
+            raise RuntimeError("CFG graph builder returned None")
+
+        record = {
+            "binary_name": item["binary_name"],
+            "function_name": function_name,
+            "file_path": f"{bc_path}::{function_name}",
+            "input_ids": truncated_input_ids,
+            "cfg_graph": [list(edge) for edge in cfg_graph],
+            "ddg_graph": [list(edge) for edge in ddg_graph],
+        }
+        return BuildFunctionResult(
+            record=truncate_record(record, tokenizer.eos_token_id, max_seq_length),
+            input_hash=input_hash,
+        )
+    except Exception:
+        if claimed_hash_path is not None:
+            claimed_hash_path.unlink(missing_ok=True)
+        raise
 
 
 def write_records_to_parquet(records: List[Dict[str, Any]], path: Path) -> None:
@@ -1043,6 +1198,12 @@ def process_function_chunk(chunk_id: str, items: List[Dict[str, Any]], context: 
     timeout_seconds = int(context["timeout_seconds"])
     max_seq_length = int(context["max_seq_length"])
     debug = bool(context["debug"])
+    prefilter_uninformative = bool(context.get("prefilter_uninformative"))
+    prefilter_max_stub_tokens = int(
+        context.get("prefilter_max_stub_tokens") or DEFAULT_PREFILTER_MAX_STUB_TOKENS
+    )
+    dedup_input_ids = bool(context.get("dedup_input_ids"))
+    dedup_hash_root = Path(context["dedup_hash_root"]) if context.get("dedup_hash_root") else None
     split = items[0].get("split") if items else None
     split_dir_name = split_key(split)
     raw_dir = Path(context["raw_shard_root"]) / split_dir_name
@@ -1063,6 +1224,7 @@ def process_function_chunk(chunk_id: str, items: List[Dict[str, Any]], context: 
     records: List[Dict[str, Any]] = []
     success_rows: List[Dict[str, Any]] = []
     failed_rows: List[Dict[str, Any]] = []
+    skipped_rows: List[Dict[str, Any]] = []
 
     try:
         for item in items:
@@ -1070,7 +1232,7 @@ def process_function_chunk(chunk_id: str, items: List[Dict[str, Any]], context: 
             function_name = item["function_name"]
             function_index = int(item["function_index"])
             try:
-                record = build_function_record(
+                result = build_function_record(
                     item=item,
                     function_name=function_name,
                     function_index=function_index,
@@ -1078,9 +1240,27 @@ def process_function_chunk(chunk_id: str, items: List[Dict[str, Any]], context: 
                     max_seq_length=max_seq_length,
                     timeout_seconds=timeout_seconds,
                     temp_root=chunk_temp_root / hashlib.sha1(bc_path.encode("utf-8")).hexdigest()[:16],
+                    prefilter_uninformative=prefilter_uninformative,
+                    prefilter_max_stub_tokens=prefilter_max_stub_tokens,
+                    dedup_input_ids=dedup_input_ids,
+                    dedup_hash_root=dedup_hash_root,
                 )
-                records.append(record)
-                success_rows.append({**item, "status": "function_success", "chunk_id": chunk_id})
+                if result.record is None:
+                    skipped_rows.append(
+                        {
+                            **item,
+                            "status": "function_skipped",
+                            "stage": "prefilter",
+                            "chunk_id": chunk_id,
+                            "reason": result.skip_reason,
+                            "input_hash": result.input_hash,
+                        }
+                    )
+                    continue
+                records.append(result.record)
+                success_rows.append(
+                    {**item, "status": "function_success", "chunk_id": chunk_id, "input_hash": result.input_hash}
+                )
             except Exception as exc:
                 failed_rows.append(
                     {
@@ -1112,8 +1292,10 @@ def process_function_chunk(chunk_id: str, items: List[Dict[str, Any]], context: 
 
         success_manifest = chunk_manifest_dir / f"{manifest_stem}_success.jsonl"
         failed_manifest = chunk_manifest_dir / f"{manifest_stem}_failed.jsonl"
+        skipped_manifest = chunk_manifest_dir / f"{manifest_stem}_skipped.jsonl"
         jsonl_append(success_manifest, success_rows)
         jsonl_append(failed_manifest, failed_rows)
+        jsonl_append(skipped_manifest, skipped_rows)
 
         return {
             "chunk_id": chunk_id,
@@ -1121,10 +1303,12 @@ def process_function_chunk(chunk_id: str, items: List[Dict[str, Any]], context: 
             "functions": len(items),
             "records": len(records),
             "success_functions": len(success_rows),
+            "skipped_entries": len(skipped_rows),
             "failed_entries": len(failed_rows),
             "raw_shard": str(raw_shard_path) if raw_shard_path else None,
             "success_manifest": str(success_manifest) if success_rows else None,
             "failed_manifest": str(failed_manifest) if failed_rows else None,
+            "skipped_manifest": str(skipped_manifest) if skipped_rows else None,
             "elapsed_seconds": time.time() - start,
         }
     finally:
@@ -1139,6 +1323,7 @@ def collect_chunk_manifests(output_root: Path) -> None:
 
     manifest_map = {
         "success": manifest_dir(output_root) / "task3_success.jsonl",
+        "skipped": manifest_dir(output_root) / "task3_skipped.jsonl",
         "failed": manifest_dir(output_root) / "task3_failed.jsonl",
         "no_functions": manifest_dir(output_root) / "task3_no_functions.jsonl",
     }
@@ -1404,7 +1589,10 @@ def run_ray_backend(chunks: List[tuple[str, List[FunctionWorkItem]]], context: D
         cluster_cpus = int(ray.cluster_resources().get("CPU", 0))
         console.print(f"[green]Ray cluster CPUs: {cluster_cpus}[/green]")
 
-        @ray.remote
+        ray_worker_cpus = float(context.get("ray_worker_cpus") or 1.0)
+        console.print(f"[green]Ray worker CPUs per chunk: {ray_worker_cpus:g}[/green]")
+
+        @ray.remote(num_cpus=ray_worker_cpus)
         def ray_process_function_chunk(chunk_id: str, chunk_items_list: List[Dict[str, Any]], worker_context: Dict[str, Any]):
             return process_function_chunk(chunk_id, chunk_items_list, worker_context)
 
@@ -1415,6 +1603,7 @@ def run_ray_backend(chunks: List[tuple[str, List[FunctionWorkItem]]], context: D
         completed = 0
         completed_functions = 0
         completed_records = 0
+        skipped_entries = 0
         failed_entries = 0
         total_functions = sum(len(chunk_items_list) for _, chunk_items_list in chunks)
         total_chunks = len(chunks)
@@ -1471,7 +1660,7 @@ def run_ray_backend(chunks: List[tuple[str, List[FunctionWorkItem]]], context: D
             console.print(
                 f"[cyan]Task3 Ray progress {progress_bar(completed_functions, total_functions)} "
                 f"functions={completed_functions}/{total_functions} pct={pct:.1f}% "
-                f"records={completed_records} failed={failed_entries} "
+                f"records={completed_records} skipped={skipped_entries} failed={failed_entries} "
                 f"chunks={completed}/{total_chunks} submitted={next_chunk_index} "
                 f"in_flight={len(pending)} "
                 f"rate_functions_s={rate:.2f} eta={format_duration(eta)} "
@@ -1488,6 +1677,7 @@ def run_ray_backend(chunks: List[tuple[str, List[FunctionWorkItem]]], context: D
                 completed_functions=completed_functions,
                 total_functions=total_functions,
                 records=completed_records,
+                skipped_entries=skipped_entries,
                 failed_entries=failed_entries,
                 rate_functions_s=round(rate, 3),
                 eta_s=round(eta, 3) if eta is not None else None,
@@ -1528,6 +1718,7 @@ def run_ray_backend(chunks: List[tuple[str, List[FunctionWorkItem]]], context: D
                         results.append(result)
                         completed_functions += int(result.get("functions") or 0)
                         completed_records += int(result.get("records") or 0)
+                        skipped_entries += int(result.get("skipped_entries") or 0)
                         failed_entries += int(result.get("failed_entries") or 0)
                         progress_event(
                             output_root,
@@ -1535,6 +1726,7 @@ def run_ray_backend(chunks: List[tuple[str, List[FunctionWorkItem]]], context: D
                             chunk_id=result.get("chunk_id"),
                             functions=result.get("functions"),
                             records=result.get("records"),
+                            skipped_entries=result.get("skipped_entries"),
                             failed_entries=result.get("failed_entries"),
                             elapsed_seconds=round(float(result.get("elapsed_seconds") or 0), 3),
                         )
@@ -1595,6 +1787,11 @@ def main(
         "--ray-max-in-flight-chunks",
         help="Maximum Ray chunk tasks submitted at once; 0 chooses about 4x cluster CPUs with a floor of 1024",
     ),
+    ray_worker_cpus: float = typer.Option(
+        1.0,
+        "--ray-worker-cpus",
+        help="Logical Ray CPU reservation per function chunk worker.",
+    ),
     csv_filter_dir: str = typer.Option(
         "",
         "--csv-filter-dir",
@@ -1602,6 +1799,21 @@ def main(
             "Optional Dataset-1 CSV whitelist directory. Expected files are "
             "training_Dataset-1.csv, validation_Dataset-1.csv, and testing_Dataset-1.csv."
         ),
+    ),
+    prefilter_uninformative: bool = typer.Option(
+        False,
+        "--prefilter-uninformative/--no-prefilter-uninformative",
+        help="Skip short unreachable/constant-return functions before CFG/DDG graph construction.",
+    ),
+    prefilter_max_stub_tokens: int = typer.Option(
+        DEFAULT_PREFILTER_MAX_STUB_TOKENS,
+        "--prefilter-max-stub-tokens",
+        help="Maximum token length considered for prefiltering short stubs.",
+    ),
+    dedup_input_ids: bool = typer.Option(
+        False,
+        "--dedup-input-ids/--no-dedup-input-ids",
+        help="Keep the first function per split with each exact truncated input_ids hash.",
     ),
     command_timeout_seconds: int = typer.Option(0, "--command-timeout-seconds", help="Per LLVM/opt command timeout; 0 disables timeout"),
     progress_summary_interval_s: int = typer.Option(30, "--progress-summary-interval-s", help="Emit Slurm-friendly text progress every N seconds"),
@@ -1619,6 +1831,10 @@ def main(
         raise typer.BadParameter("--chunk-manifest-mode must be either worker or chunk")
     if ray_max_in_flight_chunks < 0:
         raise typer.BadParameter("--ray-max-in-flight-chunks must be non-negative")
+    if ray_worker_cpus <= 0:
+        raise typer.BadParameter("--ray-worker-cpus must be positive")
+    if prefilter_max_stub_tokens <= 0:
+        raise typer.BadParameter("--prefilter-max-stub-tokens must be positive")
 
     input_root = Path(input_path).resolve()
     output_root = Path(output).resolve()
@@ -1648,6 +1864,11 @@ def main(
     console.print(f"[green]Max parquet files: {max_parquet_files}[/green]")
     if resolved_csv_filter_dir is not None:
         console.print(f"[green]CSV filter dir: {resolved_csv_filter_dir}[/green]")
+    console.print(
+        f"[green]Prefilter: uninformative={int(prefilter_uninformative)} "
+        f"max_stub_tokens={prefilter_max_stub_tokens} "
+        f"dedup_input_ids={int(dedup_input_ids)}[/green]"
+    )
     console.print(
         f"[green]Chunk manifest mode: {normalized_chunk_manifest_mode}; "
         f"cleanup={int(cleanup_chunk_manifest_files)}[/green]"
@@ -1702,6 +1923,7 @@ def main(
         grouped_functions.setdefault(item.split, []).append(item)
 
     chunks: List[tuple[str, List[FunctionWorkItem]]] = []
+    skipped_existing_chunks = 0
     active_splits = list(grouped_functions.items())
     raw_shard_budget = max(1, max_parquet_files // 2)
     if len(active_splits) > raw_shard_budget:
@@ -1729,7 +1951,12 @@ def main(
             f"interleave_by_bc=1[/cyan]"
         )
         for index, chunk in enumerate(chunk_function_items(split_items, split_chunk_size)):
-            chunks.append((safe_chunk_id(split, index), chunk))
+            chunk_id = safe_chunk_id(split, index)
+            existing_raw_shard = raw_shard_root(output_root) / split_key(split) / f"{chunk_id}.parquet"
+            if resume and existing_raw_shard.is_file():
+                skipped_existing_chunks += 1
+                continue
+            chunks.append((chunk_id, chunk))
 
     if len(chunks) > max_parquet_files // 2:
         console.print(
@@ -1739,9 +1966,20 @@ def main(
     estimated_manifest_files = "worker processes" if normalized_chunk_manifest_mode == "worker" else str(len(chunks) * 2)
     console.print(
         f"[cyan]Planned task3 chunks={len(chunks)} raw_parquet_peak={len(chunks)} "
+        f"skipped_existing_chunks={skipped_existing_chunks} "
         f"chunk_manifest_files={estimated_manifest_files} "
         f"ray_max_in_flight={ray_max_in_flight_chunks or 'auto'}[/cyan]"
     )
+
+    if dedup_input_ids and resume:
+        seed_summary = seed_input_hashes_from_raw_shards(output_root)
+        write_json(manifest_dir(output_root) / "task3_dedup_seed_summary.json", seed_summary)
+        console.print(
+            f"[cyan]Seeded input_id dedup hashes from existing raw shards: "
+            f"raw_shards={seed_summary['raw_shards']} "
+            f"seeded={seed_summary['seeded_hashes']} "
+            f"duplicates={seed_summary['duplicate_hashes']}[/cyan]"
+        )
 
     context = {
         "repo_root": str(REPO_ROOT),
@@ -1757,6 +1995,11 @@ def main(
         "progress_summary_interval_s": progress_summary_interval_s,
         "chunk_manifest_mode": normalized_chunk_manifest_mode,
         "ray_max_in_flight_chunks": ray_max_in_flight_chunks,
+        "ray_worker_cpus": ray_worker_cpus,
+        "prefilter_uninformative": prefilter_uninformative,
+        "prefilter_max_stub_tokens": prefilter_max_stub_tokens,
+        "dedup_input_ids": dedup_input_ids,
+        "dedup_hash_root": str(state_root(output_root) / "input_id_hashes") if dedup_input_ids else "",
         "run_id": f"{int(time.time())}_{os.getpid()}",
     }
 

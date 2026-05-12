@@ -41,7 +41,6 @@ CANONICALIZE_OPT_LEVEL = "-Oc"
 CANONICALIZE_PASSES = (
     "sroa",
     "mem2reg",
-    "instcombine",
     "simplifycfg",
     "early-cse",
     "sccp",
@@ -49,13 +48,11 @@ CANONICALIZE_PASSES = (
     "jump-threading",
     "simplifycfg",
     "reassociate",
-    "instcombine",
     "gvn",
     "dce",
     "bdce",
     "adce",
     "simplifycfg",
-    "instcombine",
 )
 
 
@@ -1232,6 +1229,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-failures-to-screen", type=int, default=200)
     parser.add_argument("--task3-chunk-manifest-mode", choices=("worker", "chunk"), default="worker")
     parser.add_argument("--task3-ray-max-in-flight-chunks", type=int, default=0)
+    parser.add_argument("--task3-ray-worker-cpus", type=float, default=1.0)
+    parser.add_argument("--task3-prefilter-uninformative", action="store_true")
+    parser.add_argument("--task3-prefilter-max-stub-tokens", type=int, default=128)
+    parser.add_argument("--task3-dedup-input-ids", action="store_true")
     parser.add_argument(
         "--task3-csv-filter-dir",
         default=os.environ.get("REGRAPH_TASK3_CSV_FILTER_DIR", ""),
@@ -1372,6 +1373,12 @@ def main() -> int:
         logger.info(f"final_output_root={final_output_root}")
         logger.info(f"task3_csv_filter_dir={task3_csv_filter_dir if task3_csv_filter_dir else 'disabled'}")
         logger.info(
+            f"task3_prefilter_uninformative={args.task3_prefilter_uninformative} "
+            f"task3_prefilter_max_stub_tokens={args.task3_prefilter_max_stub_tokens} "
+            f"task3_dedup_input_ids={args.task3_dedup_input_ids} "
+            f"task3_ray_worker_cpus={args.task3_ray_worker_cpus}"
+        )
+        logger.info(
             f"final_filter_reference={final_filter_reference if final_filter_reference else 'disabled'} "
             f"kind={args.final_filter_reference_kind} match_mode={args.final_filter_match_mode}"
         )
@@ -1480,9 +1487,15 @@ def main() -> int:
             args.task3_chunk_manifest_mode,
             "--ray-max-in-flight-chunks",
             str(args.task3_ray_max_in_flight_chunks),
+            "--ray-worker-cpus",
+            str(args.task3_ray_worker_cpus),
         ]
         if task3_csv_filter_dir is not None:
             task3_command.extend(["--csv-filter-dir", str(task3_csv_filter_dir)])
+        if args.task3_prefilter_uninformative:
+            task3_command.extend(["--prefilter-uninformative", "--prefilter-max-stub-tokens", str(args.task3_prefilter_max_stub_tokens)])
+        if args.task3_dedup_input_ids:
+            task3_command.append("--dedup-input-ids")
         if args.keep_task3_chunk_manifests:
             task3_command.append("--keep-chunk-manifests")
         if args.task3_chunk_size > 0:
