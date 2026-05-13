@@ -22,16 +22,18 @@ class RoFormerSdpaSelfAttention(RoFormerSelfAttention):
         hidden_states,
         attention_mask=None,
         sinusoidal_pos=None,
+        head_mask=None,
         encoder_hidden_states=None,
         past_key_values=None,
         output_attentions=False,
         cache_position=None,
     ):
-        if output_attentions:
+        if output_attentions or head_mask is not None:
             return super().forward(
                 hidden_states,
                 attention_mask=attention_mask,
                 sinusoidal_pos=sinusoidal_pos,
+                head_mask=head_mask,
                 encoder_hidden_states=encoder_hidden_states,
                 past_key_values=past_key_values,
                 output_attentions=output_attentions,
