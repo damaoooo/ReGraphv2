@@ -28,24 +28,46 @@ TASK2_CLANG_REOPT_FLAGS = (
     "-fno-pie",
 )
 TASK2_CONFIG_TOKEN = "noinline_noinlinefunc_nopic_nopie"
-TASK2_CANONICALIZE_OPT_LEVEL = "-Oc"
-TASK2_CANONICALIZE_PASSES = (
-    "sroa",
-    "mem2reg",
-    "simplifycfg",
-    "early-cse",
-    "sccp",
-    "correlated-propagation",
-    "jump-threading",
-    "simplifycfg",
-    "reassociate",
-    "gvn",
-    "dce",
-    "bdce",
-    "adce",
-    "simplifycfg",
-)
-TASK2_CANONICALIZE_CONFIG_TOKEN = "canonicalize_v1_noattrs_noinline_noglobal"
+TASK2_CANONICALIZE_PASSES_BY_OPT_LEVEL = {
+    "-Oc": (
+        "sroa",
+        "mem2reg",
+        "simplifycfg",
+        "early-cse",
+        "sccp",
+        "correlated-propagation",
+        "jump-threading",
+        "simplifycfg",
+        "reassociate",
+        "gvn",
+        "dce",
+        "bdce",
+        "adce",
+        "simplifycfg",
+    ),
+    "-Oc2": (
+        "sroa",
+        "mem2reg",
+        "instcombine<max-iterations=1>",
+        "simplifycfg",
+        "early-cse",
+        "sccp",
+        "correlated-propagation",
+        "jump-threading",
+        "simplifycfg",
+        "reassociate",
+        "instcombine<max-iterations=1>",
+        "gvn",
+        "dce",
+        "bdce",
+        "adce",
+        "simplifycfg",
+    ),
+}
+TASK2_CANONICALIZE_CONFIG_TOKENS = {
+    "-Oc": "canonicalize_v1_noattrs_noinline_noglobal",
+    "-Oc2": "canonicalize_v2_instcombine1_noattrs_noinline_noglobal",
+}
 ARCH_TO_CLANG_FLAG = {
     "m32": "-m32",
     "m64": "-m64",
@@ -130,12 +152,12 @@ def resolve_arch(file_path: str, arch_mode: str) -> str | None:
 
 def opt_level_state_token(opt_level: str, arch: str) -> str:
     opt_token = opt_level.lstrip("-").replace(os.sep, "_")
-    config_token = (
-        TASK2_CANONICALIZE_CONFIG_TOKEN
-        if opt_level == TASK2_CANONICALIZE_OPT_LEVEL
-        else TASK2_CONFIG_TOKEN
-    )
+    config_token = TASK2_CANONICALIZE_CONFIG_TOKENS.get(opt_level, TASK2_CONFIG_TOKEN)
     return f"{opt_token}_{arch}_{config_token}"
+
+
+def canonicalize_passes_for_opt_level(opt_level: str) -> tuple[str, ...] | None:
+    return TASK2_CANONICALIZE_PASSES_BY_OPT_LEVEL.get(opt_level)
 
 
 def marker_path_for_output(input_root: str, output_path: str, opt_level: str, arch: str) -> str:
@@ -154,10 +176,11 @@ def reoptimize_file(file_path: str, output_path: str, opt_level: str, arch: str,
         os.remove(marker_path)
 
     arch_flag = ARCH_TO_CLANG_FLAG[arch]
-    if opt_level == TASK2_CANONICALIZE_OPT_LEVEL:
+    canonicalize_passes = canonicalize_passes_for_opt_level(opt_level)
+    if canonicalize_passes is not None:
         command = [
             "opt",
-            f"-passes={','.join(TASK2_CANONICALIZE_PASSES)}",
+            f"-passes={','.join(canonicalize_passes)}",
             file_path,
             "-o",
             output_path,
@@ -182,7 +205,7 @@ def reoptimize_file(file_path: str, output_path: str, opt_level: str, arch: str,
     success, stdout, stderr = run_command(command, command_description)
 
     if success and not file_exists_and_not_empty(output_path):
-        return False, stdout, f"clang finished successfully but output is missing: {output_path}"
+        return False, stdout, f"{tool} finished successfully but output is missing: {output_path}"
 
     if success:
         ensure_directory(os.path.dirname(marker_path))
@@ -191,8 +214,8 @@ def reoptimize_file(file_path: str, output_path: str, opt_level: str, arch: str,
             handle.write(f"tool={tool}\n")
             handle.write(f"arch={arch}\n")
             handle.write(f"arch_flag={arch_flag}\n")
-            if opt_level == TASK2_CANONICALIZE_OPT_LEVEL:
-                handle.write(f"passes={','.join(TASK2_CANONICALIZE_PASSES)}\n")
+            if canonicalize_passes is not None:
+                handle.write(f"passes={','.join(canonicalize_passes)}\n")
             else:
                 handle.write(f"flags={' '.join(TASK2_CLANG_REOPT_FLAGS)}\n")
 
@@ -210,7 +233,7 @@ def main(
     opt_level: str = typer.Option(
         "O3",
         "--opt-level",
-        help="Task 2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oz, or Oc canonicalization",
+        help="Task 2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oz, Oc, or Oc2 canonicalization",
     ),
     arch: str = typer.Option(
         "auto",
@@ -231,8 +254,9 @@ def main(
     console.print(f"[green]Processing directory: {normalized_input_path}[/green]")
     console.print(f"[green]Task 2 opt level: {normalized_opt_level}[/green]")
     console.print(f"[green]Task 2 arch mode: {normalized_arch}[/green]")
-    if normalized_opt_level == TASK2_CANONICALIZE_OPT_LEVEL:
-        console.print(f"[green]Task 2 canonicalize passes: {','.join(TASK2_CANONICALIZE_PASSES)}[/green]")
+    canonicalize_passes = canonicalize_passes_for_opt_level(normalized_opt_level)
+    if canonicalize_passes is not None:
+        console.print(f"[green]Task 2 canonicalize passes: {','.join(canonicalize_passes)}[/green]")
     else:
         console.print(f"[green]Task 2 clang flags: {'/'.join(ARCH_TO_CLANG_FLAG.values())} {' '.join(TASK2_CLANG_REOPT_FLAGS)}[/green]")
 

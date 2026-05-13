@@ -37,23 +37,42 @@ DEFAULT_DATASET_PATH = Path("/scratch/zhoul0e/Dataset-1")
 DEFAULT_SMOKE_DATASET_PATH = Path("/scratch/zhoul0e/Dataset-smoketest")
 DEFAULT_CACHE_ROOT = Path("/scratch/zhoul0e/regraph_cache")
 SPLITS = ("train", "validation", "test")
-CANONICALIZE_OPT_LEVEL = "-Oc"
-CANONICALIZE_PASSES = (
-    "sroa",
-    "mem2reg",
-    "simplifycfg",
-    "early-cse",
-    "sccp",
-    "correlated-propagation",
-    "jump-threading",
-    "simplifycfg",
-    "reassociate",
-    "gvn",
-    "dce",
-    "bdce",
-    "adce",
-    "simplifycfg",
-)
+CANONICALIZE_PASSES_BY_OPT_LEVEL = {
+    "-Oc": (
+        "sroa",
+        "mem2reg",
+        "simplifycfg",
+        "early-cse",
+        "sccp",
+        "correlated-propagation",
+        "jump-threading",
+        "simplifycfg",
+        "reassociate",
+        "gvn",
+        "dce",
+        "bdce",
+        "adce",
+        "simplifycfg",
+    ),
+    "-Oc2": (
+        "sroa",
+        "mem2reg",
+        "instcombine<max-iterations=1>",
+        "simplifycfg",
+        "early-cse",
+        "sccp",
+        "correlated-propagation",
+        "jump-threading",
+        "simplifycfg",
+        "reassociate",
+        "instcombine<max-iterations=1>",
+        "gvn",
+        "dce",
+        "bdce",
+        "adce",
+        "simplifycfg",
+    ),
+}
 
 
 def now_ts() -> str:
@@ -298,11 +317,12 @@ def task2_chunk(chunk_id: str, items: list[dict[str, Any]], context: dict[str, A
         if marker.exists():
             marker.unlink()
 
-        if item["opt_level"] == CANONICALIZE_OPT_LEVEL:
+        canonicalize_passes = CANONICALIZE_PASSES_BY_OPT_LEVEL.get(item["opt_level"])
+        if canonicalize_passes is not None:
             task2_tool = "opt"
             command = [
                 "opt",
-                f"-passes={','.join(CANONICALIZE_PASSES)}",
+                f"-passes={','.join(canonicalize_passes)}",
                 item["source_ll"],
                 "-o",
                 str(output_bc),
@@ -337,8 +357,8 @@ def task2_chunk(chunk_id: str, items: list[dict[str, Any]], context: dict[str, A
                         "source_ll": item["source_ll"],
                         "opt_level": item["opt_level"],
                         "task2_tool": task2_tool,
-                        "passes": ",".join(CANONICALIZE_PASSES)
-                        if item["opt_level"] == CANONICALIZE_OPT_LEVEL
+                        "passes": ",".join(canonicalize_passes)
+                        if canonicalize_passes is not None
                         else "",
                     }
                 )
@@ -1212,8 +1232,8 @@ def parse_args() -> argparse.Namespace:
         "--opt-level",
         required=True,
         help=(
-            "Task2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oc. "
-            "O0 uses llvm-as, Oc uses a conservative opt canonicalization pipeline, others use clang."
+            "Task2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oc, Oc2. "
+            "O0 uses llvm-as, Oc/Oc2 use conservative opt canonicalization pipelines, others use clang."
         ),
     )
     parser.add_argument("--resume", action="store_true")
