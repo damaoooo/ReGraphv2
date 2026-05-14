@@ -48,7 +48,7 @@ TASK2_CANONICALIZE_PASSES_BY_OPT_LEVEL = {
     "-Oc2": (
         "sroa",
         "mem2reg",
-        "instcombine<max-iterations=1>",
+        "instcombine<no-verify-fixpoint;max-iterations=1>",
         "simplifycfg",
         "early-cse",
         "sccp",
@@ -56,7 +56,7 @@ TASK2_CANONICALIZE_PASSES_BY_OPT_LEVEL = {
         "jump-threading",
         "simplifycfg",
         "reassociate",
-        "instcombine<max-iterations=1>",
+        "instcombine<no-verify-fixpoint;max-iterations=1>",
         "gvn",
         "dce",
         "bdce",
@@ -66,8 +66,12 @@ TASK2_CANONICALIZE_PASSES_BY_OPT_LEVEL = {
 }
 TASK2_CANONICALIZE_CONFIG_TOKENS = {
     "-Oc": "canonicalize_v1_noattrs_noinline_noglobal",
-    "-Oc2": "canonicalize_v2_instcombine1_noattrs_noinline_noglobal",
+    "-Oc2": "canonicalize_v2_instcombine1_nofixpoint_noattrs_noinline_noglobal",
 }
+ILLEGAL_FUNCTION_BITCAST_RE = re.compile(
+    r"^\s*(?P<name>%\"[^\"]+\"|%[-A-Za-z0-9$._]+)\s*=\s*bitcast\s+"
+    r"i(?:1|8|16|32|64|128)\s+.+\s+to\s+.+\([^)]*\)\s*$"
+)
 ARCH_TO_CLANG_FLAG = {
     "m32": "-m32",
     "m64": "-m64",
@@ -160,6 +164,38 @@ def canonicalize_passes_for_opt_level(opt_level: str) -> tuple[str, ...] | None:
     return TASK2_CANONICALIZE_PASSES_BY_OPT_LEVEL.get(opt_level)
 
 
+def sanitize_illegal_function_bitcasts(file_path: str, output_path: str) -> tuple[str | None, int]:
+    """Drop invalid lifted stores that bitcast integers into function values."""
+    invalid_values = set()
+    output_lines = []
+    removed = 0
+
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            match = ILLEGAL_FUNCTION_BITCAST_RE.match(line)
+            if match:
+                invalid_values.add(match.group("name"))
+                removed += 1
+                continue
+
+            stripped = line.lstrip()
+            if invalid_values and stripped.startswith("store "):
+                if any(f" {name}," in line or f"\t{name}," in line for name in invalid_values):
+                    removed += 1
+                    continue
+
+            output_lines.append(line)
+
+    if removed == 0:
+        return None, 0
+
+    sanitized_path = os.path.splitext(output_path)[0] + ".sanitized.ll"
+    ensure_directory(os.path.dirname(sanitized_path))
+    with open(sanitized_path, "w", encoding="utf-8") as handle:
+        handle.write("".join(output_lines))
+    return sanitized_path, removed
+
+
 def marker_path_for_output(input_root: str, output_path: str, opt_level: str, arch: str) -> str:
     relative_output_path = os.path.relpath(output_path, input_root)
     return os.path.join(
@@ -177,6 +213,8 @@ def reoptimize_file(file_path: str, output_path: str, opt_level: str, arch: str,
 
     arch_flag = ARCH_TO_CLANG_FLAG[arch]
     canonicalize_passes = canonicalize_passes_for_opt_level(opt_level)
+    sanitized_input = ""
+    sanitized_removed = 0
     if canonicalize_passes is not None:
         command = [
             "opt",
@@ -203,6 +241,25 @@ def reoptimize_file(file_path: str, output_path: str, opt_level: str, arch: str,
         command_description = f"Re-optimizing {file_path} with {opt_level}"
 
     success, stdout, stderr = run_command(command, command_description)
+    if (
+        not success
+        and canonicalize_passes is not None
+        and "invalid cast opcode for cast from" in (stderr or stdout)
+    ):
+        sanitized_path, sanitized_removed = sanitize_illegal_function_bitcasts(file_path, output_path)
+        if sanitized_path is not None:
+            sanitized_input = sanitized_path
+            retry_command = [
+                "opt",
+                f"-passes={','.join(canonicalize_passes)}",
+                sanitized_input,
+                "-o",
+                output_path,
+            ]
+            success, stdout, stderr = run_command(
+                retry_command,
+                f"Canonicalizing sanitized {file_path} with {opt_level}",
+            )
 
     if success and not file_exists_and_not_empty(output_path):
         return False, stdout, f"{tool} finished successfully but output is missing: {output_path}"
@@ -216,6 +273,9 @@ def reoptimize_file(file_path: str, output_path: str, opt_level: str, arch: str,
             handle.write(f"arch_flag={arch_flag}\n")
             if canonicalize_passes is not None:
                 handle.write(f"passes={','.join(canonicalize_passes)}\n")
+                if sanitized_input:
+                    handle.write(f"sanitized_input={sanitized_input}\n")
+                    handle.write(f"sanitized_removed_lines={sanitized_removed}\n")
             else:
                 handle.write(f"flags={' '.join(TASK2_CLANG_REOPT_FLAGS)}\n")
 

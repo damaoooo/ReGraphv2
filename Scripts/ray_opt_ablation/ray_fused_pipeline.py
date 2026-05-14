@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import selectors
 import shutil
 import socket
@@ -57,7 +58,7 @@ CANONICALIZE_PASSES_BY_OPT_LEVEL = {
     "-Oc2": (
         "sroa",
         "mem2reg",
-        "instcombine<max-iterations=1>",
+        "instcombine<no-verify-fixpoint;max-iterations=1>",
         "simplifycfg",
         "early-cse",
         "sccp",
@@ -65,7 +66,7 @@ CANONICALIZE_PASSES_BY_OPT_LEVEL = {
         "jump-threading",
         "simplifycfg",
         "reassociate",
-        "instcombine<max-iterations=1>",
+        "instcombine<no-verify-fixpoint;max-iterations=1>",
         "gvn",
         "dce",
         "bdce",
@@ -73,6 +74,10 @@ CANONICALIZE_PASSES_BY_OPT_LEVEL = {
         "simplifycfg",
     ),
 }
+ILLEGAL_FUNCTION_BITCAST_RE = re.compile(
+    r"^\s*(?P<name>%\"[^\"]+\"|%[-A-Za-z0-9$._]+)\s*=\s*bitcast\s+"
+    r"i(?:1|8|16|32|64|128)\s+.+\s+to\s+.+\([^)]*\)\s*$"
+)
 
 
 def now_ts() -> str:
@@ -295,6 +300,36 @@ def chunks(items: list[dict[str, Any]], chunk_size: int) -> list[list[dict[str, 
     return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
 
 
+def sanitize_illegal_function_bitcasts(source_ll: Path, sanitized_ll: Path) -> tuple[Path | None, int]:
+    """Drop invalid lifted stores that bitcast integers into function values."""
+    invalid_values: set[str] = set()
+    output_lines: list[str] = []
+    removed = 0
+
+    with source_ll.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            match = ILLEGAL_FUNCTION_BITCAST_RE.match(line)
+            if match:
+                invalid_values.add(match.group("name"))
+                removed += 1
+                continue
+
+            stripped = line.lstrip()
+            if invalid_values and stripped.startswith("store "):
+                if any(f" {name}," in line or f"\t{name}," in line for name in invalid_values):
+                    removed += 1
+                    continue
+
+            output_lines.append(line)
+
+    if removed == 0:
+        return None, 0
+
+    ensure_dir(sanitized_ll.parent)
+    sanitized_ll.write_text("".join(output_lines), encoding="utf-8")
+    return sanitized_ll, removed
+
+
 @ray.remote
 def task2_chunk(chunk_id: str, items: list[dict[str, Any]], context: dict[str, Any]) -> dict[str, Any]:
     start = time.time()
@@ -350,6 +385,30 @@ def task2_chunk(chunk_id: str, items: list[dict[str, Any]], context: dict[str, A
                 str(output_bc),
             ]
         success, stdout, stderr, returncode = run_command(command, timeout=timeout)
+        sanitized_input = ""
+        sanitized_removed = 0
+        error_text = stderr or stdout
+        if (
+            not success
+            and canonicalize_passes is not None
+            and "invalid cast opcode for cast from" in error_text
+        ):
+            sanitized_ll = output_bc.with_suffix(".sanitized.ll")
+            sanitized_path, sanitized_removed = sanitize_illegal_function_bitcasts(
+                Path(item["source_ll"]),
+                sanitized_ll,
+            )
+            if sanitized_path is not None:
+                sanitized_input = str(sanitized_path)
+                retry_command = [
+                    "opt",
+                    f"-passes={','.join(canonicalize_passes)}",
+                    sanitized_input,
+                    "-o",
+                    str(output_bc),
+                ]
+                success, stdout, stderr, returncode = run_command(retry_command, timeout=timeout)
+
         if success and output_bc.exists() and output_bc.stat().st_size > 0:
             marker.write_text(
                 json.dumps(
@@ -360,6 +419,8 @@ def task2_chunk(chunk_id: str, items: list[dict[str, Any]], context: dict[str, A
                         "passes": ",".join(canonicalize_passes)
                         if canonicalize_passes is not None
                         else "",
+                        "sanitized_input": sanitized_input,
+                        "sanitized_removed_lines": sanitized_removed,
                     }
                 )
                 + "\n"
