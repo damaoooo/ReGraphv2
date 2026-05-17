@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 REPO_ROOT="${REPO_ROOT:-${DEFAULT_REPO_ROOT}}"
-CONDA_ENV="${CONDA_ENV:-ReLL}"
+CONDA_ENV="${CONDA_ENV:-}"
 PYTHON_CMD="${PYTHON_CMD:-python}"
 read -r -a PYTHON <<< "${PYTHON_CMD}"
 
@@ -49,6 +49,7 @@ Options:
   --dataset-root DIR     OC fused dataset root.
   --test-set DIR         Test final_set directory. Default: DATASET_ROOT/test_final_set_len128_hashdedup
   --output-root DIR      Output root. Default: runs/dataset1_oc_graph_ablation
+  --conda-env NAME       Conda env to activate. Default: keep current shell environment
   --fresh                Do not resume training.
   --skip-train           Only run evaluation with existing model.
   --reuse-embeddings     Reuse existing embedding cache.
@@ -57,7 +58,7 @@ Options:
 
 Environment:
   REPO_ROOT              Repository root.
-  CONDA_ENV              Conda env to activate. Default: ReLL
+  CONDA_ENV              Conda env to activate. Empty means keep current shell environment.
   PYTHON_CMD             Python command after env activation. Default: python
   DATASET_ROOT           Same as --dataset-root.
   TEST_SET               Same as --test-set.
@@ -65,6 +66,7 @@ Environment:
 
 Examples:
   bash Scripts/train_test_oc_graph_ablation.sh ddg
+  CONDA_ENV=myenv bash Scripts/train_test_oc_graph_ablation.sh ddg
   bash Scripts/train_test_oc_graph_ablation.sh cfg --steps 50000
   bash Scripts/train_test_oc_graph_ablation.sh all --reuse-embeddings
 EOF
@@ -124,6 +126,10 @@ while [[ $# -gt 0 ]]; do
       OUTPUT_ROOT="$2"
       shift 2
       ;;
+    --conda-env)
+      CONDA_ENV="$2"
+      shift 2
+      ;;
     --fresh)
       RESUME=0
       shift
@@ -177,7 +183,7 @@ case "${MODE}" in
     ;;
 esac
 
-if [[ "${USE_CONDA}" == "1" ]]; then
+if [[ "${USE_CONDA}" == "1" && -n "${CONDA_ENV}" ]]; then
   if [[ -n "${CONDA_SH:-}" && -f "${CONDA_SH}" ]]; then
     # shellcheck disable=SC1090
     source "${CONDA_SH}"
@@ -194,6 +200,10 @@ if [[ "${USE_CONDA}" == "1" ]]; then
     exit 1
   fi
   conda activate "${CONDA_ENV}"
+elif [[ "${USE_CONDA}" == "1" && -n "${CONDA_DEFAULT_ENV:-}" ]]; then
+  echo "[INFO] Using active conda env: ${CONDA_DEFAULT_ENV}"
+elif [[ "${USE_CONDA}" == "1" ]]; then
+  echo "[INFO] CONDA_ENV is empty; using current PATH python. Set CONDA_ENV=name or pass --conda-env name to activate one."
 fi
 
 cd "${REPO_ROOT}"
