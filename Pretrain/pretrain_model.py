@@ -215,10 +215,22 @@ class MoCoPretrainModel(nn.Module):
 
         batch_size = keys.shape[0]
         ptr = int(self.queue_ptr)
-        assert self.moco_buffer_size % batch_size == 0
+        if batch_size > self.moco_buffer_size:
+            raise RuntimeError(
+                f"MoCo batch size ({batch_size}) exceeds queue size ({self.moco_buffer_size})."
+            )
 
-        self.queue[:, ptr : ptr + batch_size] = keys.T
-        self.queue_labels[ptr : ptr + batch_size] = labels
+        end = ptr + batch_size
+        if end <= self.moco_buffer_size:
+            self.queue[:, ptr:end] = keys.T
+            self.queue_labels[ptr:end] = labels
+        else:
+            first = self.moco_buffer_size - ptr
+            self.queue[:, ptr:] = keys[:first].T
+            self.queue_labels[ptr:] = labels[:first]
+            self.queue[:, : end - self.moco_buffer_size] = keys[first:].T
+            self.queue_labels[: end - self.moco_buffer_size] = labels[first:]
+
         ptr = (ptr + batch_size) % self.moco_buffer_size
         self.queue_ptr[0] = ptr
 
