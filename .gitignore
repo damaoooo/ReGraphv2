@@ -51,5 +51,5 @@ test.py
 *.i64
 *.eps
 runs/
-
+data/
 tmp/
