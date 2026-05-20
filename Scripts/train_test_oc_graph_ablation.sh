@@ -258,6 +258,7 @@ run_one_mode() {
   echo "===== OC graph ablation: ${mode} ====="
   echo "[INFO] repo_root=${REPO_ROOT}"
   echo "[INFO] dataset_root=${DATASET_ROOT}"
+  echo "[INFO] test_set=${TEST_SET}"
   echo "[INFO] output_root=${mode_root}"
   echo "[INFO] model_dir=${model_dir}"
   echo "[INFO] max_steps=${MAX_STEPS}, max_length=${MAX_LENGTH}"
