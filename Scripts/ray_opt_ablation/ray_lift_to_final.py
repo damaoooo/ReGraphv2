@@ -824,6 +824,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task3-chunk-manifest-mode", choices=("worker", "chunk"), default="worker")
     parser.add_argument("--task3-ray-max-in-flight-chunks", type=int, default=0)
     parser.add_argument(
+        "--task3-record-format",
+        choices=("graph", "qwen-text"),
+        default=os.environ.get("REGRAPH_TASK3_RECORD_FORMAT", "graph"),
+        help="Task3 record format. qwen-text writes normalized LLVM IR text without graph/input_ids columns.",
+    )
+    parser.add_argument(
         "--task3-csv-filter-dir",
         default=os.environ.get("REGRAPH_TASK3_CSV_FILTER_DIR", ""),
         help=(
@@ -1085,6 +1091,8 @@ def main() -> int:
             args.task3_chunk_manifest_mode,
             "--ray-max-in-flight-chunks",
             str(args.task3_ray_max_in_flight_chunks),
+            "--record-format",
+            args.task3_record_format,
         ]
         if task3_csv_filter_dir is not None:
             task3_command.extend(["--csv-filter-dir", str(task3_csv_filter_dir)])
@@ -1115,6 +1123,8 @@ def main() -> int:
             str(hf_root),
             "--cache-dir",
             os.environ["HF_DATASETS_CACHE"],
+            "--features",
+            "qwen-text" if args.task3_record_format == "qwen-text" else "graph",
         ]
         parquet_splits = parquet_splits_complete(task3_output / "parquet")
         if args.resume and not task3_ran and parquet_splits and hf_splits_complete(hf_root, parquet_splits):

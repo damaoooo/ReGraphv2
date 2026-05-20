@@ -250,8 +250,20 @@ def prepare_output_root(output_root: Path, resume: bool, force_clean: bool) -> N
     ensure_dir(output_root / ".ray_fused_state")
 
 
-def split_roots(dataset_path: Path) -> list[tuple[str | None, Path]]:
-    roots = [(split, dataset_path / split) for split in SPLITS if (dataset_path / split).is_dir()]
+def parse_split_names(raw_splits: str) -> list[str]:
+    raw_splits = (raw_splits or "train,validation,test").strip()
+    if raw_splits.lower() in {"all", "*"}:
+        return list(SPLITS)
+    split_names = [split.strip() for split in raw_splits.split(",") if split.strip()]
+    invalid = [split for split in split_names if split not in SPLITS]
+    if invalid:
+        raise SystemExit(f"Invalid split name(s): {','.join(invalid)}. Valid values: {','.join(SPLITS)}")
+    return split_names or list(SPLITS)
+
+
+def split_roots(dataset_path: Path, split_names: Iterable[str] = SPLITS) -> list[tuple[str | None, Path]]:
+    requested = tuple(split_names)
+    roots = [(split, dataset_path / split) for split in requested if (dataset_path / split).is_dir()]
     if roots:
         return roots
     return [(None, dataset_path)]
@@ -261,10 +273,15 @@ def stable_hash_key(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()
 
 
-def discover_source_ll_files(dataset_path: Path, output_root: Path, opt_level: str) -> list[dict[str, Any]]:
+def discover_source_ll_files(
+    dataset_path: Path,
+    output_root: Path,
+    opt_level: str,
+    split_names: Iterable[str] = SPLITS,
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     bc_root = output_root / "bc"
-    for split, root in split_roots(dataset_path):
+    for split, root in split_roots(dataset_path, split_names):
         for source_ll in root.rglob("*.ll"):
             name = source_ll.name
             if name.endswith("_purified.ll") or name.endswith("_instrumented.ll"):
@@ -807,9 +824,9 @@ def refresh_directory_symlink(link_path: Path, target: Path, logger: RunLogger) 
     logger.info(f"final_set_link link={link_path} target={target}")
 
 
-def discover_hf_split_datasets(hf_root: Path) -> list[tuple[str, Path]]:
+def discover_hf_split_datasets(hf_root: Path, split_names: Iterable[str] = SPLITS) -> list[tuple[str, Path]]:
     results = []
-    for split in SPLITS:
+    for split in split_names:
         path = hf_root / f"{split}_dataset"
         if dataset_dir_complete(path):
             results.append((split, path))
@@ -818,10 +835,10 @@ def discover_hf_split_datasets(hf_root: Path) -> list[tuple[str, Path]]:
     return results
 
 
-def parquet_splits_complete(parquet_root: Path) -> list[str]:
+def parquet_splits_complete(parquet_root: Path, split_names: Iterable[str] = SPLITS) -> list[str]:
     return [
         split
-        for split in SPLITS
+        for split in split_names
         if (parquet_root / split).is_dir() and any((parquet_root / split).glob("*.parquet"))
     ]
 
@@ -1131,6 +1148,7 @@ def run_final_reference_filter(
     final_filter_reference: Path | None,
     final_filter_reference_kind: str,
     final_filter_match_mode: str,
+    split_names: list[str],
     repo_root: str,
     output_root: Path,
     final_output_root: Path,
@@ -1149,9 +1167,9 @@ def run_final_reference_filter(
     logger.info(
         f"stage=final_reference_filter start reference={final_filter_reference} "
         f"reference_kind={final_filter_reference_kind} match_mode={final_filter_match_mode} "
-        "splits=['validation', 'test'] mode=in_place"
+        f"splits={split_names} mode=in_place"
     )
-    for split in ("validation", "test"):
+    for split in split_names:
         final_set_dir = final_output_root / f"{split}_final_set"
         if not dataset_dir_complete(final_set_dir / "train_dataset_pool"):
             failures.append(
@@ -1200,7 +1218,7 @@ def run_final_reference_filter(
                 }
             )
 
-    logger.info(f"stage=final_reference_filter complete filtered_splits=['validation', 'test'] failed={len(failures)}")
+    logger.info(f"stage=final_reference_filter complete filtered_splits={split_names} failed={len(failures)}")
     return failures
 
 
@@ -1300,6 +1318,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--force-clean", action="store_true")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument(
+        "--splits",
+        default=os.environ.get("REGRAPH_SPLITS", "train,validation,test"),
+        help="Comma-separated Dataset-1 splits to process. Use test for Qwen-only test-set generation.",
+    )
     parser.add_argument("--task2-chunk-size", type=int, default=1)
     parser.add_argument("--task3-chunk-size", type=int, default=500)
     parser.add_argument("--max-seq-length", type=int, default=2048)
@@ -1311,6 +1334,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task3-chunk-manifest-mode", choices=("worker", "chunk"), default="worker")
     parser.add_argument("--task3-ray-max-in-flight-chunks", type=int, default=0)
     parser.add_argument("--task3-ray-worker-cpus", type=float, default=1.0)
+    parser.add_argument(
+        "--task3-record-format",
+        choices=("graph", "qwen-text"),
+        default=os.environ.get("REGRAPH_TASK3_RECORD_FORMAT", "graph"),
+        help="Task3 record format. qwen-text writes normalized LLVM IR text without graph/input_ids columns.",
+    )
+    parser.add_argument(
+        "--qwen-text-final-set",
+        action="store_true",
+        help="Convenience alias for --task3-record-format qwen-text.",
+    )
     parser.add_argument("--task3-prefilter-uninformative", action="store_true")
     parser.add_argument("--task3-prefilter-max-stub-tokens", type=int, default=128)
     parser.add_argument("--task3-dedup-input-ids", action="store_true")
@@ -1402,6 +1436,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.qwen_text_final_set:
+        args.task3_record_format = "qwen-text"
     repo_root = str(Path(args.repo_root).resolve())
     cache_root = str(Path(args.cache_root).expanduser().resolve())
     cache_env = configure_cache(cache_root)
@@ -1414,6 +1450,7 @@ def main() -> int:
     dataset_path = dataset_path.resolve()
     if not dataset_path.exists():
         raise SystemExit(f"Dataset path does not exist: {dataset_path}")
+    active_splits = parse_split_names(args.splits)
 
     output_root = Path(args.output_path) if args.output_path else dataset_path.with_name(f"{dataset_path.name}-{opt_state_token(opt_level)}-fused")
     output_root = output_root.resolve()
@@ -1452,11 +1489,13 @@ def main() -> int:
         logger.info(f"dataset_path={dataset_path}")
         logger.info(f"output_root={output_root}")
         logger.info(f"final_output_root={final_output_root}")
+        logger.info(f"active_splits={active_splits}")
         logger.info(f"task3_csv_filter_dir={task3_csv_filter_dir if task3_csv_filter_dir else 'disabled'}")
         logger.info(
             f"task3_prefilter_uninformative={args.task3_prefilter_uninformative} "
             f"task3_prefilter_max_stub_tokens={args.task3_prefilter_max_stub_tokens} "
             f"task3_dedup_input_ids={args.task3_dedup_input_ids} "
+            f"task3_record_format={args.task3_record_format} "
             f"task3_ray_worker_cpus={args.task3_ray_worker_cpus}"
         )
         logger.info(
@@ -1493,7 +1532,7 @@ def main() -> int:
             "max_failures_to_screen": args.max_failures_to_screen,
         }
 
-        source_items = discover_source_ll_files(dataset_path, output_root, opt_level)
+        source_items = discover_source_ll_files(dataset_path, output_root, opt_level, active_splits)
         if not source_items:
             raise SystemExit(f"No source .ll files found under {dataset_path}")
 
@@ -1533,7 +1572,7 @@ def main() -> int:
 
         task3_output = output_root / "task3_fused"
         hf_root = output_root / "hf"
-        existing_parquet_splits = parquet_splits_complete(task3_output / "parquet")
+        existing_parquet_splits = parquet_splits_complete(task3_output / "parquet", active_splits)
         task3_ran = False
         if args.force_task3_rebuild and task3_output.exists():
             logger.info(f"stage=task3_fused force_rebuild removing {task3_output}")
@@ -1570,6 +1609,8 @@ def main() -> int:
             str(args.task3_ray_max_in_flight_chunks),
             "--ray-worker-cpus",
             str(args.task3_ray_worker_cpus),
+            "--record-format",
+            args.task3_record_format,
         ]
         if task3_csv_filter_dir is not None:
             task3_command.extend(["--csv-filter-dir", str(task3_csv_filter_dir)])
@@ -1583,7 +1624,7 @@ def main() -> int:
             task3_command.extend(["--chunk-size", str(args.task3_chunk_size)])
         if args.resume and not args.force_task3_rebuild:
             task3_command.append("--resume")
-        if args.resume and not args.force_task3_rebuild and set(existing_parquet_splits) == set(SPLITS):
+        if args.resume and not args.force_task3_rebuild and set(existing_parquet_splits) == set(active_splits):
             logger.info(
                 f"stage=task3_fused skipped existing final parquet splits={existing_parquet_splits}; "
                 "use --force-task3-rebuild to regenerate"
@@ -1603,14 +1644,16 @@ def main() -> int:
             str(hf_root),
             "--cache-dir",
             os.environ["HF_DATASETS_CACHE"],
+            "--features",
+            "qwen-text" if args.task3_record_format == "qwen-text" else "graph",
         ]
-        parquet_splits = parquet_splits_complete(task3_output / "parquet")
+        parquet_splits = parquet_splits_complete(task3_output / "parquet", active_splits)
         if args.resume and not task3_ran and parquet_splits and hf_splits_complete(hf_root, parquet_splits):
             logger.info(f"stage=dataprocess_hf skipped existing HF splits={parquet_splits}")
         else:
             run_subprocess_stage("dataprocess_hf", dataprocess_command, repo_root, output_root, logger)
 
-        final_datasets = discover_hf_split_datasets(hf_root)
+        final_datasets = discover_hf_split_datasets(hf_root, active_splits)
         final_failures = run_final_splits_parallel(
             final_datasets,
             args,
@@ -1637,6 +1680,7 @@ def main() -> int:
             final_filter_reference,
             args.final_filter_reference_kind,
             args.final_filter_match_mode,
+            active_splits,
             repo_root,
             output_root,
             final_output_root,

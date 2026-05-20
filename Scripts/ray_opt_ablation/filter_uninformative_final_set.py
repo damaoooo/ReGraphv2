@@ -36,7 +36,7 @@ from Tokenizer.ir_tokenizer import load_tokenizer
 
 
 DEFAULT_TOKENIZER = REPO_ROOT / "Tokenizer" / "output_tokenizer" / "llvm_ir_bpe.json"
-OPT_LEVEL_PATTERN = re.compile(r"^(?P<prefix>.+)-(?P<opt>O0|O1|O2|O3|Os|Og|Oz|Oc)_(?P<binary>.+)$")
+OPT_LEVEL_PATTERN = re.compile(r"^(?P<prefix>.+)-(?P<opt>O0|O1|O2|O3|Os|Og|Oz|Oc|Oc2)_(?P<binary>.+)$")
 CONST_RET_RE = re.compile(
     r"\bret\s+"
     r"(?:(?:noundef\s+)?(?:i\d+|ptr|float|double))\s+"
@@ -54,6 +54,11 @@ SEMANTIC_OP_RE = re.compile(
 def hash_ids(input_ids: list[int]) -> str:
     arr = np.asarray(input_ids, dtype=np.int32)
     return f"{len(input_ids)}:{hashlib.blake2b(arr.tobytes(), digest_size=12).hexdigest()}"
+
+
+def hash_text(text: str) -> str:
+    payload = text.encode("utf-8", errors="replace")
+    return f"{len(payload)}:{hashlib.blake2b(payload, digest_size=12).hexdigest()}"
 
 
 def remove_path(path: Path) -> None:
@@ -262,9 +267,16 @@ def main() -> int:
 
     dataset = datasets.load_from_disk(str(input_pool))
     dataset = ensure_metadata_columns(dataset)
-    tokenizer = load_tokenizer(args.tokenizer)
+    has_input_ids = "input_ids" in dataset.column_names
+    has_text = "text" in dataset.column_names
+    if not has_input_ids and not has_text:
+        raise SystemExit("Dataset must contain either input_ids or text.")
+    tokenizer = load_tokenizer(args.tokenizer) if has_input_ids else None
 
-    read_cols = ["input_ids", "function_name"]
+    record_column = "input_ids" if has_input_ids else "text"
+    read_cols = [record_column, "function_name"]
+    if has_text and "token_len" in dataset.column_names:
+        read_cols.append("token_len")
     for column in ("binary_name", "origin_binary_name", "opt_level", "file_path"):
         if column in dataset.column_names:
             read_cols.append(column)
@@ -277,18 +289,24 @@ def main() -> int:
 
     seen = 0
     for batch in dataset.select_columns(read_cols).iter(batch_size=args.batch_size):
-        size = len(batch["input_ids"])
+        size = len(batch[record_column])
         for offset in range(size):
             index = seen + offset
-            input_ids = batch["input_ids"][offset]
-            row = {column: batch[column][offset] for column in read_cols if column != "input_ids"}
+            row = {column: batch[column][offset] for column in read_cols if column != record_column}
             group_key = row_group_key(row)
-            input_hash = hash_ids(input_ids)
+            if has_input_ids:
+                input_ids = batch["input_ids"][offset]
+                input_hash = hash_ids(input_ids)
+                decoded = tokenizer.decode(input_ids)
+                token_len = len(input_ids)
+            else:
+                decoded = str(batch["text"][offset] or "")
+                input_hash = hash_text(decoded)
+                token_len = int(batch["token_len"][offset]) if "token_len" in batch else len(decoded.split())
             hash_rows[input_hash].append(index)
             hash_groups[input_hash].add(group_key)
 
-            decoded = tokenizer.decode(input_ids)
-            reason = is_uninformative_stub(decoded, len(input_ids), args.max_stub_tokens)
+            reason = is_uninformative_stub(decoded, token_len, args.max_stub_tokens)
             if reason:
                 stub_indices.add(index)
                 stub_reasons[reason] += 1
@@ -299,8 +317,8 @@ def main() -> int:
                             "binary_name": row.get("binary_name"),
                             "function_name": row.get("function_name"),
                             "opt_level": row.get("opt_level"),
-                            "tokens": len(input_ids),
-                            "decoded": decoded,
+                            "tokens": token_len,
+                            "decoded": decoded[:2000],
                         }
                     )
         seen += size

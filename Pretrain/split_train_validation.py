@@ -212,7 +212,7 @@ def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, Li
     final_validation_dataset.save_to_disk('validation_dataset_pool')
         
 
-OPT_LEVEL_PATTERN = re.compile(r"^(?P<prefix>.+)-(?P<opt>O0|O1|O2|O3|Os|Oz)_(?P<binary>.+)$")
+OPT_LEVEL_PATTERN = re.compile(r"^(?P<prefix>.+)-(?P<opt>O0|O1|O2|O3|Os|Og|Oz|Oc|Oc2)_(?P<binary>.+)$")
 
 
 def derive_origin_and_opt(binary_name: str) -> Tuple[str, str]:
@@ -226,7 +226,7 @@ def derive_origin_and_opt(binary_name: str) -> Tuple[str, str]:
         return origin, match.group("opt")
 
     legacy_parts = basename.rsplit("-", 2)
-    if len(legacy_parts) == 3 and legacy_parts[1] in {"O0", "O1", "O2", "O3", "Os", "Oz"}:
+    if len(legacy_parts) == 3 and legacy_parts[1] in {"O0", "O1", "O2", "O3", "Os", "Og", "Oz", "Oc", "Oc2"}:
         origin_basename = legacy_parts[0]
         origin = f"{directory}/{origin_basename}" if directory else origin_basename
         return origin, legacy_parts[1]

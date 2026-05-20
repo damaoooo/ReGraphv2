@@ -11,13 +11,13 @@ import typer
 from rich.console import Console
 
 try:
-    from .dataset_features import get_dataset_features
+    from .dataset_features import get_dataset_features, get_qwen_text_dataset_features
 except ImportError:  # Support direct script execution.
     import os
     import sys
 
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-    from DataProcess.dataset_features import get_dataset_features
+    from DataProcess.dataset_features import get_dataset_features, get_qwen_text_dataset_features
 
 
 app = typer.Typer(help="Materialize ReGraph fused parquet shards as HuggingFace datasets")
@@ -81,6 +81,11 @@ def parquet_to_hf(
         help="Output directory for HuggingFace dataset(s)",
     ),
     cache_dir: Optional[str] = typer.Option(None, "--cache-dir", help="Optional HuggingFace datasets cache directory"),
+    features: str = typer.Option(
+        "graph",
+        "--features",
+        help="Parquet schema: graph, qwen-text, or auto.",
+    ),
 ):
     """Read final parquet shards and save HuggingFace dataset directories."""
     input_root = Path(input_parquet_dir).resolve()
@@ -96,19 +101,30 @@ def parquet_to_hf(
 
     output_root.mkdir(parents=True, exist_ok=True)
     single_dataset = len(split_inputs) == 1 and split_inputs[0][0] is None
-    features = get_dataset_features()
+    normalized_features = features.lower()
+    if normalized_features == "graph":
+        dataset_features = get_dataset_features()
+    elif normalized_features == "qwen-text":
+        dataset_features = get_qwen_text_dataset_features()
+    elif normalized_features == "auto":
+        dataset_features = None
+    else:
+        console.print(f"[red]Unsupported --features value: {features}[/red]")
+        raise typer.Exit(code=2)
 
     for split, files in split_inputs:
         label = split or "dataset"
         target_path = output_path_for_split(output_root, split, single_dataset)
         console.print(f"[yellow]Loading split={label}, parquet_files={len(files)}[/yellow]")
-        dataset = datasets.load_dataset(
-            "parquet",
-            data_files=files,
-            split="train",
-            features=features,
-            cache_dir=cache_dir,
-        )
+        load_kwargs = {
+            "path": "parquet",
+            "data_files": files,
+            "split": "train",
+            "cache_dir": cache_dir,
+        }
+        if dataset_features is not None:
+            load_kwargs["features"] = dataset_features
+        dataset = datasets.load_dataset(**load_kwargs)
         if target_path.exists():
             import shutil
 

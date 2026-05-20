@@ -42,7 +42,7 @@ for path in (str(SCRIPT_DIR), str(REPO_ROOT)):
         sys.path.insert(0, path)
 
 from utils import console, ensure_directory  # noqa: E402
-from DataProcess.dataset_features import get_dataset_features  # noqa: E402
+from DataProcess.dataset_features import get_dataset_features, get_qwen_text_dataset_features  # noqa: E402
 from GraphBuilder.cfg_graph_builder import CFGGraphBuilder  # noqa: E402
 from GraphBuilder.ddg_graph_builder import DataDependencyGraphBuilder  # noqa: E402
 from Tokenizer.ir_tokenizer import load_tokenizer  # noqa: E402
@@ -122,6 +122,11 @@ class BuildFunctionResult:
     record: Optional[Dict[str, Any]]
     skip_reason: Optional[str] = None
     input_hash: Optional[str] = None
+
+
+RECORD_FORMAT_GRAPH = "graph"
+RECORD_FORMAT_QWEN_TEXT = "qwen-text"
+RECORD_FORMATS = {RECORD_FORMAT_GRAPH, RECORD_FORMAT_QWEN_TEXT}
 
 
 def split_key(split: Optional[str]) -> str:
@@ -903,6 +908,26 @@ def opt_initial_purify(llvm_ir_path: Path, timeout_seconds: int) -> Path:
     return purified_file
 
 
+def opt_initial_purify_for_text(llvm_ir_path: Path, timeout_seconds: int) -> Path:
+    purified_file = llvm_ir_path.with_name(llvm_ir_path.stem + "_text_purified.ll")
+    result = run_command(
+        [
+            "opt",
+            "-S",
+            "--passes=strip",
+            "-non-global-value-max-name-size=16384",
+            llvm_ir_path.name,
+            "-o",
+            purified_file.name,
+        ],
+        cwd=llvm_ir_path.parent,
+        timeout_seconds=timeout_seconds,
+    )
+    if result.returncode == 0 and purified_file.exists() and purified_file.stat().st_size > 0:
+        return purified_file
+    return llvm_ir_path
+
+
 def opt_generate_ddg(purified_llvm_ir_path: Path, timeout_seconds: int) -> tuple[Path, Path]:
     instrumented_file = purified_llvm_ir_path.with_name(purified_llvm_ir_path.stem + "_instrumented.ll")
     result = run_command(
@@ -1003,6 +1028,17 @@ def hash_input_ids(input_ids: List[int]) -> str:
     return f"{len(input_ids)}:{hashlib.blake2b(payload, digest_size=12).hexdigest()}"
 
 
+def hash_text(text: str) -> str:
+    payload = text.encode("utf-8", errors="replace")
+    return f"{len(payload)}:{hashlib.blake2b(payload, digest_size=12).hexdigest()}"
+
+
+def get_features_for_record_format(record_format: str):
+    if record_format == RECORD_FORMAT_QWEN_TEXT:
+        return get_qwen_text_dataset_features()
+    return get_dataset_features()
+
+
 def decoded_body(decoded: str) -> str:
     if "{" not in decoded or "}" not in decoded:
         return decoded
@@ -1055,7 +1091,7 @@ def claim_input_hash(hash_root: Path, split: Optional[str], input_hash: str, ite
     return marker_path
 
 
-def seed_input_hashes_from_raw_shards(output_root: Path) -> Dict[str, Any]:
+def seed_input_hashes_from_raw_shards(output_root: Path, record_format: str) -> Dict[str, Any]:
     hash_root = state_root(output_root) / "input_id_hashes"
     if hash_root.exists():
         shutil.rmtree(hash_root)
@@ -1071,9 +1107,13 @@ def seed_input_hashes_from_raw_shards(output_root: Path) -> Dict[str, Any]:
         summary["raw_shards"] += 1
         try:
             parquet_file = pq.ParquetFile(str(shard))
-            for batch in parquet_file.iter_batches(columns=["input_ids"], batch_size=10000):
-                for input_ids in batch.column("input_ids").to_pylist():
-                    input_hash = hash_input_ids([int(token_id) for token_id in input_ids])
+            hash_column = "text" if record_format == RECORD_FORMAT_QWEN_TEXT else "input_ids"
+            for batch in parquet_file.iter_batches(columns=[hash_column], batch_size=10000):
+                for value in batch.column(hash_column).to_pylist():
+                    if record_format == RECORD_FORMAT_QWEN_TEXT:
+                        input_hash = hash_text(str(value))
+                    else:
+                        input_hash = hash_input_ids([int(token_id) for token_id in value])
                     marker = claim_input_hash(
                         hash_root,
                         split,
@@ -1108,6 +1148,7 @@ def build_function_record(
     prefilter_max_stub_tokens: int,
     dedup_input_ids: bool,
     dedup_hash_root: Optional[Path],
+    record_format: str,
 ) -> BuildFunctionResult:
     bc_path = Path(item["bc_path"])
     function_hash = hashlib.sha1(f"{bc_path}::{function_name}".encode("utf-8")).hexdigest()
@@ -1117,8 +1158,39 @@ def build_function_record(
     function_ir = function_dir / "function.ll"
     extract_function_ir(bc_path, function_name, function_ir, timeout_seconds)
 
-    purified_ir = opt_initial_purify(function_ir, timeout_seconds)
+    if record_format == RECORD_FORMAT_QWEN_TEXT:
+        purified_ir = opt_initial_purify_for_text(function_ir, timeout_seconds)
+    else:
+        purified_ir = opt_initial_purify(function_ir, timeout_seconds)
     normalized_ir = normalize_file(str(purified_ir))
+    if record_format == RECORD_FORMAT_QWEN_TEXT:
+        token_len = len(normalized_ir.split())
+        input_hash = hash_text(normalized_ir)
+
+        if prefilter_uninformative:
+            reason = is_uninformative_stub(normalized_ir, token_len, prefilter_max_stub_tokens)
+            if reason:
+                return BuildFunctionResult(record=None, skip_reason=reason, input_hash=input_hash)
+
+        claimed_hash_path: Optional[Path] = None
+        if dedup_input_ids:
+            if dedup_hash_root is None:
+                raise RuntimeError("dedup_input_ids enabled without a dedup hash root")
+            claimed_hash_path = claim_input_hash(dedup_hash_root, item.get("split"), input_hash, item)
+            if claimed_hash_path is None:
+                return BuildFunctionResult(record=None, skip_reason="duplicate_text", input_hash=input_hash)
+
+        record = {
+            "binary_name": item["binary_name"],
+            "function_name": function_name,
+            "file_path": f"{bc_path}::{function_name}",
+            "text": normalized_ir,
+            "token_len": int(token_len),
+        }
+        return BuildFunctionResult(record=record, input_hash=input_hash)
+
+    if tokenizer is None:
+        raise RuntimeError("graph record format requires tokenizer")
     tokens = tokenizer(normalized_ir)
     input_ids = tokens.get("input_ids")
     if not input_ids:
@@ -1174,13 +1246,13 @@ def build_function_record(
         raise
 
 
-def write_records_to_parquet(records: List[Dict[str, Any]], path: Path) -> None:
+def write_records_to_parquet(records: List[Dict[str, Any]], path: Path, record_format: str) -> None:
     if not records:
         return
     ensure_directory(str(path.parent))
     import datasets
 
-    dataset = datasets.Dataset.from_list(records, features=get_dataset_features())
+    dataset = datasets.Dataset.from_list(records, features=get_features_for_record_format(record_format))
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     if tmp_path.exists():
         tmp_path.unlink()
@@ -1194,7 +1266,8 @@ def process_function_chunk(chunk_id: str, items: List[Dict[str, Any]], context: 
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
 
-    tokenizer = load_tokenizer(context["tokenizer_path"])
+    record_format = str(context.get("record_format") or RECORD_FORMAT_GRAPH)
+    tokenizer = None if record_format == RECORD_FORMAT_QWEN_TEXT else load_tokenizer(context["tokenizer_path"])
     timeout_seconds = int(context["timeout_seconds"])
     max_seq_length = int(context["max_seq_length"])
     debug = bool(context["debug"])
@@ -1244,6 +1317,7 @@ def process_function_chunk(chunk_id: str, items: List[Dict[str, Any]], context: 
                     prefilter_max_stub_tokens=prefilter_max_stub_tokens,
                     dedup_input_ids=dedup_input_ids,
                     dedup_hash_root=dedup_hash_root,
+                    record_format=record_format,
                 )
                 if result.record is None:
                     skipped_rows.append(
@@ -1276,7 +1350,7 @@ def process_function_chunk(chunk_id: str, items: List[Dict[str, Any]], context: 
         raw_shard_path = None
         if records:
             raw_shard_path = raw_dir / f"{chunk_id}.parquet"
-            write_records_to_parquet(records, raw_shard_path)
+            write_records_to_parquet(records, raw_shard_path, record_format)
             for row in success_rows:
                 row["raw_shard"] = str(raw_shard_path)
 
@@ -1760,6 +1834,11 @@ def main(
     resume: bool = typer.Option(False, "--resume", help="Skip .bc files completed in previous manifests"),
     debug: bool = typer.Option(False, "--debug", help="Keep temporary IR/dot files under the debug directory"),
     tokenizer_path: str = typer.Option(DEFAULT_TOKENIZER_PATH, "--tokenizer-path", help="Tokenizer JSON path"),
+    record_format: str = typer.Option(
+        RECORD_FORMAT_GRAPH,
+        "--record-format",
+        help="Output record format: graph or qwen-text.",
+    ),
     max_seq_length: int = typer.Option(DEFAULT_MAX_SEQ_LENGTH, "--max-seq-length", help="Truncate token ids and graph edges to this length"),
     target_shard_size_bytes: int = typer.Option(
         DEFAULT_TARGET_SHARD_SIZE_BYTES,
@@ -1803,7 +1882,7 @@ def main(
     prefilter_uninformative: bool = typer.Option(
         False,
         "--prefilter-uninformative/--no-prefilter-uninformative",
-        help="Skip short unreachable/constant-return functions before CFG/DDG graph construction.",
+        help="Skip short unreachable/constant-return functions before graph/text record writing.",
     ),
     prefilter_max_stub_tokens: int = typer.Option(
         DEFAULT_PREFILTER_MAX_STUB_TOKENS,
@@ -1813,15 +1892,18 @@ def main(
     dedup_input_ids: bool = typer.Option(
         False,
         "--dedup-input-ids/--no-dedup-input-ids",
-        help="Keep the first function per split with each exact truncated input_ids hash.",
+        help="Keep the first function per split with each exact record hash; qwen-text hashes normalized IR text.",
     ),
     command_timeout_seconds: int = typer.Option(0, "--command-timeout-seconds", help="Per LLVM/opt command timeout; 0 disables timeout"),
     progress_summary_interval_s: int = typer.Option(30, "--progress-summary-interval-s", help="Emit Slurm-friendly text progress every N seconds"),
 ):
     """Run fused Task 3."""
     normalized_backend = backend.lower()
+    normalized_record_format = record_format.lower()
     if normalized_backend not in {"local", "ray"}:
         raise typer.BadParameter("--backend must be either local or ray")
+    if normalized_record_format not in RECORD_FORMATS:
+        raise typer.BadParameter("--record-format must be graph or qwen-text")
     if max_seq_length <= 1:
         raise typer.BadParameter("--max-seq-length must be greater than 1")
     if max_parquet_files < 2:
@@ -1848,7 +1930,7 @@ def main(
     if not input_root.exists() or not input_root.is_dir():
         console.print(f"[red]Input directory not found: {input_root}[/red]")
         raise typer.Exit(code=1)
-    if not Path(tokenizer_path).exists():
+    if normalized_record_format == RECORD_FORMAT_GRAPH and not Path(tokenizer_path).exists():
         console.print(f"[red]Tokenizer not found: {tokenizer_path}[/red]")
         raise typer.Exit(code=1)
     if resolved_csv_filter_dir is not None and not resolved_csv_filter_dir.is_dir():
@@ -1859,7 +1941,9 @@ def main(
     console.print(f"[green]Input: {input_root}[/green]")
     console.print(f"[green]Output: {output_root}[/green]")
     console.print(f"[green]Backend: {normalized_backend}[/green]")
-    console.print(f"[green]Tokenizer: {tokenizer_path}[/green]")
+    console.print(f"[green]Record format: {normalized_record_format}[/green]")
+    if normalized_record_format == RECORD_FORMAT_GRAPH:
+        console.print(f"[green]Tokenizer: {tokenizer_path}[/green]")
     console.print(f"[green]Max seq length: {max_seq_length}[/green]")
     console.print(f"[green]Max parquet files: {max_parquet_files}[/green]")
     if resolved_csv_filter_dir is not None:
@@ -1972,10 +2056,10 @@ def main(
     )
 
     if dedup_input_ids and resume:
-        seed_summary = seed_input_hashes_from_raw_shards(output_root)
+        seed_summary = seed_input_hashes_from_raw_shards(output_root, normalized_record_format)
         write_json(manifest_dir(output_root) / "task3_dedup_seed_summary.json", seed_summary)
         console.print(
-            f"[cyan]Seeded input_id dedup hashes from existing raw shards: "
+            f"[cyan]Seeded dedup hashes from existing raw shards: "
             f"raw_shards={seed_summary['raw_shards']} "
             f"seeded={seed_summary['seeded_hashes']} "
             f"duplicates={seed_summary['duplicate_hashes']}[/cyan]"
@@ -1989,6 +2073,7 @@ def main(
         "temp_root": str(task_tmp_root),
         "debug_root": str(state_root(output_root) / "debug"),
         "tokenizer_path": tokenizer_path,
+        "record_format": normalized_record_format,
         "max_seq_length": max_seq_length,
         "timeout_seconds": command_timeout_seconds,
         "debug": debug,
