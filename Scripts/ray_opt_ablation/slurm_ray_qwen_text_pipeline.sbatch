@@ -14,7 +14,13 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/scratch/zhoul0e/ReGraphv2}"
 INNER="${REPO_ROOT}/Scripts/ray_opt_ablation/slurm_ray_fused_pipeline.sbatch"
+RELL_NORMALIZER="${REPO_ROOT}/Scripts/rell_normalizer.py"
 OPT_ARG="${1:-${OPT_LEVEL:-}}"
+
+if [[ ! -f "${RELL_NORMALIZER}" ]]; then
+  echo "ERROR: ReLL qwen text normalizer not found: ${RELL_NORMALIZER}" >&2
+  exit 1
+fi
 
 export TASK3_RECORD_FORMAT="qwen-text"
 export SPLITS="${SPLITS:-test}"

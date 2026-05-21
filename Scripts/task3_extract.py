@@ -46,7 +46,8 @@ from DataProcess.dataset_features import get_dataset_features, get_qwen_text_dat
 from GraphBuilder.cfg_graph_builder import CFGGraphBuilder  # noqa: E402
 from GraphBuilder.ddg_graph_builder import DataDependencyGraphBuilder  # noqa: E402
 from Tokenizer.ir_tokenizer import load_tokenizer  # noqa: E402
-from Tokenizer.normalizer import normalize_file  # noqa: E402
+from Tokenizer.normalizer import normalize_file as normalize_graph_file  # noqa: E402
+from rell_normalizer import normalize_file as normalize_qwen_text_file  # noqa: E402
 from Utils.utils import (  # noqa: E402
     DEFAULT_CFG_SO_PATH,
     DEFAULT_DDG_SO_PATH,
@@ -1159,11 +1160,7 @@ def build_function_record(
     extract_function_ir(bc_path, function_name, function_ir, timeout_seconds)
 
     if record_format == RECORD_FORMAT_QWEN_TEXT:
-        purified_ir = opt_initial_purify_for_text(function_ir, timeout_seconds)
-    else:
-        purified_ir = opt_initial_purify(function_ir, timeout_seconds)
-    normalized_ir = normalize_file(str(purified_ir))
-    if record_format == RECORD_FORMAT_QWEN_TEXT:
+        normalized_ir = normalize_qwen_text_file(str(function_ir))
         token_len = len(normalized_ir.split())
         input_hash = hash_text(normalized_ir)
 
@@ -1188,6 +1185,9 @@ def build_function_record(
             "token_len": int(token_len),
         }
         return BuildFunctionResult(record=record, input_hash=input_hash)
+
+    purified_ir = opt_initial_purify(function_ir, timeout_seconds)
+    normalized_ir = normalize_graph_file(str(purified_ir))
 
     if tokenizer is None:
         raise RuntimeError("graph record format requires tokenizer")
