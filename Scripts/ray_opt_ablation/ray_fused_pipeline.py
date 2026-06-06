@@ -73,6 +73,27 @@ CANONICALIZE_PASSES_BY_OPT_LEVEL = {
         "adce",
         "simplifycfg",
     ),
+    "-Oc3": (
+        "sroa",
+        "mem2reg",
+        "instcombine<no-verify-fixpoint;max-iterations=1>",
+        "simplifycfg",
+        "early-cse",
+        "sccp",
+        "correlated-propagation",
+        "jump-threading",
+        "simplifycfg",
+        "reassociate",
+        "instcombine<no-verify-fixpoint;max-iterations=1>",
+        "gvn",
+        "dce",
+        "bdce",
+        "adce",
+        "simplifycfg",
+    ),
+}
+IR_CANONICALIZATION_BY_OPT_LEVEL = {
+    "-Oc3": "oc3",
 }
 ILLEGAL_FUNCTION_BITCAST_RE = re.compile(
     r"^\s*(?P<name>%\"[^\"]+\"|%[-A-Za-z0-9$._]+)\s*=\s*bitcast\s+"
@@ -184,6 +205,10 @@ def normalize_opt_level(repo_root: str, opt_level: str) -> str:
 
 def opt_state_token(opt_level: str) -> str:
     return opt_level.lstrip("-").replace(os.sep, "_")
+
+
+def ir_canonicalization_for_opt_level(opt_level: str) -> str:
+    return IR_CANONICALIZATION_BY_OPT_LEVEL.get(opt_level, os.environ.get("REGRAPH_IR_CANONICALIZATION", "none"))
 
 
 def run_command(
@@ -1311,8 +1336,10 @@ def parse_args() -> argparse.Namespace:
         "--opt-level",
         required=True,
         help=(
-            "Task2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oc, Oc2. "
-            "O0 uses llvm-as, Oc/Oc2 use conservative opt canonicalization pipelines, others use clang."
+            "Task2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oc, Oc2, Oc3. "
+            "O0 uses llvm-as, Oc/Oc2/Oc3 use conservative opt canonicalization pipelines, others use clang. "
+            "Oc3 also enables REGRAPH_IR_CANONICALIZATION=oc3, which means to32 bit/ABI canonicalization, "
+            "for token/graph dataset generation."
         ),
     )
     parser.add_argument("--resume", action="store_true")
@@ -1443,6 +1470,9 @@ def main() -> int:
     cache_env = configure_cache(cache_root)
     configure_imports(repo_root, cache_root)
     opt_level = normalize_opt_level(repo_root, args.opt_level)
+    ir_canonicalization = ir_canonicalization_for_opt_level(opt_level)
+    if ir_canonicalization != "none":
+        os.environ["REGRAPH_IR_CANONICALIZATION"] = ir_canonicalization
 
     dataset_path = Path(args.dataset_path)
     if args.smoke:
@@ -1511,6 +1541,7 @@ def main() -> int:
         )
         logger.info(f"final_local_root={final_local_root if final_local_root else 'disabled'} keep_final_local={args.keep_final_local}")
         logger.info(f"opt_level={opt_level}")
+        logger.info(f"ir_canonicalization={os.environ.get('REGRAPH_IR_CANONICALIZATION', 'none')}")
         for name in sorted(cache_env):
             logger.info(f"{name}={cache_env[name]}")
 

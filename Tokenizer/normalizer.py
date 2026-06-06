@@ -9,6 +9,7 @@ Normalizes LLVM IR code by:
 """
 
 import sys
+import os
 from typing import Dict, Set, List, Tuple, Optional
 from collections import defaultdict
 import re
@@ -22,6 +23,52 @@ except ImportError:
     LLVMLITE_AVAILABLE = False
     print("Warning: LLVMLite not available, falling back to regex-based parsing")
     print("Install with: pip install llvmlite")
+
+
+IR_CANONICALIZATION_ENV = "REGRAPH_IR_CANONICALIZATION"
+BIT_ABI_INTEGER_TYPE_RE = re.compile(r"\bi(?:32|64)\b")
+BIT_ABI_ALIGN_RE = re.compile(r"\balign\s+(?:4|8|16)\b")
+
+
+def normalize_canonicalization_mode(mode: Optional[str] = None) -> str:
+    value = (mode if mode is not None else os.environ.get(IR_CANONICALIZATION_ENV, "none")).strip().lower()
+    aliases = {
+        "": "none",
+        "0": "none",
+        "false": "none",
+        "off": "none",
+        "none": "none",
+        "no": "none",
+        "1": "oc3_i32",
+        "true": "oc3_i32",
+        "on": "oc3_i32",
+        "oc3": "oc3_i32",
+        "oc3_i32": "oc3_i32",
+        "i32": "oc3_i32",
+        "to32": "oc3_i32",
+        "oc3_i64": "oc3_i64",
+        "i64": "oc3_i64",
+        "to64": "oc3_i64",
+    }
+    if value not in aliases:
+        raise ValueError(
+            f"Unsupported {IR_CANONICALIZATION_ENV}={value!r}. "
+            "Use none, oc3/i32/to32, or oc3_i64/i64/to64."
+        )
+    return aliases[value]
+
+
+def canonicalize_bit_abi(normalized_ir: str, mode: Optional[str] = None) -> str:
+    """Canonicalize pointer-width ABI artifacts after regular IR normalization."""
+    canonical_mode = normalize_canonicalization_mode(mode)
+    if canonical_mode == "none":
+        return normalized_ir
+
+    target_int = "i32" if canonical_mode == "oc3_i32" else "i64"
+    target_align = "4" if canonical_mode == "oc3_i32" else "8"
+    text = BIT_ABI_INTEGER_TYPE_RE.sub(target_int, normalized_ir)
+    text = BIT_ABI_ALIGN_RE.sub(f"align {target_align}", text)
+    return text
 
 
 class LLVMIRNormalizer:
@@ -585,7 +632,7 @@ def normalize_file(input_path: str, output_path: str = None) -> str:
         with open(input_path, 'r', encoding='utf-8') as f:
             ir_code = f.read()
         
-        normalized_code = normalizer.normalize_ir(ir_code)
+        normalized_code = canonicalize_bit_abi(normalizer.normalize_ir(ir_code))
         
         if output_path:
             with open(output_path, 'w', encoding='utf-8') as f:
@@ -603,7 +650,7 @@ def normalize_string(ir_code: str) -> str:
     normalizer = LLVMIRNormalizer()
     
     try:
-        normalized_code = normalizer.normalize_ir(ir_code)
+        normalized_code = canonicalize_bit_abi(normalizer.normalize_ir(ir_code))
         return normalized_code
     except Exception as e:
         print(f"Error normalizing string: {e}")
