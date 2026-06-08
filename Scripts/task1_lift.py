@@ -13,24 +13,65 @@ import multiprocessing
 import logging
 import subprocess
 import traceback
+import sys
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
-import sys
-import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from utils import console, ensure_directory, file_exists_and_not_empty
-from ida2llvm import lift_binary_to_llvm
 
 # Configuration
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BINARY_PATH = "/home/damaoooo/Downloads/regraphv2/Binaries"
 IDA_PATH = "/home/damaoooo/ida-pro-9.3"  # Update this path to your IDA Pro installation
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lift_task1_log.txt")
+LOG_PATH = os.path.join(SCRIPT_DIR, "lift_task1_log.txt")
+LIFT_BACKENDS = {"ida", "ghidra"}
 
 app = typer.Typer()
 
-def generate_i64(binary_path: str) -> tuple:
+
+def is_input_binary_file(file_name: str) -> bool:
+    """Return True for dataset binaries and False for generated/source side files."""
+    if file_name.startswith("."):
+        return False
+    ignored_suffixes = (
+        ".i64",
+        ".idb",
+        ".id0",
+        ".id1",
+        ".id2",
+        ".til",
+        ".nam",
+        ".asm",
+        ".ll",
+        ".bc",
+        ".re",
+        ".c",
+        ".cc",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".txt",
+        ".log",
+        ".md",
+        ".py",
+        ".sh",
+        ".json",
+        ".jsonl",
+        ".pkl",
+    )
+    return not file_name.endswith(ignored_suffixes)
+
+
+def python_runner(conda_env: str) -> list[str]:
+    """Build a Python command without hardcoding a conda environment."""
+    if conda_env:
+        return ["conda", "run", "-n", conda_env, "python"]
+    return [sys.executable]
+
+
+def generate_i64(binary_path: str, ida_path: str) -> tuple:
     """
     Generate the .i64 file for a given binary file using IDA Pro
     
@@ -38,7 +79,7 @@ def generate_i64(binary_path: str) -> tuple:
     :return: (success, binary_path) tuple
     """
     command_line = [
-        os.path.join(IDA_PATH, "idat"),
+        os.path.join(ida_path, "idat"),
         "-A", 
         "-B",
         binary_path
@@ -75,7 +116,20 @@ def generate_i64(binary_path: str) -> tuple:
     return (success, binary_path)
 
 
-def lift_single_file(input_binary: str, output_llvm: str) -> tuple:
+def lift_single_file(
+    input_binary: str,
+    output_llvm: str,
+    backend: str,
+    conda_env: str,
+    ghidra_home: str,
+    analyze_headless: str,
+    ghidra_target: str,
+    ghidra_max_cpu: int,
+    ghidra_decompile_timeout: int,
+    ghidra_analysis_timeout: int,
+    ghidra_no_analysis: bool,
+    allow_partial: bool,
+) -> tuple:
     """
     Lift a single binary file to LLVM IR.
     
@@ -83,20 +137,45 @@ def lift_single_file(input_binary: str, output_llvm: str) -> tuple:
     :param output_llvm: Path to the output LLVM IR file
     :return: (success, input_binary) tuple
     """
-    ida2llvm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ida2llvm.py")
-    cmd = [
-        "conda",
-        "run",
-        "-n",
-        "ReLL",
-        "python",
-        ida2llvm_path,
-        "-f",
-        input_binary,
-        "-o",
-        output_llvm,
-        "-v",
-    ]
+    if backend == "ida":
+        lifter_path = os.path.join(SCRIPT_DIR, "ida2llvm.py")
+        cmd = python_runner(conda_env) + [
+            lifter_path,
+            "-f",
+            input_binary,
+            "-o",
+            output_llvm,
+            "-v",
+        ]
+    elif backend == "ghidra":
+        lifter_path = os.path.join(SCRIPT_DIR, "pcode2llvm.py")
+        cmd = python_runner(conda_env) + [
+            lifter_path,
+            "-f",
+            input_binary,
+            "-o",
+            output_llvm,
+            "-v",
+            "--target",
+            ghidra_target,
+            "--max-cpu",
+            str(max(ghidra_max_cpu, 1)),
+            "--decompile-timeout",
+            str(max(ghidra_decompile_timeout, 1)),
+            "--analysis-timeout",
+            str(max(ghidra_analysis_timeout, 0)),
+        ]
+        if ghidra_home:
+            cmd.extend(["--ghidra-home", ghidra_home])
+        if analyze_headless:
+            cmd.extend(["--analyze-headless", analyze_headless])
+        if ghidra_no_analysis:
+            cmd.append("--no-analysis")
+        if allow_partial:
+            cmd.append("--allow-partial")
+    else:
+        return (False, input_binary)
+
     result = subprocess.run(cmd, capture_output=True, text=True)
     success = result.returncode == 0
     if result.stdout or result.stderr:
@@ -122,19 +201,71 @@ def main(
     output: str = typer.Option(..., help="Output directory"),
     workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
     resume: bool = typer.Option(False, help="Resume from previous run, skip existing files"),
+    backend: str = typer.Option(
+        "ida",
+        "--backend",
+        help="Lifter backend: ida uses ida2llvm.py on .i64 files; ghidra uses pcode2llvm.py directly on binaries",
+    ),
+    conda_env: str = typer.Option(
+        os.environ.get("REGRAPH_CONDA_ENV", ""),
+        "--conda-env",
+        help="Conda environment for lifter subprocesses; empty uses the current Python interpreter",
+    ),
+    ida_path: str = typer.Option(IDA_PATH, "--ida-path", help="IDA Pro installation path for the ida backend"),
+    ghidra_home: str = typer.Option("", "--ghidra-home", help="Ghidra installation root for the ghidra backend"),
+    analyze_headless: str = typer.Option(
+        "",
+        "--analyze-headless",
+        help="Path to Ghidra support/analyzeHeadless for the ghidra backend",
+    ),
+    ghidra_target: str = typer.Option(
+        "host",
+        "--ghidra-target",
+        help="pcode2llvm.py target triple source for the ghidra backend: host or ghidra",
+    ),
+    ghidra_max_cpu: int = typer.Option(
+        1,
+        "--ghidra-max-cpu",
+        help="Ghidra CPUs per worker. Keep this low when task1 workers already provide parallelism",
+    ),
+    ghidra_decompile_timeout: int = typer.Option(
+        60,
+        "--ghidra-decompile-timeout",
+        help="Ghidra decompiler timeout per function in seconds",
+    ),
+    ghidra_analysis_timeout: int = typer.Option(
+        300,
+        "--ghidra-analysis-timeout",
+        help="Ghidra analysis timeout per binary in seconds",
+    ),
+    ghidra_no_analysis: bool = typer.Option(
+        False,
+        "--ghidra-no-analysis",
+        help="Skip Ghidra auto-analysis. Only use this for debugging already-analyzed projects",
+    ),
+    allow_partial: bool = typer.Option(
+        False,
+        "--allow-partial",
+        help="Allow pcode2llvm.py to succeed when some functions are skipped. Off by default for reproducibility",
+    ),
     start_from_step2: bool = typer.Option(
         False,
         help="Start directly from Step 2 (scan .i64 and lift), skip Step 1 .i64 generation",
     ),
 ):
     """
-    Lift binary files to LLVM IR using IDA Pro (Two-step process).
+    Lift binary files to LLVM IR using IDA or Ghidra.
     
+    IDA backend:
     Step 1: Generate .i64 files from binary files using IDA Pro
-    Step 2: Convert .i64 files to LLVM IR format using ida2llvm
+    Step 2: Convert .i64 files to LLVM IR format using ida2llvm.py
+
+    Ghidra backend:
+    Step 1: Skipped
+    Step 2: Convert binaries directly to LLVM IR using pcode2llvm.py
     
-    This command scans the input directory for binary files, first generates
-    .i64 database files using IDA Pro, then converts each .i64 file to LLVM IR.
+    This command scans the input directory for binaries and mirrors the input
+    directory structure under the output directory.
     
     Features:
     - Two-stage processing with separate progress bars
@@ -142,8 +273,19 @@ def main(
     - Resume capability (skip already processed files in both stages)
     - Automatic directory creation for output
     - Detailed logging of all failures to lift_task1_log.txt
-    - Automatic cleanup of failed IDA temporary files
+    - Automatic cleanup of failed IDA temporary files in IDA mode
     """
+    backend = backend.lower()
+    if backend not in LIFT_BACKENDS:
+        console.print(f"[red]Error: backend must be one of {sorted(LIFT_BACKENDS)}, got {backend!r}.[/red]")
+        raise typer.Exit(code=1)
+    ghidra_target = ghidra_target.lower()
+    if ghidra_target not in ("host", "ghidra"):
+        console.print("[red]Error: --ghidra-target must be one of: host, ghidra.[/red]")
+        raise typer.Exit(code=1)
+    if backend == "ida" and not os.path.exists(os.path.join(ida_path, "idat")) and not start_from_step2:
+        console.print(f"[red]Error: IDA idat not found under {ida_path}. Use --backend ghidra for artifact runs.[/red]")
+        raise typer.Exit(code=1)
     
     # Setup logging
     logging.basicConfig(
@@ -159,7 +301,14 @@ def main(
     separator = "="*60
     logger.info(separator)
     logger.info(f"Task 1 started at {datetime.now()}")
-    logger.info(f"Workers: {workers}, Resume: {resume}, StartFromStep2: {start_from_step2}")
+    logger.info(
+        "Workers: %s, Resume: %s, StartFromStep2: %s, Backend: %s, CondaEnv: %s",
+        workers,
+        resume,
+        start_from_step2,
+        backend,
+        conda_env or "<current-python>",
+    )
     logger.info(separator)
     
     # Determine input path
@@ -184,7 +333,9 @@ def main(
     console.print(f"[bold cyan]═══════════════════════════════════════[/bold cyan]")
     console.print(f"[green]Input:  {db_path}[/green]")
     console.print(f"[green]Output: {output_path}[/green]")
+    console.print(f"[green]Backend: {backend}[/green]")
     console.print(f"[green]Workers: {workers}[/green]")
+    console.print(f"[green]Lifter Python: {conda_env or 'current interpreter'}[/green]")
     console.print(f"[green]Log file: {LOG_PATH}[/green]")
     if resume:
         console.print(f"[yellow]Resume mode: skipping existing lifted files[/yellow]")
@@ -194,9 +345,13 @@ def main(
     
     logger.info(f"Input path: {db_path}")
     logger.info(f"Output path: {output_path}")
+    logger.info(f"Backend: {backend}")
 
     # Step 1: Generate .i64 files from binaries (optional)
-    if not start_from_step2:
+    if backend == "ghidra":
+        console.print("[bold blue]Step 1: Skipped .i64 generation (Ghidra backend lifts binaries directly)[/bold blue]")
+        console.print()
+    elif not start_from_step2:
         console.print("[bold blue]Step 1: Scanning for binary files to generate .i64...[/bold blue]")
         
         # Clean any failed IDA files first
@@ -218,12 +373,7 @@ def main(
         
         for root, dirs, files in os.walk(db_path):
             for file in files:
-                # Skip IDA database files and other temporary files
-                if file.endswith((".i64", ".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm", ".ll", ".bc", ".c", ".cpp", ".h", ".hpp")):
-                    continue
-                
-                # Skip hidden files and common non-binary files
-                if file.startswith(".") or file.endswith((".txt", ".log", ".md", ".py", ".sh")):
+                if not is_input_binary_file(file):
                     continue
                     
                 file_path = os.path.join(root, file)
@@ -270,7 +420,7 @@ def main(
                 with ProcessPoolExecutor(max_workers=workers) as executor:
                     # Submit all i64 generation tasks
                     future_to_binary = {
-                        executor.submit(generate_i64, binary_path): binary_path
+                        executor.submit(generate_i64, binary_path, ida_path): binary_path
                         for binary_path in i64_tasks
                     }
                 
@@ -312,21 +462,29 @@ def main(
         console.print("[bold blue]Step 1: Skipped .i64 generation[/bold blue]")
         console.print()
 
-    console.print("[bold blue]Step 2: Scanning for .i64 files to lift to LLVM IR...[/bold blue]")
+    if backend == "ida":
+        console.print("[bold blue]Step 2: Scanning for .i64 files to lift to LLVM IR...[/bold blue]")
+    else:
+        console.print("[bold blue]Step 2: Scanning for binaries to lift to LLVM IR with Ghidra...[/bold blue]")
     lift_tasks = []
     skipped_count = 0
     
     for root, dirs, files in os.walk(db_path):
         for file in files:
-            # Only process .i64 files
-            if not file.endswith(".i64"):
-                continue
+            if backend == "ida":
+                if not file.endswith(".i64"):
+                    continue
+                output_name = file.replace(".i64", "") + ".ll"
+            else:
+                if not is_input_binary_file(file):
+                    continue
+                output_name = file + ".ll"
                 
             file_path = os.path.join(root, file)
             relative_path = os.path.relpath(root, db_path)
             output_dir = os.path.join(output_path, relative_path)
             ensure_directory(output_dir)
-            output_file_path = os.path.join(output_dir, file.replace(".i64", "")) + ".ll"
+            output_file_path = os.path.join(output_dir, output_name)
             
             # Check if file already exists and we're resuming
             if resume and file_exists_and_not_empty(output_file_path):
@@ -372,7 +530,21 @@ def main(
         with ProcessPoolExecutor(max_workers=workers) as executor:
             # Submit all tasks
             future_to_task = {
-                executor.submit(lift_single_file, input_bin, output_llvm): (input_bin, output_llvm)
+                executor.submit(
+                    lift_single_file,
+                    input_bin,
+                    output_llvm,
+                    backend,
+                    conda_env,
+                    ghidra_home,
+                    analyze_headless,
+                    ghidra_target,
+                    ghidra_max_cpu,
+                    ghidra_decompile_timeout,
+                    ghidra_analysis_timeout,
+                    ghidra_no_analysis,
+                    allow_partial,
+                ): (input_bin, output_llvm)
                 for input_bin, output_llvm in lift_tasks
             }
         
