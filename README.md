@@ -21,7 +21,8 @@ ReGraphv2 attacks the problem before the model sees the function:
 ```text
 Binary function
    ↓
-IDA / ida2llvm lifting
+Ghidra High P-Code / pcode2llvm lifting
+   or IDA / ida2llvm lifting
    ↓
 LLVM IR semantic normalization (`Oc`)
    ↓
@@ -48,6 +49,7 @@ a separate artifact package.
 | Reproduce the main Dataset-1 retrieval result | `evaluation.py` | Uses packaged `Oc` final set + trained model |
 | Retrain ReGraphv2 on packaged data | `Scripts/train_test_fused_opt.sh Oc` | Uses train/validation final sets |
 | Rebuild Dataset-1 final sets | `Scripts/ray_opt_ablation/ray_fused_pipeline.py` | Expensive; requires prepared IR and compute |
+| Lift new binaries without IDA | `Scripts/pcode2llvm.py` or `Scripts/pipeline.py task1 --backend ghidra` | Uses open-source Ghidra High P-Code |
 | Run graph ablations | `Scripts/train_test_oc_graph_ablation.sh` | IR-only, IR+CFG, IR+DDG, IR+CFG+DDG |
 | Evaluate Dataset-Vulnerability | `Scripts/evaluate_dataset_vulnerability_regraph.py` | Binary-in ranking workflow |
 | Benchmark preprocessing latency | `Scripts/benchmark_pipeline_latency.py` | Requires IDA Pro |
@@ -62,8 +64,20 @@ For the full artifact-evaluation checklist, see:
 
 ### 1. Lift Once, Compare in IR
 
-ReGraphv2 uses IDA/ida2llvm to lift binary functions into LLVM IR.  This gives a
-shared intermediate representation across architectures.
+ReGraphv2 lifts binary functions into LLVM IR, giving the model a shared
+intermediate representation across architectures.
+
+For artifact evaluation, the release includes an open-source Ghidra path:
+
+```text
+Binary
+  -> Ghidra decompiler High P-Code
+  -> Scripts/pcode2llvm.py
+  -> LLVM IR
+```
+
+The older IDA/ida2llvm path is still supported for continuity with the original
+experiments, but it is no longer the only way to reproduce the lifting stage.
 
 ### 2. Canonicalize With `Oc`
 
@@ -102,6 +116,8 @@ The model combines:
 
 ```text
 Scripts/              pipeline, training wrappers, AE scripts, benchmarks
+Scripts/pcode2llvm.py Ghidra High P-Code to LLVM IR lifter
+Scripts/ghidra/       Ghidra headless export scripts
 DataProcess/          final_set construction from function-level LLVM IR
 GraphBuilder/         CFG/DDG graph extraction over token spans
 Tokenizer/            LLVM IR tokenizer and normalizer
@@ -161,9 +177,12 @@ python -m pip install -r requirements.txt
 Notes:
 
 - `pygraphviz` may require the system Graphviz development package.
-- Full lifting requires IDA Pro.
-- The default local IDA path in scripts is `/home/damaoooo/ida-pro-9.3/idat`;
-  adjust it for your machine if you run lifting.
+- Open-source lifting uses Ghidra.  Set `GHIDRA_HOME` or
+  `GHIDRA_ANALYZE_HEADLESS`, or pass `--ghidra-home` /
+  `--analyze-headless` directly.
+- IDA Pro is still supported as the historical backend.  The default local IDA
+  path in scripts is `/home/damaoooo/ida-pro-9.3/idat`; adjust it for your
+  machine only if you run the IDA backend.
 - The quick reproduction path does **not** require re-lifting binaries.
 
 ---
@@ -228,7 +247,9 @@ IR/Dataset-1-Oc-fused/test_final_set_len128_hashdedup
 ## 🏗️ Full Preprocessing Pipeline
 
 Full preprocessing is intended for advanced reproduction.  It is expensive and
-requires IDA Pro plus substantial CPU/storage.
+requires substantial CPU/storage.  If you start from already lifted IR, use the
+Ray fused pipeline below.  If you start from binaries and want an open-source
+lifter, use the Ghidra backend in the next section.
 
 ```bash
 python Scripts/ray_opt_ablation/ray_fused_pipeline.py \
@@ -254,6 +275,61 @@ python Scripts/pipeline.py --help
 
 That pipeline exposes the traditional stages: lifting, re-optimization,
 function extraction, and optional recompilation.
+
+---
+
+## 🧩 Open-Source Lifting With Ghidra
+
+Reviewers do not need IDA Pro to inspect or rerun the lifting stage.  This
+release includes a Ghidra High P-Code lifter:
+
+```text
+Scripts/pcode2llvm.py
+Scripts/ghidra/PcodeDump.java
+```
+
+`PcodeDump.java` is executed by Ghidra headless mode and exports each function's
+High P-Code, CFG, types, and varnodes as JSONL.  `pcode2llvm.py` then emits LLVM
+IR with real branches, phi nodes, integer/float operations, load/store, direct
+calls, and indirect calls.  The default mode is strict: if any function cannot
+be lifted, the command exits non-zero instead of silently emitting a partial
+module.
+
+Single-binary lift:
+
+```bash
+export GHIDRA_HOME=/path/to/ghidra
+
+python Scripts/pcode2llvm.py \
+  -f /path/to/binary \
+  -o /tmp/binary.ll \
+  --max-cpu 4 \
+  --analysis-timeout 300 \
+  --decompile-timeout 60
+```
+
+Equivalent Task 1 pipeline entry:
+
+```bash
+python Scripts/pipeline.py task1 \
+  --backend ghidra \
+  --input-path /path/to/binaries \
+  --output /tmp/regraph_lifted \
+  --workers 16 \
+  --ghidra-max-cpu 1 \
+  --resume
+```
+
+By default the generated LLVM module uses the host target triple, matching the
+legacy `ida2llvm.py` behavior used by the preprocessing scripts.  To preserve
+the architecture triple detected by Ghidra, pass:
+
+```bash
+--ghidra-target ghidra
+```
+
+Use `--allow-partial` only for debugging unsupported binaries; artifact
+reproduction should keep the strict default.
 
 ---
 
@@ -292,6 +368,8 @@ for committing to GitHub.
 
 - This branch intentionally excludes datasets, model checkpoints, and run
   caches from Git.
+- Open-source Ghidra/P-Code lifting is included to address reproducibility
+  concerns around IDA as commercial software.
 - `Oc2` and later exploratory settings are not part of the release workflow.
 - `runs/dataset1_oc_fused/model_cfg_ddg` does not need a standalone
   `config.json`; `evaluation.py` falls back to the repository's
