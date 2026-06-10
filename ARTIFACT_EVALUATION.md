@@ -1,12 +1,12 @@
-# ReGraphv2 Artifact Evaluation Guide
+# ReLL Artifact Evaluation Guide
 
-This branch is the artifact-evaluation release for ReGraphv2.  The GitHub
+This branch is the artifact-evaluation release for ReLL.  The GitHub
 branch contains code, scripts, and documentation only.  Dataset and model files
 are packaged separately and should be distributed through external storage.
 
 ## Scope
 
-The default artifact reproduces the main ReGraphv2 retrieval result on Dataset-1
+The default artifact reproduces the main ReLL retrieval result on Dataset-1
 with the paper's `Oc` semantic normalization setting:
 
 - Dataset: `IR/Dataset-1-Oc-fused/test_final_set_len128_hashdedup`
@@ -16,7 +16,9 @@ with the paper's `Oc` semantic normalization setting:
 
 The release also includes scripts for full preprocessing, graph ablation,
 optimization ablation, Dataset-Vulnerability, and latency benchmarking.  Those
-larger experiments require substantially more compute and/or IDA Pro.
+larger experiments require substantially more compute and a configured lifting
+backend.  Ghidra is provided for open-source lifting; the historical IDA backend
+and IDA latency benchmark remain available.
 
 ## External Artifact Package
 
@@ -45,7 +47,7 @@ anchors:       164,969
 Unpack the package from the repository root:
 
 ```bash
-tar -I zstd -xf regraphv2_artifact_core.tar.zst -C /path/to/regraphv2
+tar -I zstd -xf rell_artifact_core.tar.zst -C /path/to/rell
 ```
 
 If the package was created with gzip fallback, replace `-I zstd` with `-z`.
@@ -58,13 +60,15 @@ development environment used `conda`, but the scripts do not require a fixed
 environment name.
 
 ```bash
-cd /path/to/regraphv2
+cd /path/to/rell
 python -m pip install -r requirements.txt
 ```
 
-`pygraphviz` may require the system Graphviz development package.  Full lifting
-requires IDA Pro; the default local path in the scripts is
-`/home/damaoooo/ida-pro-9.3/idat`.
+`pygraphviz` may require the system Graphviz development package.  Open-source
+lifting uses Ghidra through `Scripts/pcode2llvm.py`; set `GHIDRA_HOME` or
+`GHIDRA_ANALYZE_HEADLESS`, or pass the path through the command line.  IDA Pro
+is still supported as the historical backend; its default local path in the
+scripts is `/home/damaoooo/ida-pro-9.3/idat`.
 
 ## Main Evaluation
 
@@ -118,7 +122,7 @@ AE path because it is expensive.
 
 ```bash
 python Scripts/ray_opt_ablation/ray_fused_pipeline.py \
-  --repo-root /path/to/regraphv2 \
+  --repo-root /path/to/rell \
   --dataset-path IR/Dataset-1-new/Dataset-1 \
   --output-path IR/Dataset-1-Oc-fused \
   --opt-level Oc \
@@ -181,7 +185,7 @@ optimization-specific final sets are large.
 
 Dataset-Vulnerability is evaluated by a separate binary-in ranking script.  It
 uses the official candidate pool under `binary_function_similarity` and the
-ReGraphv2 `Oc` model.
+ReLL `Oc` model.
 
 ```bash
 python Scripts/evaluate_dataset_vulnerability_regraph.py \

@@ -89,7 +89,7 @@ def _build_health_payload() -> Dict[str, object]:
     }
 
 
-app = FastAPI(title="ReGraph Inference API", version="0.1.0")
+app = FastAPI(title="ReLL Inference API", version="0.1.0")
 
 
 @app.get("/health")

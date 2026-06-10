@@ -1393,7 +1393,7 @@ def lift_binary_to_llvm(
 
 app = typer.Typer(
     add_completion=False,
-    help="Ghidra High P-Code to LLVM IR lifter for ReGraph BFSD preprocessing.",
+    help="Ghidra High P-Code to LLVM IR lifter for ReLL BFSD preprocessing.",
 )
 
 

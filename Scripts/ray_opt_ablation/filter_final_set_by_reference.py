@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Filter a ReGraph final_set by a CSV or another final_set reference."""
+"""Filter a ReLL final_set by a CSV or another final_set reference."""
 from __future__ import annotations
 
 import csv

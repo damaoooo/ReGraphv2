@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/artifact_packages}"
-OUTPUT_NAME="${OUTPUT_NAME:-regraphv2_artifact_core.tar.zst}"
+OUTPUT_NAME="${OUTPUT_NAME:-rell_artifact_core.tar.zst}"
 DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/IR/Dataset-1-Oc-fused}"
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/runs/dataset1_oc_fused/model_cfg_ddg}"
 INCLUDE_RESULTS=1
@@ -15,7 +15,7 @@ print_help() {
 Usage:
   bash Scripts/pack_artifact_release.sh [OPTIONS]
 
-Packages the compact ReGraphv2 artifact data/model bundle.  The archive is
+Packages the compact ReLL artifact data/model bundle.  The archive is
 intended for external storage, not for committing to GitHub.
 
 Included by default:
@@ -27,7 +27,7 @@ Included by default:
 
 Options:
   --output-dir DIR       Directory where archive and manifest are written.
-  --output-name NAME     Archive filename. Default: regraphv2_artifact_core.tar.zst
+  --output-name NAME     Archive filename. Default: rell_artifact_core.tar.zst
   --dataset-root DIR     Dataset root. Default: REPO_ROOT/IR/Dataset-1-Oc-fused
   --model-dir DIR        Model dir. Default: REPO_ROOT/runs/dataset1_oc_fused/model_cfg_ddg
   --no-results           Do not include result Markdown snapshots.
@@ -35,7 +35,7 @@ Options:
   -h, --help             Show this help.
 
 Example:
-  bash Scripts/pack_artifact_release.sh --output-dir /home/user/regraphv2_artifacts
+  bash Scripts/pack_artifact_release.sh --output-dir /home/user/rell_artifacts
 EOF
 }
 
@@ -127,7 +127,7 @@ archive="${OUTPUT_DIR}/${OUTPUT_NAME}"
 manifest="${OUTPUT_DIR}/${OUTPUT_NAME%.*}.MANIFEST.md"
 
 {
-  echo "# ReGraphv2 Artifact Core Manifest"
+  echo "# ReLL Artifact Core Manifest"
   echo
   echo "- Repository root: \`${REPO_ROOT}\`"
   echo "- Archive: \`${archive}\`"

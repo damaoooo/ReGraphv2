@@ -616,7 +616,7 @@ def main(
     }
 
     print("")
-    print("=== ReGraph Inference Speed Test ===")
+    print("=== ReLL Inference Speed Test ===")
     print(f"checkpoint: {checkpoint_file}")
     print(f"device: {resolved_device} | bf16_autocast: {use_bf16}")
     print(

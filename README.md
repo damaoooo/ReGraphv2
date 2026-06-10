@@ -1,4 +1,4 @@
-# ReGraphv2
+# ReLL
 
 > **Semantic normalization for binary function similarity detection.**
 > Lift binaries to LLVM IR, canonicalize away architecture/compiler noise, then
@@ -6,7 +6,7 @@
 
 ---
 
-## ✨ Why ReGraphv2?
+## ✨ Why ReLL?
 
 Binary Function Similarity Detection (BFSD) is hard because the same source
 function can look very different after:
@@ -16,7 +16,7 @@ function can look very different after:
 - different optimization levels: `O0/O1/O2/O3/Og/Os`;
 - binary-level artifacts introduced by lifting and analysis tools.
 
-ReGraphv2 attacks the problem before the model sees the function:
+ReLL attacks the problem before the model sees the function:
 
 ```text
 Binary function
@@ -47,7 +47,7 @@ a separate artifact package.
 | Goal | Entry Point | Notes |
 | --- | --- | --- |
 | Reproduce the main Dataset-1 retrieval result | `evaluation.py` | Uses packaged `Oc` final set + trained model |
-| Retrain ReGraphv2 on packaged data | `Scripts/train_test_fused_opt.sh Oc` | Uses train/validation final sets |
+| Retrain ReLL on packaged data | `Scripts/train_test_fused_opt.sh Oc` | Uses train/validation final sets |
 | Rebuild Dataset-1 final sets | `Scripts/ray_opt_ablation/ray_fused_pipeline.py` | Expensive; requires prepared IR and compute |
 | Lift new binaries without IDA | `Scripts/pcode2llvm.py` or `Scripts/pipeline.py task1 --backend ghidra` | Uses open-source Ghidra High P-Code |
 | Run graph ablations | `Scripts/train_test_oc_graph_ablation.sh` | IR-only, IR+CFG, IR+DDG, IR+CFG+DDG |
@@ -64,7 +64,7 @@ For the full artifact-evaluation checklist, see:
 
 ### 1. Lift Once, Compare in IR
 
-ReGraphv2 lifts binary functions into LLVM IR, giving the model a shared
+ReLL lifts binary functions into LLVM IR, giving the model a shared
 intermediate representation across architectures.
 
 For artifact evaluation, the release includes an open-source Ghidra path:
@@ -81,7 +81,7 @@ experiments, but it is no longer the only way to reproduce the lifting stage.
 
 ### 2. Canonicalize With `Oc`
 
-Instead of blindly applying `-O3`, ReGraphv2 uses a conservative
+Instead of blindly applying `-O3`, ReLL uses a conservative
 canonicalization profile called `Oc`.
 
 `Oc` keeps passes that are useful for semantic cleanup:
@@ -147,13 +147,13 @@ selected result markdown snapshots
 Unpack it from the repository root:
 
 ```bash
-tar -I zstd -xf regraphv2_artifact_core.tar.zst -C /path/to/regraphv2
+tar -I zstd -xf rell_artifact_core.tar.zst -C /path/to/rell
 ```
 
 If the archive was created with gzip fallback:
 
 ```bash
-tar -zxf regraphv2_artifact_core.tar.gz -C /path/to/regraphv2
+tar -zxf rell_artifact_core.tar.gz -C /path/to/rell
 ```
 
 The packaged main test split contains:
@@ -253,7 +253,7 @@ lifter, use the Ghidra backend in the next section.
 
 ```bash
 python Scripts/ray_opt_ablation/ray_fused_pipeline.py \
-  --repo-root /path/to/regraphv2 \
+  --repo-root /path/to/rell \
   --dataset-path IR/Dataset-1-new/Dataset-1 \
   --output-path IR/Dataset-1-Oc-fused \
   --opt-level Oc \
@@ -379,6 +379,6 @@ for committing to GitHub.
 
 ## Citation
 
-If you use this artifact, cite the corresponding ReGraphv2 paper version.  The
+If you use this artifact, cite the corresponding ReLL paper version.  The
 release branch is designed to make the main claims auditable through code,
 packaged final sets, model weights, and deterministic evaluation commands.
