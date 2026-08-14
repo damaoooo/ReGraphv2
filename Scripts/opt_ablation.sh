@@ -1,13 +1,13 @@
 
-cd "/home/damaoooo/Downloads/regraphv2"
+cd "/path/to/rell"
 PYTHON_PATH="$(python -c 'import sys; print(sys.executable)')"
-DATASET_PATH="/home/damaoooo/Downloads/regraphv2/IR/Dataset-1"
+DATASET_PATH="/path/to/rell/IR/Dataset-1"
 if [ -z "$1" ]; then
     echo "Usage: $0 <OPT_LEVEL>"
     exit 1
 fi
 OPT_LEVEL="$1"
-OUTPUT_PATH="/home/damaoooo/Downloads/regraphv2/IR/Dataset-1-${OPT_LEVEL}"
+OUTPUT_PATH="/path/to/rell/IR/Dataset-1-${OPT_LEVEL}"
 
 ${PYTHON_PATH} Scripts/pipeline.py pipeline --input-path ${DATASET_PATH} --output ${DATASET_PATH} --start-from 2 --opt-level ${OPT_LEVEL} --resume
 

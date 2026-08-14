@@ -1,0 +1,49 @@
+model:
+  name: Qwen/Qwen3-Embedding-0.6B
+  max_length: 2048
+  quantization_bits: 4
+  instruction: 'Represent this LLVM IR for searching for similar functions:'
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  bias: none
+data:
+  train_dataset_pool_path: /path/to/rell/IR/Dataset-1-Oc-qwen-text-fused/train_final_set/train_dataset_pool
+  train_positive_map_path: /path/to/rell/IR/Dataset-1-Oc-qwen-text-fused/train_final_set/train_positive_map.pkl
+  validation_dataset_pool_path: /path/to/rell/IR/Dataset-1-Oc-qwen-text-fused/validation_final_set/train_dataset_pool
+  validation_positive_map_path: /path/to/rell/IR/Dataset-1-Oc-qwen-text-fused/validation_final_set/train_positive_map.pkl
+  steps_per_epoch: 600000
+  steps_per_epoch_eval: 128
+training:
+  output_dir: /path/to/qwen-case-study/experiments/qwen-llvm-finetune-hf-oc
+  num_train_epochs: 1.0
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 1
+  optim: paged_adamw_8bit
+  learning_rate: 2.0e-05
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  fp16: false
+  bf16: true
+  gradient_checkpointing: false
+  logging_strategy: steps
+  logging_steps: 10
+  eval_strategy: 'no'
+  eval_steps: 500
+  save_strategy: steps
+  save_steps: 500
+  save_total_limit: 3
+  load_best_model_at_end: false
+  dataloader_num_workers: 8
+  remove_unused_columns: false
+  triplet_margin: 1.0
+  label_names: []
+  seed: 42
+  do_eval: false

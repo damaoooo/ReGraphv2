@@ -280,7 +280,7 @@ def build_positive_indices(dataset: datasets.Dataset, base_path: str) -> Tuple[d
 
 def main(
     dataset_path: str = typer.Argument(..., help="Path to the dataset directory"),
-    base_path: str = typer.Option("/home/damaoooo/Datasets/IR/small_test/small_test", help="Base path for function mapping CSV files"),
+    base_path: str = typer.Option("/path/to/datasets/IR/small_test/small_test", help="Base path for function mapping CSV files"),
     train_ratio: float = typer.Option(0.9, help="Training set ratio (0.0-1.0)"),
     random_seed: int = typer.Option(42, help="Random seed for reproducibility"),
     output_dir: str = typer.Option(".", help="Output directory for generated files")

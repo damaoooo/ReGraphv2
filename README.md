@@ -40,7 +40,7 @@ binary surface form; first normalize the semantics into a cleaner IR space.**
 
 ## 🚀 What You Can Do With This Release
 
-This `release` branch is prepared for artifact evaluation.  It contains code,
+This artifact release is prepared for evaluation. It contains code,
 scripts, and documentation.  Large datasets and model weights are distributed as
 a separate artifact package.
 
@@ -53,6 +53,7 @@ a separate artifact package.
 | Run graph ablations | `Scripts/train_test_oc_graph_ablation.sh` | IR-only, IR+CFG, IR+DDG, IR+CFG+DDG |
 | Evaluate Dataset-Vulnerability | `Scripts/evaluate_dataset_vulnerability_regraph.py` | Binary-in ranking workflow |
 | Benchmark preprocessing latency | `Scripts/benchmark_pipeline_latency.py` | Requires IDA Pro |
+| Reproduce the Qwen3 case study | `case_studies/qwen3_embedding/README.md` | Five IR/assembly and fine-tuning settings |
 
 For the full artifact-evaluation checklist, see:
 
@@ -123,6 +124,7 @@ GraphBuilder/         CFG/DDG graph extraction over token spans
 Tokenizer/            LLVM IR tokenizer and normalizer
 Model/                RoFormer + CFG/DDG graph branches
 Pretrain/             MoCo training loop and config
+case_studies/         Qwen3 case-study code and frozen result tables
 evaluation.py         Dataset-1 retrieval evaluation
 inference.py          single-binary inference pipeline
 api_server.py         FastAPI embedding service
@@ -181,7 +183,7 @@ Notes:
   `GHIDRA_ANALYZE_HEADLESS`, or pass `--ghidra-home` /
   `--analyze-headless` directly.
 - IDA Pro is still supported as the historical backend.  The default local IDA
-  path in scripts is `/home/damaoooo/ida-pro-9.3/idat`; adjust it for your
+  path in scripts is `/path/to/ida-pro/idat`; adjust it for your
   machine only if you run the IDA backend.
 - The quick reproduction path does **not** require re-lifting binaries.
 

@@ -27,8 +27,8 @@ class PretrainConfig(RoFormerConfig):
         # === 序列长度配置 ===
         max_seq_length: int = 2048,
         # === 路径配置 ===
-        tokenizer_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json",
-        train_dataset_dir: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set",
+        tokenizer_path: str = "/path/to/rell/IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json",
+        train_dataset_dir: str = "/path/to/rell/IR/dataset-1/train_final_set",
         train_dataset_pool_path: Optional[str] = None,
         train_dataset_idx_path: Optional[str] = None,
         train_dataset_map_path: Optional[str] = None,

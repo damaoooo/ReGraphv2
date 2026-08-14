@@ -68,7 +68,7 @@ python -m pip install -r requirements.txt
 lifting uses Ghidra through `Scripts/pcode2llvm.py`; set `GHIDRA_HOME` or
 `GHIDRA_ANALYZE_HEADLESS`, or pass the path through the command line.  IDA Pro
 is still supported as the historical backend; its default local path in the
-scripts is `/home/damaoooo/ida-pro-9.3/idat`.
+scripts is `/path/to/ida-pro/idat`.
 
 ## Main Evaluation
 
@@ -235,9 +235,32 @@ The benchmark separates IDA database loading from steady-state function lifting.
 For the paper-style 100-function table, sample many functions from one binary or
 a small number of binaries.
 
+## Qwen3 Case Study
+
+The model-scale case study compares Qwen3-Embedding on normalized IR and raw
+assembly, with and without task-specific fine-tuning. Its code, configuration,
+frozen result tables, and plotting script are documented in:
+
+```text
+case_studies/qwen3_embedding/README.md
+```
+
+The five paper settings are 0.6B on IR without fine-tuning, 0.6B on IR with
+fine-tuning, 0.6B on assembly without fine-tuning, 0.6B on assembly with
+fine-tuning, and 4B on assembly without fine-tuning. To regenerate the two
+curves from the frozen tables, run:
+
+```bash
+python case_studies/qwen3_embedding/scripts/plot_case_study.py
+```
+
+The Qwen base models are downloaded from Hugging Face. Fine-tuned weights and
+the processed evaluation data belong in the external artifact package rather
+than the Git repository.
+
 ## Notes
 
-- GitHub release branch contains code/docs only.
+- The source release contains code and documentation only.
 - Dataset/model artifacts are intentionally distributed separately.
 - `Oc2` and later exploratory settings are not part of this release workflow.
 - The model directory does not need `config.json`; `evaluation.py` falls back to

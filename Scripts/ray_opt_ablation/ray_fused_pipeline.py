@@ -33,10 +33,10 @@ from rich.progress import (
 )
 
 
-DEFAULT_REPO_ROOT = Path("/scratch/zhoul0e/ReGraphv2")
-DEFAULT_DATASET_PATH = Path("/scratch/zhoul0e/Dataset-1")
-DEFAULT_SMOKE_DATASET_PATH = Path("/scratch/zhoul0e/Dataset-smoketest")
-DEFAULT_CACHE_ROOT = Path("/scratch/zhoul0e/regraph_cache")
+DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DATASET_PATH = DEFAULT_REPO_ROOT / "IR" / "Dataset-1-new" / "Dataset-1"
+DEFAULT_SMOKE_DATASET_PATH = DEFAULT_REPO_ROOT / "IR" / "Dataset-smoketest"
+DEFAULT_CACHE_ROOT = DEFAULT_REPO_ROOT / ".cache" / "regraph"
 SPLITS = ("train", "validation", "test")
 CANONICALIZE_PASSES_BY_OPT_LEVEL = {
     "-Oc": (

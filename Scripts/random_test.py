@@ -7,8 +7,8 @@ from datasets import load_from_disk
 import time
 
 # Load the BPE tokenizer
-tokenizer_path = "/home/damaoooo/Downloads/regraphv2/DataProcess/output_tokenizer/llvm_ir_bpe.json"
-dataset_path = "/home/damaoooo/Downloads/regraphv2/DataProcess/output_corpus/ir_corpus"
+tokenizer_path = "/path/to/rell/DataProcess/output_tokenizer/llvm_ir_bpe.json"
+dataset_path = "/path/to/rell/DataProcess/output_corpus/ir_corpus"
 
 def count_tokens_batch(examples, tokenizer):
     """Count tokens for a batch of examples using tokenizer"""

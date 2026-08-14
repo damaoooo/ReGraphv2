@@ -34,7 +34,7 @@ DEFAULT_DATASET2_LENGTH_STATS = {
     "min": 31,
     "max": 2048,
     "resolved_dataset_path": (
-        "/home/damaoooo/Downloads/regraphv2/IR/Dataset-2/db2_final_set/train_dataset_pool"
+        "/path/to/rell/IR/Dataset-2/db2_final_set/train_dataset_pool"
     ),
 }
 
@@ -463,7 +463,7 @@ def _summarize_metrics(
 
 def main(
     model_path: str = typer.Option(
-        "/home/damaoooo/Downloads/regraphv2/db1_model_cfg_ddg",
+        "/path/to/rell/db1_model_cfg_ddg",
         help="Checkpoint directory used for inference benchmarking.",
     ),
     tokenizer_path: Optional[str] = typer.Option(

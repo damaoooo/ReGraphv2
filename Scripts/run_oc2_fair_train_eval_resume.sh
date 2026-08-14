@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/home/damaoooo/Downloads/regraphv2}"
+REPO_ROOT="${REPO_ROOT:-/path/to/rell}"
 DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/IR/Dataset-1-Oc2-fused}"
 REFERENCE_TEST_SET="${REFERENCE_TEST_SET:-${REPO_ROOT}/IR/Dataset-1-new/Dataset-1-Oc-fused/test_final_set}"
 RUN_ROOT="${RUN_ROOT:-${REPO_ROOT}/runs/dataset1_oc2_fused}"
@@ -26,7 +26,7 @@ GPU_BATCH_SIZE="${GPU_BATCH_SIZE:-256}"
 REBUILD_COMMON_TEST="${REBUILD_COMMON_TEST:-1}"
 
 set +u
-source "/home/damaoooo/miniconda3/etc/profile.d/conda.sh"
+source "/path/to/miniconda3/etc/profile.d/conda.sh"
 conda activate ReLL
 set -u
 

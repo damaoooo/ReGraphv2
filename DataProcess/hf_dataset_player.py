@@ -3,7 +3,7 @@ import pandas as pd
 from typing import Optional, Dict, Any
 
 class HuggingFaceDatasetPlayer:
-    def __init__(self, dataset_path: str = "/home/damaoooo/Downloads/regraphv2/IR/hf_save"):
+    def __init__(self, dataset_path: str = "/path/to/rell/IR/hf_save"):
         """
         Initialize the dataset player with the path to the saved dataset.
         """

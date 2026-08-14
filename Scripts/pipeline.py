@@ -13,7 +13,7 @@ import multiprocessing
 from utils import console, normalize_clang_opt_level
 
 # Configuration
-BINARY_PATH = "/home/damaoooo/Downloads/regraphv2/Binaries"
+BINARY_PATH = "/path/to/rell/Binaries"
 
 app = typer.Typer()
 

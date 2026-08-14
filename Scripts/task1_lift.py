@@ -23,8 +23,8 @@ from utils import console, ensure_directory, file_exists_and_not_empty
 
 # Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BINARY_PATH = "/home/damaoooo/Downloads/regraphv2/Binaries"
-IDA_PATH = "/home/damaoooo/ida-pro-9.3"  # Update this path to your IDA Pro installation
+BINARY_PATH = "/path/to/rell/Binaries"
+IDA_PATH = "/path/to/ida-pro"  # Update this path to your IDA Pro installation
 LOG_PATH = os.path.join(SCRIPT_DIR, "lift_task1_log.txt")
 LIFT_BACKENDS = {"ida", "ghidra"}
 

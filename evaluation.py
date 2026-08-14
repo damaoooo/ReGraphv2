@@ -836,7 +836,7 @@ def main(
         if tokenizer_path:
             tokenizer = load_tokenizer(str(tokenizer_path))
         else:
-            default_tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
+            default_tokenizer_path = "/path/to/rell/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
             tokenizer = load_tokenizer(default_tokenizer_path)
 
         console.print(f"[blue]Graph branches: cfg={use_cfg}, ddg={use_ddg}[/blue]")

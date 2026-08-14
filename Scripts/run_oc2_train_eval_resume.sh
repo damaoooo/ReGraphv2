@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="/home/damaoooo/Downloads/regraphv2"
+REPO_ROOT="/path/to/rell"
 DATASET_ROOT="${REPO_ROOT}/IR/Dataset-1-Oc2-fused"
 RUN_ROOT="${REPO_ROOT}/runs/dataset1_oc2_fused"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
@@ -24,7 +24,7 @@ EMBEDDINGS_PATH="${RUN_ROOT}/${TEST_TAG}_full_embeddings_cfg_ddg_${RUN_ID}.pth"
 MARKDOWN_PATH="${RUN_ROOT}/${TEST_TAG}_full_results_${RUN_ID}.md"
 
 set +u
-source "/home/damaoooo/miniconda3/etc/profile.d/conda.sh"
+source "/path/to/miniconda3/etc/profile.d/conda.sh"
 conda activate ReLL
 set -u
 

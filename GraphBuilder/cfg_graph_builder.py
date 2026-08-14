@@ -187,9 +187,9 @@ class CFGGraphBuilder:
 
 # Example usage:
 if __name__ == "__main__":
-    tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
-    llvm_ir_path = "/home/damaoooo/Downloads/LinkerLocalityTest/code_sample/code_sample/sample_code_functions/792f695c859f77c25bb5261bff3310baf4781796.ll"
-    dot_file_path = "/home/damaoooo/Downloads/LinkerLocalityTest/code_sample/code_sample/sample_code_functions/cfg_a4047ae365ca99672328c618e5b052b8343d31879b0a1090eda19891175de006.dot"
+    tokenizer_path = "/path/to/rell/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
+    llvm_ir_path = "/path/to/LinkerLocalityTest/code_sample/code_sample/sample_code_functions/792f695c859f77c25bb5261bff3310baf4781796.ll"
+    dot_file_path = "/path/to/LinkerLocalityTest/code_sample/code_sample/sample_code_functions/cfg_a4047ae365ca99672328c618e5b052b8343d31879b0a1090eda19891175de006.dot"
     tokenizer = load_tokenizer(tokenizer_path)
     builder = CFGGraphBuilder(tokenizer, llvm_ir_path, dot_file_path)
     cfg_edges = builder.build_cfg_edges()

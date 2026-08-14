@@ -252,7 +252,7 @@ def main(
         tokenizer = load_tokenizer(str(tokenizer_path))
     else:
         # 使用默认的tokenizer路径（假设与测试代码中相同）
-        default_tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
+        default_tokenizer_path = "/path/to/rell/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
         tokenizer = load_tokenizer(default_tokenizer_path)
 
 

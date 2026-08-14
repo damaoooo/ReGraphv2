@@ -171,10 +171,10 @@ class DataDependencyGraphBuilder:
 
 
 def main():
-    dot_file = "/home/damaoooo/Downloads/regraphv2/DataProcess/ddg_exporter/build/id_graph.movelim.dot"
-    instrumented = "/home/damaoooo/Downloads/regraphv2/DataProcess/ddg_exporter/build/instrumented.ll"
-    origin_ir = "/home/damaoooo/Downloads/regraphv2/DataProcess/ddg_exporter/test.ll"
-    tokenizer_path = "/home/damaoooo/Downloads/regraphv2/DataProcess/output_tokenizer/llvm_ir_bpe.json"
+    dot_file = "/path/to/rell/DataProcess/ddg_exporter/build/id_graph.movelim.dot"
+    instrumented = "/path/to/rell/DataProcess/ddg_exporter/build/instrumented.ll"
+    origin_ir = "/path/to/rell/DataProcess/ddg_exporter/test.ll"
+    tokenizer_path = "/path/to/rell/DataProcess/output_tokenizer/llvm_ir_bpe.json"
 
     tokenizer = load_tokenizer(tokenizer_path)
 

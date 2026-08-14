@@ -199,10 +199,10 @@ def compute_group_ids(data: Dict[int, List[int]]) -> Dict[int, int]:
 if __name__ == "__main__":
     # 测试代码
     import pickle
-    tokenizer = load_tokenizer("/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json")
-    dataset_pool = load_dataset("/home/damaoooo/Downloads/regraphv2/IR/train_dataset_pool")
-    dataset = load_dataset("/home/damaoooo/Downloads/regraphv2/IR/train_task_dataset")
-    with open("/home/damaoooo/Downloads/regraphv2/IR/train_positive_map.pkl", "rb") as f:
+    tokenizer = load_tokenizer("/path/to/rell/Tokenizer/output_tokenizer/llvm_ir_bpe.json")
+    dataset_pool = load_dataset("/path/to/rell/IR/train_dataset_pool")
+    dataset = load_dataset("/path/to/rell/IR/train_task_dataset")
+    with open("/path/to/rell/IR/train_positive_map.pkl", "rb") as f:
         map_file = pickle.load(f)
     
     group_id_mapping = compute_group_ids(map_file)
