@@ -135,36 +135,55 @@ ARTIFACT_EVALUATION.md detailed reproduction guide
 
 ---
 
-## 📦 External Artifact Package
+## 📦 External Artifact Packages
 
-The compact artifact package contains the minimal data and model files needed
-for the main reproduction path:
+The prepared datasets and trained weights are distributed as two separate
+archives because they are too large for Git. Anonymous download links will be
+added here after the archives are uploaded.
+
+| Archive | Contents | Size | SHA-256 |
+| --- | --- | ---: | --- |
+| `rell_sec27_data_2026-08-24.tar.zst` | Prepared ReLL and Qwen evaluation/training data | 3.5 GB | `249f38e2f34a9a5b0ecb24ed6e5f1217d672a6bd2661a4206cfe962ef4a860dc` |
+| `rell_sec27_weights_2026-08-24.tar.zst` | ReLL model and Qwen IR/assembly LoRA adapters | 1.3 GB | `7f87553a4ca55db9b16b90bd54a70c6fc9f49df2df929dff432933f4995ffdd5` |
+
+Download both archives, their manifests, and `SHA256SUMS`. On Linux, verify
+the downloads with:
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+On macOS, use:
+
+```bash
+shasum -a 256 -c SHA256SUMS
+```
+
+Then unpack both archives into the root of this repository:
+
+```bash
+cd /path/to/rell
+tar -I zstd -xf /path/to/rell_sec27_data_2026-08-24.tar.zst -C .
+tar -I zstd -xf /path/to/rell_sec27_weights_2026-08-24.tar.zst -C .
+```
+
+The downloads require about 4.8 GB. The extracted files require about 30 GB;
+we recommend at least 40 GB of available disk space while downloading and
+unpacking them.
+
+The data archive provides the three Dataset-1 `Oc` final sets used by ReLL and
+the prepared normalized-IR and assembly final sets used by the Qwen case study.
+The weights archive provides:
 
 ```text
-IR/Dataset-1-Oc-fused/train_final_set
-IR/Dataset-1-Oc-fused/validation_final_set
-IR/Dataset-1-Oc-fused/test_final_set_len128_hashdedup
 runs/dataset1_oc_fused/model_cfg_ddg
-selected result markdown snapshots
+case_studies/qwen3_embedding/weights/qwen3_0p6b_ir_lora
+case_studies/qwen3_embedding/weights/qwen3_0p6b_asm_lora
 ```
 
-The archive is distributed separately because the encoded datasets and model
-weights are too large for Git.  The current release is
-`rell_artifact_core.tar.zst` (2.4 GB; SHA-256
-`13d153477b6b6bacf1a54da153825ca7d67968816c9ac15cc430a42c51c27400`).
-Its anonymous download URL must be added here after the archive is uploaded.
-
-Unpack it from the repository root:
-
-```bash
-tar -I zstd -xf rell_artifact_core.tar.zst -C /path/to/rell
-```
-
-If the archive was created with gzip fallback:
-
-```bash
-tar -zxf rell_artifact_core.tar.gz -C /path/to/rell
-```
+The ReLL quick reproduction below does not require a Qwen model. The two Qwen
+adapters use `Qwen/Qwen3-Embedding-0.6B` as their base model; the base model is
+downloaded separately from Hugging Face and is not duplicated in this release.
 
 ### Dataset flow
 
@@ -211,7 +230,7 @@ Notes:
 
 ## ⚡ Quick Reproduction
 
-After unpacking the artifact package:
+After unpacking both artifact packages:
 
 ```bash
 mkdir -p runs/artifact_eval
@@ -366,7 +385,7 @@ reproduction should keep the strict default.
 | Pipeline latency benchmark | `Scripts/benchmark_pipeline_latency.py` |
 
 Latency code is included, but local timing results are not shipped in the
-compact package.  See:
+external archives.  See:
 
 📄 **[`Scripts/PIPELINE_LATENCY_BENCHMARK.md`](Scripts/PIPELINE_LATENCY_BENCHMARK.md)**
 
@@ -374,7 +393,7 @@ compact package.  See:
 
 ## 🧾 Artifact Packaging
 
-To rebuild the compact artifact package locally:
+The following maintainer utility builds an anonymized core ReLL bundle:
 
 ```bash
 bash Scripts/pack_artifact_release.sh \
@@ -384,8 +403,9 @@ bash Scripts/pack_artifact_release.sh \
 
 The packer rewrites author-specific paths in both metadata and Arrow datasets,
 checks the staged files for identity markers, and records the archive's SHA-256
-digest in its manifest.  The generated archive is meant for anonymous external
-storage, not for committing to GitHub.
+digest in its manifest. It is not needed for evaluation. The released data and
+weights archives above additionally contain the prepared Qwen case-study data
+and adapters.
 
 ---
 

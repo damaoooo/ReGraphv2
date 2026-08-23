@@ -21,25 +21,42 @@ larger experiments require substantially more compute and a configured lifting
 backend.  Ghidra is provided for open-source lifting; the historical IDA backend
 and IDA latency benchmark remain available.
 
-## External Artifact Package
+## External Artifact Packages
 
-The core package produced by `Scripts/pack_artifact_release.sh` has this layout:
+The data and weights are provided as separate archives. Anonymous download
+links will be listed in the main README after upload.
+
+| Archive | Size | SHA-256 |
+| --- | ---: | --- |
+| `rell_sec27_data_2026-08-24.tar.zst` | 3.5 GB | `249f38e2f34a9a5b0ecb24ed6e5f1217d672a6bd2661a4206cfe962ef4a860dc` |
+| `rell_sec27_weights_2026-08-24.tar.zst` | 1.3 GB | `7f87553a4ca55db9b16b90bd54a70c6fc9f49df2df929dff432933f4995ffdd5` |
+
+The data archive contains:
 
 ```text
 IR/Dataset-1-Oc-fused/train_final_set
 IR/Dataset-1-Oc-fused/validation_final_set
 IR/Dataset-1-Oc-fused/test_final_set_len128_hashdedup
-runs/dataset1_oc_fused/model_cfg_ddg
-runs/dataset1_oc_fused/oc_test_results_len128_hashdedup.md
-runs/dataset1_oc_fused/common_oc_csv_results.md
-runs/dataset1_oc_graph_ablation/seed_eval_10_summary.md
-runs/dataset_vulnerability_regraph/results_bitnorm_fusion_max.md
-runs/dataset_vulnerability_regraph/vuln_search_big_table.md
+IR/Dataset-1-Oc-qwen-text-fused/train_final_set
+IR/Dataset-1-Oc-qwen-text-fused/validation_final_set
+IR/Dataset-1-Oc-qwen-text-fused/test_final_set_csv_len128_text_hashdedup
+IR/Dataset-1-ASM-Qwen-text/train_final_set
+IR/Dataset-1-ASM-Qwen-text/validation_final_set
+IR/dataset-1-asm/test_final_set_common_oc_csv_hashdedup_qwen_text
 ```
 
-The release archive is `rell_artifact_core.tar.zst` (SHA-256
-`13d153477b6b6bacf1a54da153825ca7d67968816c9ac15cc430a42c51c27400`).
-Its anonymous download URL must be listed in the main README after upload.
+The weights archive contains:
+
+```text
+runs/dataset1_oc_fused/model_cfg_ddg
+case_studies/qwen3_embedding/weights/qwen3_0p6b_ir_lora
+case_studies/qwen3_embedding/weights/qwen3_0p6b_asm_lora
+```
+
+Intermediate checkpoints, optimizer states, merged copies of the Qwen base
+model, and cached evaluation embeddings are not included. They are not needed
+for the main reproduction path. Frozen result tables remain in the source
+repository next to the scripts that consume them.
 
 The Dataset-1 `Oc` final sets are already filtered for short/uninformative
 functions and exact input duplicates.  The test data flow is:
@@ -59,13 +76,24 @@ pool examples: 211,018
 anchors:       164,969
 ```
 
-Unpack the package from the repository root:
+Download both archives, their manifests, and `SHA256SUMS`. Verify the downloads
+on Linux with:
 
 ```bash
-tar -I zstd -xf rell_artifact_core.tar.zst -C /path/to/rell
+sha256sum -c SHA256SUMS
 ```
 
-If the package was created with gzip fallback, replace `-I zstd` with `-z`.
+On macOS, use `shasum -a 256 -c SHA256SUMS`. Then unpack both archives from the
+repository root:
+
+```bash
+cd /path/to/rell
+tar -I zstd -xf /path/to/rell_sec27_data_2026-08-24.tar.zst -C .
+tar -I zstd -xf /path/to/rell_sec27_weights_2026-08-24.tar.zst -C .
+```
+
+The two downloads occupy about 4.8 GB and expand to about 30 GB. At least 40 GB
+of available disk space is recommended while downloading and extracting them.
 
 ## Environment
 
@@ -87,7 +115,7 @@ scripts is `/path/to/ida-pro/idat`.
 
 ## Main Evaluation
 
-After unpacking the core artifact package, run:
+After unpacking both artifact packages, run:
 
 ```bash
 mkdir -p runs/artifact_eval
@@ -172,7 +200,7 @@ bash Scripts/train_test_oc_graph_ablation.sh all \
   --resume
 ```
 
-The checked local result snapshot is packaged as:
+The checked result snapshot is included in the source repository as:
 
 ```text
 runs/dataset1_oc_graph_ablation/seed_eval_10_summary.md
@@ -228,7 +256,7 @@ python Scripts/evaluate_dataset_vulnerability_bitnorm_fusion.py \
   --mode max
 ```
 
-The compact artifact package includes result snapshots:
+The source repository includes the frozen result snapshots:
 
 ```text
 runs/dataset_vulnerability_regraph/results_bitnorm_fusion_max.md
@@ -269,11 +297,12 @@ curves from the frozen tables, run:
 python case_studies/qwen3_embedding/scripts/plot_case_study.py
 ```
 
-The Qwen base models are downloaded from Hugging Face. Fine-tuned weights and
-the processed evaluation data belong in the external artifact package rather
-than the Git repository.
+The Qwen base models are downloaded from Hugging Face. The external weights
+archive provides the two fine-tuned 0.6B LoRA adapters, and the external data
+archive provides the processed IR and assembly final sets. The base 0.6B and 4B
+models are not duplicated in the artifact.
 
-## Rebuilding the External Package
+## Rebuilding a Core External Package
 
 Run the package builder with a Python environment that includes `datasets`:
 
@@ -283,9 +312,10 @@ bash Scripts/pack_artifact_release.sh \
   --python /path/to/python
 ```
 
-Before compression, the builder rewrites author-specific paths in the saved
-Arrow datasets and text metadata.  It then scans the complete staged package
-for identity markers and records the archive's SHA-256 digest in the manifest.
+This maintainer utility builds the core ReLL data/model bundle. Reviewers do not
+need to run it. Before compression, it rewrites author-specific paths in saved
+Arrow datasets and text metadata, scans the staged package for identity
+markers, and records the archive's SHA-256 digest in the manifest.
 
 ## Notes
 
