@@ -1,8 +1,9 @@
 # ReLL Artifact Evaluation Guide
 
-This branch is the artifact-evaluation release for ReLL.  The GitHub
-branch contains code, scripts, and documentation only.  Dataset and model files
-are packaged separately and should be distributed through external storage.
+This branch accompanies *Semantic Normalization for Binary Function Similarity
+Detection: Do We Always Need Large Models?*  It contains code, scripts, and
+documentation.  Dataset and model files are packaged separately because they
+are too large for Git.
 
 ## Scope
 
@@ -36,8 +37,22 @@ runs/dataset_vulnerability_regraph/results_bitnorm_fusion_max.md
 runs/dataset_vulnerability_regraph/vuln_search_big_table.md
 ```
 
+The release archive is `rell_artifact_core.tar.zst` (SHA-256
+`13d153477b6b6bacf1a54da153825ca7d67968816c9ac15cc430a42c51c27400`).
+Its anonymous download URL must be listed in the main README after upload.
+
 The Dataset-1 `Oc` final sets are already filtered for short/uninformative
-functions and exact hash collisions.  The main test split contains:
+functions and exact input duplicates.  The test data flow is:
+
+```text
+264,548 functions listed by the Dataset-1 test metadata
+261,962 functions matched to available lifted inputs
+212,402 encoded records after extraction and exact input deduplication
+211,018 records after removing 1,384 functions with at most 128 tokens
+164,969 query anchors with at least one valid positive match
+```
+
+The final main test split therefore contains:
 
 ```text
 pool examples: 211,018
@@ -257,6 +272,20 @@ python case_studies/qwen3_embedding/scripts/plot_case_study.py
 The Qwen base models are downloaded from Hugging Face. Fine-tuned weights and
 the processed evaluation data belong in the external artifact package rather
 than the Git repository.
+
+## Rebuilding the External Package
+
+Run the package builder with a Python environment that includes `datasets`:
+
+```bash
+bash Scripts/pack_artifact_release.sh \
+  --output-dir /path/to/artifact_output \
+  --python /path/to/python
+```
+
+Before compression, the builder rewrites author-specific paths in the saved
+Arrow datasets and text metadata.  It then scans the complete staged package
+for identity markers and records the archive's SHA-256 digest in the manifest.
 
 ## Notes
 

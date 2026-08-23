@@ -1,6 +1,8 @@
 # ReLL
 
-> **Semantic normalization for binary function similarity detection.**
+> Artifact for *Semantic Normalization for Binary Function Similarity
+> Detection: Do We Always Need Large Models?*
+>
 > Lift binaries to LLVM IR, canonicalize away architecture/compiler noise, then
 > learn retrieval-ready function embeddings with IR tokens + CFG/DDG graphs.
 
@@ -146,6 +148,12 @@ runs/dataset1_oc_fused/model_cfg_ddg
 selected result markdown snapshots
 ```
 
+The archive is distributed separately because the encoded datasets and model
+weights are too large for Git.  The current release is
+`rell_artifact_core.tar.zst` (2.4 GB; SHA-256
+`13d153477b6b6bacf1a54da153825ca7d67968816c9ac15cc430a42c51c27400`).
+Its anonymous download URL must be added here after the archive is uploaded.
+
 Unpack it from the repository root:
 
 ```bash
@@ -158,12 +166,24 @@ If the archive was created with gzip fallback:
 tar -zxf rell_artifact_core.tar.gz -C /path/to/rell
 ```
 
-The packaged main test split contains:
+### Dataset flow
+
+The Dataset-1 test metadata lists 264,548 functions.  The pipeline matches
+261,962 of them to the available lifted inputs.  Function extraction and exact
+input deduplication produce 212,402 encoded records.  We then remove 1,384
+records with at most 128 tokens because they contain too little information for
+meaningful retrieval, leaving the final pool used in the paper:
 
 ```text
 pool examples: 211,018
 anchors:       164,969
 ```
+
+The 164,969 anchors are the pool entries that retain at least one valid
+cross-setting positive match.  Evaluation samples candidate pools from the
+211,018 entries and reports retrieval metrics over these anchors.  The
+filtering summary and retained indices are included with the packaged test
+split.
 
 ---
 
@@ -358,11 +378,14 @@ To rebuild the compact artifact package locally:
 
 ```bash
 bash Scripts/pack_artifact_release.sh \
-  --output-dir /path/to/artifact_output
+  --output-dir /path/to/artifact_output \
+  --python /path/to/python
 ```
 
-The generated archive is meant for external storage such as Google Drive, not
-for committing to GitHub.
+The packer rewrites author-specific paths in both metadata and Arrow datasets,
+checks the staged files for identity markers, and records the archive's SHA-256
+digest in its manifest.  The generated archive is meant for anonymous external
+storage, not for committing to GitHub.
 
 ---
 
