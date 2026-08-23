@@ -23,8 +23,9 @@ and IDA latency benchmark remain available.
 
 ## External Artifact Packages
 
-The data and weights are provided as separate archives. Anonymous download
-links will be listed in the main README after upload.
+The data and weights are provided as separate archives. Download both archives,
+their manifests, and `SHA256SUMS` from the
+[anonymous OSF artifact page](https://osf.io/e6a27/files/dropbox?view_only=cef76fc48c0246ca8db864e24258075e).
 
 | Archive | Size | SHA-256 |
 | --- | ---: | --- |

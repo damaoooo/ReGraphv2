@@ -138,8 +138,9 @@ ARTIFACT_EVALUATION.md detailed reproduction guide
 ## 📦 External Artifact Packages
 
 The prepared datasets and trained weights are distributed as two separate
-archives because they are too large for Git. Anonymous download links will be
-added here after the archives are uploaded.
+archives because they are too large for Git. Download both archives, their
+manifests, and `SHA256SUMS` from the
+[anonymous OSF artifact page](https://osf.io/e6a27/files/dropbox?view_only=cef76fc48c0246ca8db864e24258075e).
 
 | Archive | Contents | Size | SHA-256 |
 | --- | --- | ---: | --- |
