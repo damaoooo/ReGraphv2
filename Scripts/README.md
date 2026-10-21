@@ -49,8 +49,8 @@ python Scripts/pipeline.py task3 --input-path IR/xxx --resume
 ```
 
 - task1 在 `--output` 下镜像输入目录结构；失败记录写到 `logs/lift_task1_log.txt`，`ida2llvm.py` 的详细日志写到 `logs/ida2llvm.log`。
-- **论文（SEC'27）用的是 `Oc`**（第一版保守 canonicalization），生成训练/评估数据一律用 `--opt-level Oc`；`Oc2`/`Oc3` 是效果不好的探索设置，不要用。
-- task2 在原目录把 `x.ll` 写成 `x.bc`；`--opt-level` 支持 `O0/O1/O2/O3/Os/Og/Oz/Oc/Oc2`，`--arch auto` 按文件名推断 `-m32/-m64`。
+- **论文（SEC'27）用的是 `Oc`**（保守 canonicalization），生成训练/评估数据一律用 `--opt-level Oc`。
+- task2 在原目录把 `x.ll` 写成 `x.bc`；`--opt-level` 支持 `O0/O1/O2/O3/Os/Og/Oz/Oc`，`--arch auto` 按文件名推断 `-m32/-m64`。
 - task3 为每个 `x.bc` 生成 `x_functions/`。
 - 所有任务都支持 `--resume` 和 `--workers`。
 

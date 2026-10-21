@@ -45,28 +45,9 @@ TASK2_CANONICALIZE_PASSES_BY_OPT_LEVEL = {
         "adce",
         "simplifycfg",
     ),
-    "-Oc2": (
-        "sroa",
-        "mem2reg",
-        "instcombine<no-verify-fixpoint;max-iterations=1>",
-        "simplifycfg",
-        "early-cse",
-        "sccp",
-        "correlated-propagation",
-        "jump-threading",
-        "simplifycfg",
-        "reassociate",
-        "instcombine<no-verify-fixpoint;max-iterations=1>",
-        "gvn",
-        "dce",
-        "bdce",
-        "adce",
-        "simplifycfg",
-    ),
 }
 TASK2_CANONICALIZE_CONFIG_TOKENS = {
     "-Oc": "canonicalize_v1_noattrs_noinline_noglobal",
-    "-Oc2": "canonicalize_v2_instcombine1_nofixpoint_noattrs_noinline_noglobal",
 }
 ILLEGAL_FUNCTION_BITCAST_RE = re.compile(
     r"^\s*(?P<name>%\"[^\"]+\"|%[-A-Za-z0-9$._]+)\s*=\s*bitcast\s+"
@@ -293,7 +274,7 @@ def main(
     opt_level: str = typer.Option(
         "O3",
         "--opt-level",
-        help="Task 2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oz, Oc, or Oc2",
+        help="Task 2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oz, or Oc",
     ),
     arch: str = typer.Option(
         "auto",

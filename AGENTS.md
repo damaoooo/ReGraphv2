@@ -34,7 +34,7 @@ lsp_start_server(server_id="bash", workspace_root="/home/damaoooo/Downloads/regr
 - `Scripts/`: 数据生成、lift、reopt 脚本；`Scripts/train/` 是训练/评估包装脚本，`Scripts/baselines/` 放基线数据生成（如 `ida2asm.py` 汇编基线）。
 - `Scripts/pipeline.py`: 传统 Typer pipeline，串起 task1/task2/task3/task4。
 - `Scripts/task1_lift.py`: 用 IDA 生成 `.i64`，再调用 `Scripts/ida2llvm.py` lift 到 LLVM IR。IDA 路径硬编码为 `/home/damaoooo/ida-pro-9.3`。
-- `Scripts/task2_reoptimize.py`: `.ll -> .bc`，支持 `O0/O1/O2/O3/Os/Og/Oz/Oc/Oc2`，其中 `Oc/Oc2` 是保守 canonicalization pass 组合。
+- `Scripts/task2_reoptimize.py`: `.ll -> .bc`，支持 `O0/O1/O2/O3/Os/Og/Oz/Oc`，其中 `Oc` 是论文使用的保守 canonicalization pass 组合。
 - `Scripts/task3_extract.py`: 对 `.bc` 调 `Scripts/split_llvm_ir.sh` 提取函数级 IR。
 - `Scripts/task4_recompile.py`: `.bc -> .re`，用于把优化后的 bitcode 重新编译成可执行/对象侧产物。
 - `DataProcess/`: 从函数级 LLVM IR 构建 HuggingFace dataset。`cli.py` 是 Typer CLI，`dataset_builder_new.py` 串起 `FileProcessor` 和 `ParallelProcessor`，`file_processor.py` 生成 token、CFG、DDG。
@@ -103,7 +103,7 @@ bash Scripts/train/train_test_oc_graph_ablation.sh ddg
 
 大规模 Dataset-1 fused 数据（Ray / Slurm，多机）在 `rope-gnn-cluster` 分支上维护和运行（Shaheen 集群），本分支不再保留 `Scripts/ray_opt_ablation/`。需要查看或修改 fused 流水线时切到该分支。
 
-论文（SEC'27 artifact）使用的是 `Oc`：`sroa, mem2reg, simplifycfg, early-cse, sccp, correlated-propagation, jump-threading, simplifycfg, reassociate, gvn, dce, bdce, adce, simplifycfg`，定义在 `Scripts/task2_reoptimize.py`，与 `sec27-artifact` / `rope-gnn-cluster` 分支一致。生成训练/评估数据一律用 `--opt-level Oc`；`Oc2` / `Oc3` 是效果不好的探索设置，不要用。在 `rope-gnn-cluster` 上生成 `Oc` 数据时确保没有 export `REGRAPH_IR_CANONICALIZATION`（Oc3 的位宽规整会通过它作用到 Oc）。这些都不等同于 clang `-O?`。
+论文（SEC'27 artifact）使用的是 `Oc`：`sroa, mem2reg, simplifycfg, early-cse, sccp, correlated-propagation, jump-threading, simplifycfg, reassociate, gvn, dce, bdce, adce, simplifycfg`，定义在 `Scripts/task2_reoptimize.py`，与 `sec27-artifact` 分支一致。生成训练/评估数据一律用 `--opt-level Oc`，它不等同于 clang `-O?`。
 
 ## 推理和 API
 

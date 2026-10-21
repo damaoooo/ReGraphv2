@@ -121,7 +121,7 @@ def task2(
     opt_level: str = typer.Option(
         "O3",
         "--opt-level",
-        help="Task 2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oz, Oc, Oc2",
+        help="Task 2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oz, Oc",
     ),
     arch: str = typer.Option(
         "auto",
@@ -244,7 +244,7 @@ def pipeline(
     opt_level: str = typer.Option(
         "O3",
         "--opt-level",
-        help="Task 2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oz, Oc, Oc2",
+        help="Task 2 optimization level, e.g. O0, O1, O2, O3, Os, Og, Oz, Oc",
     ),
     arch: str = typer.Option(
         "auto",
