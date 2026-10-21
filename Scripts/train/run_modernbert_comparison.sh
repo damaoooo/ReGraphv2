@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CONDA_ENV="${CONDA_ENV:-ReLL}"
 MODE="${1:---cached-gnn}"
 case "${MODE}" in
   --cached-gnn|--matched-100k) ;;
@@ -22,7 +21,7 @@ TOKENIZER="${ROOT}/IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json"
 TRAIN="${ROOT}/IR/dataset-1/train_final_set"
 TEST="${ROOT}/IR/dataset-1/test_final_set"
 MODEL="${RUN_ROOT}/model_cfg_ddg"
-PYTHON=(conda run -n "${CONDA_ENV}" --no-capture-output python -u)
+PYTHON=(uv run --project "${ROOT}" --locked --extra fa2 python -u)
 ARCHIVE_ROOT="${ARCHIVE_ROOT:-/mnt/nas/ReLL-archives/2026-10-21-roformer-retirement}"
 BASELINE_ARCHIVE="${BASELINE_ARCHIVE:-${ARCHIVE_ROOT}/roformer-gnn.tar}"
 if [[ -n "${BASELINE_EMBEDDINGS:-}" ]]; then

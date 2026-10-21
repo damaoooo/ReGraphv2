@@ -1,0 +1,73 @@
+[project]
+name = "rell"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    # Explicit runtime dependencies allow per-package CUDA index routing.
+    "nvidia-cublas", "nvidia-cuda-cupti", "nvidia-cuda-nvrtc", "nvidia-cuda-runtime",
+    "nvidia-cudnn-cu13", "nvidia-cufft", "nvidia-cufile", "nvidia-curand",
+    "nvidia-cusolver", "nvidia-cusparse", "nvidia-cusparselt-cu13", "nvidia-nccl-cu13",
+    "nvidia-nvjitlink", "nvidia-nvshmem-cu13", "nvidia-nvtx", "triton",
+    "torch==2.10.0+cu130",
+    "transformers==4.57.6",
+    "tokenizers==0.22.2",
+    "datasets==4.6.1",
+    "pyarrow==23.0.0",
+    "accelerate==1.13.0",
+    "bitsandbytes==0.49.2",
+    "torch-geometric==2.7.0",
+    "torch-scatter==2.1.2+pt210cu130",
+    "torch-sparse==0.6.18+pt210cu130",
+    "torch-cluster==1.6.3+pt210cu130",
+    "pyg-lib==0.6.0+pt210cu130",
+    "numpy==2.4.2",
+    "numba==0.64.0",
+    "tensorboard==2.20.0",
+    "typer==0.23.1",
+    "rich==14.3.2",
+    "scikit-learn==1.8.0",
+]
+
+[project.optional-dependencies]
+fa2 = ["flash-attn==2.8.3.post2", "einops==0.8.2", "setuptools==80.10.2", "packaging==26.0", "ninja"]
+pipeline = ["ray==2.53.0", "llvmlite==0.46.0", "pygraphviz==1.14", "networkx==3.6.1", "pebble==5.2.0", "pandas==3.0.0"]
+api = ["fastapi==0.129.0", "uvicorn==0.40.0", "python-multipart==0.0.22"]
+notebook = ["ipykernel==7.2.0", "matplotlib==3.10.8", "seaborn==0.13.2"]
+
+[dependency-groups]
+dev = ["pytest==9.0.2"]
+
+[tool.uv]
+package = false
+find-links = ["https://data.pyg.org/whl/torch-2.10.0+cu130.html"]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+nvidia-cublas = { index = "pytorch-cu130" }
+nvidia-cuda-cupti = { index = "pytorch-cu130" }
+nvidia-cuda-nvrtc = { index = "pytorch-cu130" }
+nvidia-cuda-runtime = { index = "pytorch-cu130" }
+nvidia-cudnn-cu13 = { index = "pytorch-cu130" }
+nvidia-cufft = { index = "pytorch-cu130" }
+nvidia-cufile = { index = "pytorch-cu130" }
+nvidia-curand = { index = "pytorch-cu130" }
+nvidia-cusolver = { index = "pytorch-cu130" }
+nvidia-cusparse = { index = "pytorch-cu130" }
+nvidia-cusparselt-cu13 = { index = "pytorch-cu130" }
+nvidia-nccl-cu13 = { index = "pytorch-cu130" }
+nvidia-nvjitlink = { index = "pytorch-cu130" }
+nvidia-nvshmem-cu13 = { index = "pytorch-cu130" }
+nvidia-nvtx = { index = "pytorch-cu130" }
+triton = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn"
+version = "2.8.3.post2"
+requires-dist = ["torch", "einops"]

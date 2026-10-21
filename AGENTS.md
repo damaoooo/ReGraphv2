@@ -4,13 +4,13 @@
 
 这是一个面向 binary function similarity / retrieval 的研究代码库。核心思路是把二进制函数 lift 到 LLVM IR，经过可选 re-optimization/canonicalization 后，提取函数级 IR、CFG、DDG，再用 RoFormer + MoCo 对比学习训练函数嵌入。当前代码重点在 CFG/DDG 图分支、优化级别消融、Dataset-1/Dataset-2 的检索评估。
 
-当前主要 Python 环境是 conda 的 `ReLL`。运行长任务、训练、评估、Ray pipeline 前优先使用：
+当前分支使用 uv 管理独立 `.venv`；原 conda `ReLL` 保留作回退，不要修改或删除。训练和评估优先使用：
 
 ```bash
-conda run -n ReLL python ...
+uv run --locked --extra fa2 python ...
 ```
 
-或者在 shell 中 `conda activate ReLL` 后再运行。不要假设系统 Python 依赖完整。
+数据生成使用 `--extra pipeline`，API 使用 `--extra api`；组合功能时同时传入对应 extra。首次 FA2 构建必须选择兼容 Torch cu130 的 CUDA Toolkit，本机用 `CUDA_HOME=/usr/local/cuda-13.1`，不要使用默认 CUDA 12.9。详见 `docs/TRAINING_STEPS_GUIDE.md`。不要假设系统 Python 依赖完整。
 
 ## 先读这些
 

@@ -1,6 +1,6 @@
 # Scripts
 
-所有命令都从仓库根目录执行，Python 用 `conda run -n ReLL python ...`。
+所有命令都从仓库根目录执行。训练/评估使用 `uv run --locked --extra fa2 python ...`；数据管线使用 `uv run --locked --extra pipeline python ...`。环境配置见 `../docs/TRAINING_STEPS_GUIDE.md`。原 Conda `ReLL` 环境保留作回退，IDA 本地 SDK 仍需单独安装。
 
 ```text
 Scripts/

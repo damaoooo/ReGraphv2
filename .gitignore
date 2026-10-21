@@ -53,4 +53,5 @@ test.py
 *.eps
 runs/
 /data/
+.venv/
 tmp/

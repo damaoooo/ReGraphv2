@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-PYTHON_CMD=${PYTHON_CMD:-$(which python)}
+PYTHON_CMD=${PYTHON_CMD:-uv run --locked --extra fa2 python}
 
 steps=""
 max_length=2048
@@ -48,7 +48,7 @@ Options:
   -h, --help             Show this help.
 
 Environment:
-	PYTHON_CMD             Python runner. Default: output of `which python`
+	PYTHON_CMD             Python runner. Default: uv run --locked --extra fa2 python
 
 Example:
   bash Scripts/train/train_test_fused_opt.sh O0
