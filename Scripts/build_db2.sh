@@ -10,6 +10,6 @@ ${PYTHON_PATH} -m GraphBuilder.graph_generator "${DATASET_PATH}" # 这个命令�
 
 ${PYTHON_PATH} -m DataProcess.cli "${DATASET_PATH}" "${OUTPUT_PATH}/db2_raw_dataset" --num-processes 32 --parallel  --no-cache --use-hf
 
-${PYTHON_PATH} -m DataProcess.dataset_wash --dataset-path "${OUTPUT_PATH}/db2_raw_dataset" --output-path "${OUTPUT_PATH}/db2_wash_dataset" --tokenizer-path "/home/damaoooo/Datasets/IR/Dataset-1-all/train_corpus_tokenizer/llvm_ir_bpe.json"
+${PYTHON_PATH} -m DataProcess.dataset_wash --dataset-path "${OUTPUT_PATH}/db2_raw_dataset" --output-path "${OUTPUT_PATH}/db2_wash_dataset" --tokenizer-path "Tokenizer/output_tokenizer/llvm_ir_bpe.json"
 
 ${PYTHON_PATH} -m Pretrain.split_train_validation "${OUTPUT_PATH}/db2_wash_dataset" --base-path "${DATASET_PATH}" --train-ratio 1.0 --output-dir "${OUTPUT_PATH}/db2_final_set"

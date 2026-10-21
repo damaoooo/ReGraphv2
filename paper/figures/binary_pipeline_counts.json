@@ -1,0 +1,8 @@
+{
+  "total_binaries": 5489,
+  "i64_files": 5489,
+  "lifted_ll": 5455,
+  "reoptimized_bc": 5429,
+  "recompiled_re": 5420,
+  "source": "counted from Binaries/Dataset-1 and Binaries/Dataset-1-re on 2026-10-21 before Dataset-1-re was deleted"
+}

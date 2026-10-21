@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from xml.etree.ElementTree import Element, ElementTree, SubElement
 
@@ -7,6 +8,7 @@ from xml.etree.ElementTree import Element, ElementTree, SubElement
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_PATH = PROJECT_ROOT / "Binaries" / "Dataset-1"
 LIFT_PATH = PROJECT_ROOT / "Binaries" / "Dataset-1-re"
+COUNTS_JSON = PROJECT_ROOT / "paper" / "figures" / "binary_pipeline_counts.json"
 OUTPUT_SVG = PROJECT_ROOT / "paper" / "figures" / "binary_pipeline_sankey.svg"
 
 CANVAS_WIDTH = 252
@@ -324,13 +326,18 @@ def build_svg(total_cnt: int, lift_count: int, reopt_count: int, recompile_count
 
 
 def main() -> None:
-    if not SRC_PATH.exists():
-        raise FileNotFoundError(f"Dataset directory not found: {SRC_PATH}")
-    if not LIFT_PATH.exists():
-        raise FileNotFoundError(f"Lifted output directory not found: {LIFT_PATH}")
-
-    total_cnt, i64_cnt = count_binary_files(SRC_PATH)
-    lift_count, reopt_count, recompile_count = count_pipeline_outputs(LIFT_PATH)
+    if SRC_PATH.exists() and LIFT_PATH.exists():
+        total_cnt, i64_cnt = count_binary_files(SRC_PATH)
+        lift_count, reopt_count, recompile_count = count_pipeline_outputs(LIFT_PATH)
+    elif COUNTS_JSON.exists():
+        # Binaries/Dataset-1-re 已删除，使用删除前保存的计数
+        counts = json.loads(COUNTS_JSON.read_text())
+        total_cnt, i64_cnt = counts["total_binaries"], counts["i64_files"]
+        lift_count, reopt_count, recompile_count = (
+            counts["lifted_ll"], counts["reoptimized_bc"], counts["recompiled_re"]
+        )
+    else:
+        raise FileNotFoundError(f"Neither {SRC_PATH} + {LIFT_PATH} nor {COUNTS_JSON} found")
 
     print("Total binary files:", total_cnt)
     print("Total i64 files:", i64_cnt)
