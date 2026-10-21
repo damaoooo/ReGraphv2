@@ -90,6 +90,7 @@ python -m Pretrain.run_pretrain train \
 常用包装脚本：
 
 ```bash
+bash Scripts/train/train_test_fused_opt.sh Oc   # 论文主设置
 bash Scripts/train/train_test_fused_opt.sh O0
 bash Scripts/train/train_test_fused_opt.sh O2 --max-length 4096
 bash Scripts/train/train_test_fused_opt.sh Os --skip-train
@@ -102,7 +103,7 @@ bash Scripts/train/train_test_oc_graph_ablation.sh ddg
 
 大规模 Dataset-1 fused 数据（Ray / Slurm，多机）在 `rope-gnn-cluster` 分支上维护和运行（Shaheen 集群），本分支不再保留 `Scripts/ray_opt_ablation/`。需要查看或修改 fused 流水线时切到该分支。
 
-`Oc` / `Oc2` / `Oc3` 是项目内自定义的保守 canonicalization/reoptimization 设置，不要直接等同于 clang `-O?`。本分支查看/修改 pass 时读 `Scripts/task2_reoptimize.py` 里的 pass 表。
+论文（SEC'27 artifact）使用的是 `Oc`：`sroa, mem2reg, simplifycfg, early-cse, sccp, correlated-propagation, jump-threading, simplifycfg, reassociate, gvn, dce, bdce, adce, simplifycfg`，定义在 `Scripts/task2_reoptimize.py`，与 `sec27-artifact` / `rope-gnn-cluster` 分支一致。生成训练/评估数据一律用 `--opt-level Oc`；`Oc2` / `Oc3` 是效果不好的探索设置，不要用。在 `rope-gnn-cluster` 上生成 `Oc` 数据时确保没有 export `REGRAPH_IR_CANONICALIZATION`（Oc3 的位宽规整会通过它作用到 Oc）。这些都不等同于 clang `-O?`。
 
 ## 推理和 API
 

@@ -20,7 +20,6 @@ Scripts/
 ├── train/                 # 训练 + 评估包装脚本
 │   ├── train_test_fused_opt.sh
 │   ├── train_test_oc_graph_ablation.sh
-│   ├── run_oc3_train_eval_resume.sh
 │   └── run_modernbert_comparison.sh
 └── benchmarks/
     └── speedtest.py       # 模型吞吐/显存测速
@@ -50,6 +49,7 @@ python Scripts/pipeline.py task3 --input-path IR/xxx --resume
 ```
 
 - task1 在 `--output` 下镜像输入目录结构；失败记录写到 `logs/lift_task1_log.txt`，`ida2llvm.py` 的详细日志写到 `logs/ida2llvm.log`。
+- **论文（SEC'27）用的是 `Oc`**（第一版保守 canonicalization），生成训练/评估数据一律用 `--opt-level Oc`；`Oc2`/`Oc3` 是效果不好的探索设置，不要用。
 - task2 在原目录把 `x.ll` 写成 `x.bc`；`--opt-level` 支持 `O0/O1/O2/O3/Os/Og/Oz/Oc/Oc2`，`--arch auto` 按文件名推断 `-m32/-m64`。
 - task3 为每个 `x.bc` 生成 `x_functions/`。
 - 所有任务都支持 `--resume` 和 `--workers`。
@@ -65,10 +65,10 @@ python Scripts/ida2llvm.py -f <file.i64> -o <out.ll>
 ## 训练和评估
 
 ```bash
-bash Scripts/train/train_test_fused_opt.sh O0              # 不同优化级别 fused 数据：训练 + 测试
+bash Scripts/train/train_test_fused_opt.sh Oc              # 论文主设置：Oc fused 数据训练 + 测试
+bash Scripts/train/train_test_fused_opt.sh O0              # 其他优化级别对比
 bash Scripts/train/train_test_fused_opt.sh O2 --skip-train
 bash Scripts/train/train_test_oc_graph_ablation.sh ddg     # 图分支消融：cfg / ddg / none / all
-bash Scripts/train/run_oc3_train_eval_resume.sh            # OC3 训练 + 评估（可断点续训）
 bash Scripts/train/run_modernbert_comparison.sh            # ModernBERT 与归档 RoFormer 结果对比
 ```
 
