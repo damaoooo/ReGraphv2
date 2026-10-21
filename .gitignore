@@ -37,6 +37,7 @@ logs/
 .vscode/
 
 temp.*
+paper/analysis.ipynb
 *.tmp
 *log.txt
 
@@ -51,5 +52,5 @@ test.py
 *.i64
 *.eps
 runs/
-data/
+/data/
 tmp/

@@ -1,8 +1,11 @@
 import logging
 import pickle
 import random
+import sys
 from pathlib import Path
 from typing import List
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 import requests

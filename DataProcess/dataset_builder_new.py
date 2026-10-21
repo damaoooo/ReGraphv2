@@ -7,6 +7,7 @@ import time
 import pickle
 import json
 import logging
+from pathlib import Path
 import multiprocessing as mp
 from typing import List, Union
 from transformers import PreTrainedTokenizerFast
@@ -69,6 +70,8 @@ class DatasetBuilder:
 
     def _setup_logging(self, rich: bool = True):
         """Setup logging configuration."""
+        log_dir = Path(__file__).resolve().parents[1] / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
         # Remove existing handlers to avoid duplication
         for handler in logging.root.handlers[:]:
             logging.root.removeHandler(handler)
@@ -77,12 +80,12 @@ class DatasetBuilder:
             # Rich handler for main process
             handlers = [
                 RichHandler(console=console, rich_tracebacks=True),
-                logging.FileHandler('dataset_builder.log')
+                logging.FileHandler(log_dir / 'dataset_builder.log')
             ]
         else:
             # Standard handler for child processes
             handlers = [
-                logging.FileHandler('dataset_builder_debug.log')
+                logging.FileHandler(log_dir / 'dataset_builder_debug.log')
             ]
         
         logging.basicConfig(

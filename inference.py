@@ -306,7 +306,7 @@ class ReGraphInferencePipeline:
 
         with torch.inference_mode():
             with autocast_context:
-                return model.roformer.compute_last_layer_attention_weights(
+                return model.graph_encoder.compute_last_layer_attention_weights(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                 )

@@ -7,7 +7,7 @@ import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from .pretrain_model import MoCoPretrainModel, ReFormerPretrainModel
+from .pretrain_model import MoCoPretrainModel, ModernBertPretrainModel
 import pickle
 import torch
 import typer
@@ -27,15 +27,12 @@ except Exception:
 
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 
-LEGACY_GRAPH_MODE_TO_FLAGS: Dict[str, Tuple[bool, bool]] = {
+DEBUG_GRAPH_CONFIGS: Dict[str, Tuple[bool, bool]] = {
     "both": (True, True),
     "no_cfg": (False, True),
     "no_ddg": (True, False),
     "none": (False, False),
 }
-
-REMOVED_GRAPH_MODES = {"cfg_as_ddg", "cfg_as_ddg_no_ddg", "both_cfg_as_ddg"}
-
 
 def _split_override_item(item: str) -> Tuple[str, str]:
     if "=" not in item:
@@ -372,22 +369,9 @@ def _add_eval_strategy_arg(train_args_kwargs: Dict[str, Any], eval_strategy: str
         train_args_kwargs["evaluation_strategy"] = eval_strategy
 
 
-def _resolve_graph_flags_from_legacy_mode(mode: str) -> Tuple[bool, bool]:
-    lowered = mode.strip().lower()
-    if lowered in LEGACY_GRAPH_MODE_TO_FLAGS:
-        return LEGACY_GRAPH_MODE_TO_FLAGS[lowered]
-    if lowered in REMOVED_GRAPH_MODES:
-        raise typer.BadParameter(
-            f"graph_mode={mode!r} is no longer supported. "
-            "Use --cfg/--no-cfg and --ddg/--no-ddg explicitly."
-        )
-    supported = "/".join(sorted(LEGACY_GRAPH_MODE_TO_FLAGS.keys()))
-    raise typer.BadParameter(f"Unknown graph_mode={mode!r}. Supported legacy modes: {supported}")
-
-
 def _run_debug_across_supported_modes(base_config: PretrainConfig, runner: Callable[[PretrainConfig], None]):
     for mode in ("both", "no_cfg", "no_ddg", "none"):
-        use_cfg, use_ddg = LEGACY_GRAPH_MODE_TO_FLAGS[mode]
+        use_cfg, use_ddg = DEBUG_GRAPH_CONFIGS[mode]
         mode_config = copy.deepcopy(base_config)
         mode_config.use_cfg = use_cfg
         mode_config.use_ddg = use_ddg
@@ -497,6 +481,10 @@ def _debug_with_dummy_batch(config: PretrainConfig, use_gpu: bool):
     vocab_size = _resolve_debug_vocab_size(config)
     model_config = _clone_model_config(config, vocab_size)
     model = MoCoPretrainModel(config=model_config).to(device)
+    print(
+        "Attention backend: "
+        f"{model.encoder_q.graph_encoder.encoder.config._attn_implementation}"
+    )
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable()
     model.train()
@@ -574,7 +562,7 @@ def profile_extreme_seq_len_memory(
     if run_backward:
         model = MoCoPretrainModel(config=model_config)
     else:
-        model = ReFormerPretrainModel(config=model_config)
+        model = ModernBertPretrainModel(config=model_config)
     model = model.to(device)
     if config.gradient_checkpointing and run_backward:
         model.gradient_checkpointing_enable()
@@ -1119,6 +1107,7 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
                 if state_dict is None:
                     state_dict = model_to_save.state_dict()
                 torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+                model_to_save.config.save_pretrained(output_dir)
 
             if self.processing_class is not None:
                 self.processing_class.save_pretrained(output_dir)
@@ -1205,10 +1194,7 @@ def cli(ctx: typer.Context):
 @app.command("debug")
 def debug_command(
     device: str = typer.Argument("cpu", help="Run on cpu or gpu."),
-    graph_mode: Optional[str] = typer.Argument(
-        None,
-        help="Legacy positional graph mode (all/both/no_cfg/no_ddg/none).",
-    ),
+    all_graphs: bool = typer.Option(False, "--all-graphs", help="Test all four CFG/DDG combinations."),
     use_cfg: bool = typer.Option(True, "--cfg/--no-cfg", help="Enable CFG graph branch."),
     use_ddg: bool = typer.Option(True, "--ddg/--no-ddg", help="Enable DDG graph branch."),
     override: Optional[List[str]] = typer.Option(
@@ -1226,12 +1212,9 @@ def debug_command(
     runner: Callable[[PretrainConfig], None] = debug_cpu if device == "cpu" else debug_gpu
     config = _build_config(overrides=override)
 
-    if graph_mode is not None:
-        mode = graph_mode.lower()
-        if mode == "all":
-            _run_debug_across_supported_modes(config, runner)
-            return
-        use_cfg, use_ddg = _resolve_graph_flags_from_legacy_mode(mode)
+    if all_graphs:
+        _run_debug_across_supported_modes(config, runner)
+        return
 
     config.use_cfg = use_cfg
     config.use_ddg = use_ddg

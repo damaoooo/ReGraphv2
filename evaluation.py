@@ -1,4 +1,8 @@
 import logging
+import hashlib
+import json
+import time
+from types import SimpleNamespace
 import pickle
 import random
 from datetime import datetime
@@ -761,6 +765,10 @@ def main(
     use_ddg: bool = typer.Option(True, "--ddg/--no-ddg", help="是否启用 DDG 图分支。"),
     use_bf16: bool = typer.Option(False, "--bf16", help="将嵌入以BF16加载到GPU，减少显存与带宽开销。"),
     markdown_output: Optional[Path] = typer.Option(None, "--markdown-output", "--md-output", help="将评估结果保存为Markdown文件。"),
+    export_only: bool = typer.Option(False, "--export-only", help="Export resumable embeddings without retrieval evaluation."),
+    paired_baseline: Optional[Path] = typer.Option(None, "--paired-baseline", help="Baseline .npy cache to score with identical candidate pools."),
+    baseline_label: str = typer.Option("Baseline", "--baseline-label", help="Paired comparison baseline display name."),
+    comparison_note: str = typer.Option("", "--comparison-note", help="Provenance and limitations for the paired comparison report."),
 ):
     """
     在验证集上评估模型的函数检索性能 (Recall@K)。
@@ -770,6 +778,29 @@ def main(
     """
     console.rule(f"[bold blue]开始使用本地模型进行评估[/bold blue]")
     set_seed(seed)
+    if export_only or paired_baseline is not None:
+        if not use_gpu or not torch.cuda.is_available():
+            raise typer.BadParameter("Resumable export and paired comparison require CUDA.")
+        if embeddings_path is None:
+            raise typer.BadParameter("--embeddings-path is required.")
+        if paired_baseline is not None:
+            if markdown_output is None:
+                raise typer.BadParameter("--markdown-output is required.")
+            compare_paired_embeddings(SimpleNamespace(
+                baseline=paired_baseline, modern=embeddings_path,
+                positive_map=validation_positive_map_path, output=markdown_output,
+                seed=seed, baseline_label=baseline_label, comparison_note=comparison_note,
+            ))
+        else:
+            if validation_dataset_pool_path is None or model_path is None or tokenizer_path is None:
+                raise typer.BadParameter("Export requires --dataset-path, --model-path and --tokenizer-path.")
+            export_resumable_embeddings(SimpleNamespace(
+                dataset=validation_dataset_pool_path, model=model_path,
+                tokenizer=tokenizer_path, output=embeddings_path,
+                batch_size=batch_size, max_length=max_length,
+                use_cfg=use_cfg, use_ddg=use_ddg,
+            ))
+        return
 
     # GPU可用性检查
     if use_gpu and not GPU_AVAILABLE:
@@ -1018,6 +1049,179 @@ def main(
             use_bf16=use_bf16,
         )
         console.print(f"[green]Markdown结果已保存到: {markdown_output}[/green]")
+
+
+def write_json(path, value):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def _normalize_export_metadata(metadata):
+    """Read the previous ModernBERT cache schema without re-exporting vectors."""
+    normalized = dict(metadata)
+    if normalized.get("legacy") is False:
+        normalized.pop("legacy")
+        normalized.setdefault("model_type", "modernbert")
+    return normalized
+
+
+def export_resumable_embeddings(args):
+    max_length = getattr(args, "max_length", 4096)
+    use_cfg, use_ddg = getattr(args, "use_cfg", True), getattr(args, "use_ddg", True)
+    dataset = load_from_disk(str(args.dataset))
+    metadata = {
+        "dataset": str(args.dataset.resolve()), "fingerprint": dataset._fingerprint,
+        "rows": len(dataset), "model": str(args.model.resolve()),
+        "tokenizer_sha256": hashlib.sha256(args.tokenizer.read_bytes()).hexdigest(),
+        "max_length": max_length, "model_type": "modernbert",
+    }
+    state_path = args.output.with_suffix(".progress.json")
+    metadata_path = args.output.with_suffix(".metadata.json")
+    partial = args.output.with_suffix(".partial.npy")
+    if args.output.exists():
+        if _normalize_export_metadata(json.loads(metadata_path.read_text())) != metadata:
+            raise ValueError("Existing embedding metadata does not match this run")
+        print(f"Using completed cache: {args.output}", flush=True)
+        return
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    offset = 0
+    if state_path.exists():
+        state = json.loads(state_path.read_text())
+        if _normalize_export_metadata(state["metadata"]) != metadata:
+            raise ValueError("Partial embedding metadata mismatch")
+        offset = state["next_index"]
+        output = np.load(partial, mmap_mode="r+")
+    else:
+        output = np.lib.format.open_memmap(partial, mode="w+", dtype=np.float32,
+                                          shape=(len(dataset), 768))
+    tokenizer = load_tokenizer(str(args.tokenizer))
+    flags = {"use_cfg": use_cfg, "use_ddg": use_ddg}
+    model = get_model(str(args.model), max_seq_length=max_length,
+                      tokenizer_path=str(args.tokenizer), **flags).cuda().eval()
+    loader = get_dataloader(dataset.select(range(offset, len(dataset))), tokenizer,
+                            batch_size=args.batch_size, max_length=max_length, **flags)
+    initial_offset = offset
+    started = time.monotonic()
+    with torch.inference_mode():
+        for batch_index, batch in enumerate(loader, 1):
+            batch = {key: value.cuda() if isinstance(value, torch.Tensor) else value
+                     for key, value in batch.items()}
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                vectors = model.encode(**batch)["embedding"]
+            vectors = vectors.float().cpu().numpy()
+            if not np.isfinite(vectors).all():
+                raise ValueError(f"Nonfinite embeddings at row {offset}")
+            output[offset:offset + len(vectors)] = vectors
+            offset += len(vectors)
+            if batch_index % 100 == 0 or offset == len(dataset):
+                output.flush()
+                write_json(state_path, {"metadata": metadata, "next_index": offset})
+                speed = (offset - initial_offset) / max(time.monotonic() - started, 1e-6)
+                eta = (len(dataset) - offset) / speed / 3600
+                print(f"Embedded {offset:,}/{len(dataset):,}; "
+                      f"{speed:.1f} functions/s; ETA {eta:.2f} h", flush=True)
+    if offset != len(dataset):
+        raise ValueError("Embedding row count mismatch")
+    del output
+    partial.replace(args.output)
+    write_json(metadata_path, metadata)
+    state_path.unlink()
+    print(f"Completed: {args.output}", flush=True)
+
+
+def compare_paired_embeddings(args):
+    from numba import njit, prange
+    seed = getattr(args, "seed", 42)
+    baseline_label = getattr(args, "baseline_label", "Baseline")
+    comparison_note = getattr(args, "comparison_note", "")
+
+    @njit(parallel=True)
+    def pools_for(anchors, flat, offsets, total):
+        pools = np.empty((len(anchors), 10000), dtype=np.int64)
+        for i in prange(len(anchors)):
+            anchor = anchors[i]
+            np.random.seed((seed + anchor) % 4294967295)
+            positives = flat[offsets[anchor]:offsets[anchor + 1]]
+            pools[i, 0] = positives[np.random.randint(len(positives))]
+            exclude = np.sort(np.append(positives, anchor))
+            negatives = _sample_excluding(total, exclude, 9999)
+            # Floyd sampling gives a uniform set, not a uniformly ordered prefix.
+            np.random.shuffle(negatives)
+            pools[i, 1:] = negatives
+        return pools
+
+    arrays = [np.load(path, mmap_mode="r") for path in (args.baseline, args.modern)]
+    if arrays[0].shape != arrays[1].shape:
+        raise ValueError("Embedding shape mismatch")
+    total = len(arrays[0])
+    with args.positive_map.open("rb") as handle:
+        mapping = pickle.load(handle)
+    mapping = {int(k): sorted(set(map(int, v)) - {int(k)}) for k, v in mapping.items()}
+    mapping = {k: v for k, v in mapping.items() if v}
+    assert all(0 <= k < total and all(0 <= v < total for v in values)
+               for k, values in mapping.items())
+    assert min(total - len(v) - 1 for v in mapping.values()) >= 9999
+    flat, offsets = [], [0]
+    for i in range(total):
+        flat.extend(mapping.get(i, []))
+        offsets.append(len(flat))
+    flat, offsets = np.array(flat, dtype=np.int64), np.array(offsets, dtype=np.int64)
+    anchors = np.array(sorted(mapping), dtype=np.int64)
+    embeddings = [torch.tensor(np.asarray(a), dtype=torch.bfloat16, device="cuda")
+                  for a in arrays]
+    sizes = sorted(set([2**i for i in range(1, 14)] + [100, 10000]))
+    sums = torch.zeros((2, len(sizes), 2), dtype=torch.float64, device="cuda")
+    size_indices = torch.tensor(sizes, device="cuda") - 1
+    started = time.monotonic()
+    with torch.inference_mode():
+        for start in range(0, len(anchors), 64):
+            batch = anchors[start:start + 64]
+            pools = torch.tensor(pools_for(batch, flat, offsets, total), device="cuda")
+            indices = torch.tensor(batch, device="cuda")
+            for model_idx, matrix in enumerate(embeddings):
+                candidates = matrix[pools]
+                scores = torch.bmm(candidates, matrix[indices].unsqueeze(-1)).squeeze(-1)
+                del candidates
+                ranks = (scores > scores[:, :1]).cumsum(1)[:, size_indices] + 1
+                sums[model_idx, :, 0] += (ranks == 1).sum(0)
+                sums[model_idx, :, 1] += ranks.float().reciprocal().sum(0)
+            if start % 6400 == 0:
+                torch.cuda.synchronize()
+                done = min(start + len(batch), len(anchors))
+                speed = done / max(time.monotonic() - started, 1e-6)
+                eta = (len(anchors) - done) / speed / 60
+                print(f"Paired evaluation {done:,}/{len(anchors):,}; "
+                      f"{speed:.1f} anchors/s; ETA {eta:.1f} min", flush=True)
+    metrics = sums.cpu().numpy() / len(anchors)
+    lines = [
+        f"# Both: {baseline_label} vs ModernBERT",
+        "",
+        f"Pool rows: {total:,}; anchors: {len(anchors):,}.",
+        "Each anchor uses identical selected positive and negatives for both models.",
+        f"Deterministic sampling seed: {seed} + anchor index. Strict-greater rank ties.",
+        "Scores use BF16 dot products of the supplied normalized embedding caches.",
+        f"Baseline cache: `{args.baseline}`.",
+        f"ModernBERT cache: `{args.modern}`.",
+        comparison_note,
+        "This compares systems, not an isolated encoder-only ablation.",
+        "",
+        f"| Pool | {baseline_label} Recall@1 | ModernBERT Recall@1 | {baseline_label} MRR | ModernBERT MRR |",
+        "| ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for j, size in enumerate(sizes):
+        lines.append(f"| {size} | {metrics[0,j,0]:.6f} | {metrics[1,j,0]:.6f} | "
+                     f"{metrics[0,j,1]:.6f} | {metrics[1,j,1]:.6f} |")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text("\n".join(lines) + "\n")
+    write_json(args.output.with_suffix(".json"), {
+        "sizes": sizes, "metrics": metrics.tolist(), "rows": total,
+        "anchors": len(anchors), "baseline": str(args.baseline), "modern": str(args.modern),
+        "positive_map_sha256": hashlib.sha256(args.positive_map.read_bytes()).hexdigest(),
+        "seed": seed, "baseline_label": baseline_label, "comparison_note": comparison_note,
+        "score_dtype": "bfloat16", "tie_policy": "strict_greater",
+    })
+    print("\n".join(lines), flush=True)
 
 
 if __name__ == "__main__":

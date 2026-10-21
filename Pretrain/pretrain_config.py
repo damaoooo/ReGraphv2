@@ -4,17 +4,21 @@
 """
 
 from typing import Optional, Any, Dict
-from transformers import RoFormerConfig
+from transformers import ModernBertConfig
 
 
-class PretrainConfig(RoFormerConfig):
+class PretrainConfig(ModernBertConfig):
     def __setattr__(self, name: str, value: Any):
         """Keep sequence length fields synchronized.
 
         The codebase uses `max_seq_length` for data truncation/padding, while
-        RoFormer relies on `max_position_embeddings` internally. Divergence
+        ModernBERT relies on `max_position_embeddings` internally. Divergence
         between them can cause hard-to-debug runtime issues.
         """
+        if name == "attention_backend":
+            if value not in {"sdpa", "flash_attention_2"}:
+                raise ValueError("attention_backend must be sdpa or flash_attention_2")
+            super().__setattr__("_attn_implementation", value)
         if name in {"max_seq_length", "max_position_embeddings"}:
             synced_value = int(value)
             super().__setattr__("max_seq_length", synced_value)
@@ -37,10 +41,10 @@ class PretrainConfig(RoFormerConfig):
         validation_dataset_idx_path: Optional[str] = None,
         validation_dataset_map_path: Optional[str] = None,
         output_dir: str = "./output",
-        final_model_dir: str = "./db1_model",
+        final_model_dir: str = "./modernbert_model",
         logging_dir: str = "./logs",
         # === 模型扩展配置 ===
-        use_sdpa_attention: bool = True,
+        attention_backend: str = "flash_attention_2",
         use_cfg: bool = True,
         use_ddg: bool = True,
         embedding_size: int = 768,
@@ -91,13 +95,24 @@ class PretrainConfig(RoFormerConfig):
         pad_to_multiple_of: int = 8,
         **kwargs: Any,
     ):
+        saved_model_type = kwargs.pop("model_type", "modernbert")
+        if saved_model_type != "modernbert":
+            raise ValueError(
+                f"Expected a ModernBERT config, got {saved_model_type!r}. "
+                "Start a fresh run instead of resuming a RoFormer checkpoint."
+            )
         model_defaults: Dict[str, Any] = {
             "hidden_size": 768,
             "num_hidden_layers": 12,
             "num_attention_heads": 12,
             "intermediate_size": 3072,
-            "relative_attention": True,
-            "pos_att_type": "p2c|c2p",
+            "pad_token_id": 0,
+            "bos_token_id": None,
+            "eos_token_id": None,
+            "cls_token_id": None,
+            "sep_token_id": None,
+            "reference_compile": False,
+            "attn_implementation": attention_backend,
             "torch_dtype": "bfloat16",
             "max_position_embeddings": max_seq_length,
         }
@@ -122,7 +137,7 @@ class PretrainConfig(RoFormerConfig):
         self.logging_dir = logging_dir
 
         # === 模型扩展配置 ===
-        self.use_sdpa_attention = use_sdpa_attention
+        self.attention_backend = attention_backend
         self.use_cfg = use_cfg
         self.use_ddg = use_ddg
         self.embedding_size = embedding_size

@@ -26,10 +26,12 @@ import llvmlite.binding as llvm
 from llvmlite import ir
 
 from contextlib import suppress
+from pathlib import Path
 
-# Log 输出到文件 ida2llvm.log
+log_dir = Path(__file__).resolve().parents[1] / "logs"
+log_dir.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
-    filename='ida2llvm.log',
+    filename=log_dir / 'ida2llvm.log',
     filemode='a',  # 追加模式
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',

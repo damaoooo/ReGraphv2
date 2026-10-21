@@ -4,6 +4,7 @@ import gc
 import json
 import os
 import re
+import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -13,6 +14,9 @@ import numpy as np
 import torch
 import typer
 from datasets import load_from_disk
+
+# Keep direct script execution working after moving below Scripts/.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from Model.graph_utils import build_batched_span_graph_tensors
 from Pretrain.pretrain_config import PretrainConfig
@@ -70,73 +74,6 @@ def _load_state_dict(model_path: Path) -> tuple[Dict[str, torch.Tensor], Path]:
     )
 
 
-def _infer_config_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> PretrainConfig:
-    vocab_size, hidden_size = state_dict[
-        "encoder_q.roformer.roformer.embeddings.word_embeddings.weight"
-    ].shape
-    max_seq_length, head_dim = state_dict[
-        "encoder_q.roformer.roformer.encoder.embed_positions.weight"
-    ].shape
-    intermediate_size = state_dict[
-        "encoder_q.roformer.roformer.encoder.layer.0.intermediate.dense.weight"
-    ].shape[0]
-    embedding_size = state_dict["encoder_q.linear.2.weight"].shape[0]
-
-    layer_pattern = re.compile(r"encoder_q\.roformer\.roformer\.encoder\.layer\.(\d+)\.")
-    cfg_conv_pattern = re.compile(r"encoder_q\.roformer\.cfg_branch\.convs\.(\d+)\.")
-    ddg_conv_pattern = re.compile(r"encoder_q\.roformer\.ddg_branch\.convs\.(\d+)\.")
-
-    num_hidden_layers = len(
-        {
-            int(match.group(1))
-            for key in state_dict
-            for match in [layer_pattern.match(key)]
-            if match is not None
-        }
-    )
-    cfg_graph_layers = len(
-        {
-            int(match.group(1))
-            for key in state_dict
-            for match in [cfg_conv_pattern.match(key)]
-            if match is not None
-        }
-    )
-    ddg_graph_layers = len(
-        {
-            int(match.group(1))
-            for key in state_dict
-            for match in [ddg_conv_pattern.match(key)]
-            if match is not None
-        }
-    )
-
-    use_cfg = any(key.startswith("encoder_q.roformer.cfg_branch.") for key in state_dict)
-    use_ddg = any(key.startswith("encoder_q.roformer.ddg_branch.") for key in state_dict)
-    graph_layers = max(cfg_graph_layers, ddg_graph_layers, 0)
-
-    if use_ddg:
-        graph_attention_heads = int(state_dict["encoder_q.roformer.ddg_branch.convs.0.att"].shape[1])
-    elif use_cfg:
-        graph_attention_heads = int(state_dict["encoder_q.roformer.cfg_branch.convs.0.att"].shape[1])
-    else:
-        graph_attention_heads = 1
-
-    num_attention_heads = hidden_size // head_dim
-
-    return PretrainConfig(
-        max_seq_length=max_seq_length,
-        vocab_size=vocab_size,
-        hidden_size=hidden_size,
-        num_hidden_layers=num_hidden_layers,
-        num_attention_heads=num_attention_heads,
-        intermediate_size=intermediate_size,
-        embedding_size=embedding_size,
-        use_cfg=use_cfg,
-        use_ddg=use_ddg,
-        graph_layers=graph_layers,
-        graph_attention_heads=graph_attention_heads,
-    )
 
 
 def _resolve_tokenizer_path(model_path: Path, override: Optional[str]) -> Optional[str]:
@@ -208,7 +145,7 @@ def _load_encoder_q(
     device: torch.device,
 ) -> tuple[torch.nn.Module, PretrainConfig, Path]:
     state_dict, checkpoint_path = _load_state_dict(model_path)
-    config = _infer_config_from_state_dict(state_dict)
+    config = PretrainConfig.from_pretrained(model_path)
 
     moco_model = MoCoPretrainModel(config)
     missing_keys, unexpected_keys = moco_model.load_state_dict(state_dict, strict=True)
@@ -463,7 +400,7 @@ def _summarize_metrics(
 
 def main(
     model_path: str = typer.Option(
-        "/home/damaoooo/Downloads/regraphv2/db1_model_cfg_ddg",
+        "runs/modernbert_gnn_100k_len2048/model_cfg_ddg",
         help="Checkpoint directory used for inference benchmarking.",
     ),
     tokenizer_path: Optional[str] = typer.Option(

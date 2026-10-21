@@ -149,5 +149,5 @@ async def embed_binary(
 
 if __name__ == "__main__":
     import uvicorn
-    os.environ["REGRAPH_MODEL_PATH"] = "db1_model"
+    os.environ.setdefault("REGRAPH_MODEL_PATH", "runs/modernbert_gnn_100k_len2048/model_cfg_ddg")
     uvicorn.run(app, host="0.0.0.0", port=8000)

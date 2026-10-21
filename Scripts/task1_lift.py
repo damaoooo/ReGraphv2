@@ -25,7 +25,9 @@ from utils import console, ensure_directory, file_exists_and_not_empty
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BINARY_PATH = "/home/damaoooo/Downloads/regraphv2/Binaries"
 IDA_PATH = "/home/damaoooo/ida-pro-9.3"  # Update this path to your IDA Pro installation
-LOG_PATH = os.path.join(SCRIPT_DIR, "lift_task1_log.txt")
+LOG_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_PATH = os.path.join(LOG_DIR, "lift_task1_log.txt")
 LIFT_BACKENDS = {"ida", "ghidra"}
 
 app = typer.Typer()

@@ -82,7 +82,7 @@ python3 task3_extract.py --input-path /path/to/bc/files --resume
 3. **更好的错误处理**：每个任务都有独立的错误处理和统计
 4. **灵活的控制**：可以从任意任务开始运行流水线
 5. **清晰的进度显示**：每个任务都有独立的进度条
-6. **更好的日志**：任务1有独立的日志文件 `lift_task1_log.txt`
+6. **更好的日志**：任务1有独立的日志文件 `logs/lift_task1_log.txt`（相对于仓库根目录）
 7. **Task 2 优化级别可配置**：支持 `--opt-level O0/O1/O2/O3/Os/Oz/...`，默认 `O3`
 
 ## 典型使用场景

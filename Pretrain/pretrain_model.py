@@ -4,18 +4,27 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import GenerationMixin, RoFormerForMaskedLM
+from transformers.models.modernbert.modeling_modernbert import (
+    ModernBertPreTrainedModel,
+    ModernBertPredictionHead,
+)
 
-from Model.model_backbone import RoFormerGraph
+from Model.model_backbone import ModernBertGraph
 from .pretrain_config import PretrainConfig
 
 
-class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
+class ModernBertPretrainModel(ModernBertPreTrainedModel):
+    config_class = PretrainConfig
+    base_model_prefix = "graph_encoder"
+    _tied_weights_keys = ["decoder.weight"]
+
     def __init__(self, config: PretrainConfig):
+        if config.model_type != "modernbert":
+            raise ValueError("This branch requires a ModernBERT checkpoint; RoFormer weights are incompatible.")
         super().__init__(config)
-        self.roformer = RoFormerGraph(config)
-        # Re-tie MLM decoder weights to the new encoder embeddings.
-        self.tie_weights()
+        self.graph_encoder = ModernBertGraph(config)
+        self.head = ModernBertPredictionHead(config)
+        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=config.decoder_bias)
 
         self.linear = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
@@ -23,39 +32,28 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
             nn.Linear(config.hidden_size, config.embedding_size),
             nn.LayerNorm(config.embedding_size),
         )
+        self.post_init()
 
     def tie_weights(self, **kwargs):
-        """Tie MLM decoder weights to word embeddings, bypassing HuggingFace's
-        _tied_weights_keys path validation.
-
-        HuggingFace validates _tied_weights_keys by matching parameter names via
-        regex.  That validation runs during super().__init__() when self.roformer
-        is still a plain RoFormerModel, before we replace it with RoFormerGraph.
-        At that point the path 'roformer.roformer.embeddings...' does not yet
-        exist, causing a ValueError.  By overriding tie_weights() we perform the
-        tying directly without any path validation.
-        """
+        """Tie the ModernBERT MLM decoder to the graph encoder's token table."""
         if not getattr(self.config, "tie_word_embeddings", True):
             return
-        try:
-            input_embeddings = self.get_input_embeddings()
-        except AttributeError:
-            # Called before self.roformer was replaced with RoFormerGraph; skip.
-            return
+        input_embeddings = self.get_input_embeddings()
         output_embeddings = self.get_output_embeddings()
         if output_embeddings is not None and input_embeddings is not None:
             output_embeddings.weight = input_embeddings.weight
-        # Tie the standalone bias to the decoder bias.
-        if (hasattr(self, "cls")
-                and hasattr(self.cls.predictions, "bias")
-                and hasattr(self.cls.predictions.decoder, "bias")):
-            self.cls.predictions.decoder.bias = self.cls.predictions.bias
 
     def get_input_embeddings(self):
-        return self.roformer.roformer.embeddings.word_embeddings
+        return self.graph_encoder.encoder.embeddings.tok_embeddings
 
     def set_input_embeddings(self, value):
-        self.roformer.roformer.embeddings.word_embeddings = value
+        self.graph_encoder.encoder.embeddings.tok_embeddings = value
+
+    def get_output_embeddings(self):
+        return self.decoder
+
+    def set_output_embeddings(self, value):
+        self.decoder = value
 
     def encode(
         self,
@@ -79,7 +77,7 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         output_attentions = bool(kwargs.pop("output_attentions", False))
 
-        roformer_out = self.roformer(
+        encoder_out = self.graph_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             ddg_node_spans=ddg_node_spans,
@@ -92,7 +90,7 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
             output_attentions=output_attentions,
         )
 
-        contrastive_embed = self.linear(roformer_out["fused_feature"])
+        contrastive_embed = self.linear(encoder_out["fused_feature"])
         contrastive_embed = F.normalize(contrastive_embed, p=2, dim=1)
 
         if not return_dict:
@@ -102,7 +100,7 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
             "embedding": contrastive_embed,
         }
         if output_attentions:
-            result["attentions"] = roformer_out.get("attentions")
+            result["attentions"] = encoder_out.get("attentions")
         return result
 
     def forward(
@@ -123,7 +121,7 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         output_attentions = bool(kwargs.pop("output_attentions", False))
 
-        roformer_out = self.roformer(
+        encoder_out = self.graph_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             ddg_node_spans=ddg_node_spans,
@@ -136,10 +134,10 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
             output_attentions=output_attentions,
         )
 
-        sequence_output = roformer_out["sequence_output"]
-        fused_feature = roformer_out["fused_feature"]
+        sequence_output = encoder_out["sequence_output"]
+        fused_feature = encoder_out["fused_feature"]
 
-        prediction_logits = self.cls(sequence_output)
+        prediction_logits = self.decoder(self.head(sequence_output))
 
         mlm_loss = None
         if labels is not None:
@@ -161,7 +159,7 @@ class ReFormerPretrainModel(RoFormerForMaskedLM, GenerationMixin):
             "embedding": contrastive_embed,
         }
         if output_attentions:
-            result["attentions"] = roformer_out.get("attentions")
+            result["attentions"] = encoder_out.get("attentions")
         return result
 
 
@@ -183,8 +181,8 @@ class MoCoPretrainModel(nn.Module):
         self.moco_momentum = config.moco_momentum
         self.moco_temperature = config.moco_temperature
 
-        self.encoder_q = ReFormerPretrainModel(config)
-        self.encoder_k = ReFormerPretrainModel(config)
+        self.encoder_q = ModernBertPretrainModel(config)
+        self.encoder_k = ModernBertPretrainModel(config)
         self.encoder_k.load_state_dict(self.encoder_q.state_dict())
 
         for param_k in self.encoder_k.parameters():
