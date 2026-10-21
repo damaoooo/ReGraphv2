@@ -23,13 +23,13 @@ lsp_start_server(server_id="bash", workspace_root="/home/damaoooo/Downloads/regr
 
 建议先用 `lsp_document_symbols` / `lsp_goto_definition` / `lsp_find_references` 看关键文件。`lsp_file_exports(include_signatures=true)` 在本项目的一些重型模块上可能超时，必要时改用 `lsp_document_symbols` 加定向读取。
 
-不要全量扫生成数据目录。`IR/`、`Binaries/`、`IDBs/`、`runs/`、`output*/`、`db1_model*/`、`data/models--*/` 和大部分 `tmp/` 都可能很大；只在任务明确需要时读取具体文件。`tmp/` 里也有少量实验脚本，可以按名字定向看。
+不要全量扫生成数据目录。`IR/`、`Binaries/`、`IDBs/`、`runs/`、`data/models--*/` 都可能很大；只在任务明确需要时读取具体文件。
 
 ## 目录地图
 
 - `paper/`: 论文 PDF、`analysis.ipynb` 历史分析和绘图 notebook、`figures/` 图片；先运行 notebook 的路径初始化单元。
 - `docs/`: 使用说明，包括 `TRAINING_STEPS_GUIDE.md`。
-- `Scripts/benchmarks/speedtest.py`: 模型测速入口；`Scripts/evaluation/evaluate_bincrop.py` 为专项评估，`Scripts/data/generate_index_pool.py` 为候选池生成工具。命令从仓库根目录执行。
+- `Scripts/benchmarks/speedtest.py`: 模型测速入口，命令从仓库根目录执行。
 - `envs/containers/`: 本地 Apptainer/Singularity 镜像；`logs/`: 数据生成和 lifting 日志。
 - `Scripts/`: 数据生成、lift、reopt、训练评估包装脚本。
 - `Scripts/pipeline.py`: 传统 Typer pipeline，串起 task1/task2/task3/task4。
@@ -37,7 +37,6 @@ lsp_start_server(server_id="bash", workspace_root="/home/damaoooo/Downloads/regr
 - `Scripts/task2_reoptimize.py`: `.ll -> .bc`，支持 `O0/O1/O2/O3/Os/Og/Oz/Oc/Oc2`，其中 `Oc/Oc2` 是保守 canonicalization pass 组合。
 - `Scripts/task3_extract.py`: 对 `.bc` 调 `Scripts/split_llvm_ir.sh` 提取函数级 IR。
 - `Scripts/task4_recompile.py`: `.bc -> .re`，用于把优化后的 bitcode 重新编译成可执行/对象侧产物。
-- `Scripts/ray_opt_ablation/ray_fused_pipeline.py`: 大规模 Ray 版 fused pipeline，负责 reopt、函数提取、DataProcess、final_set 过滤/去重等。
 - `DataProcess/`: 从函数级 LLVM IR 构建 HuggingFace dataset。`cli.py` 是 Typer CLI，`dataset_builder_new.py` 串起 `FileProcessor` 和 `ParallelProcessor`，`file_processor.py` 生成 token、CFG、DDG。
 - `GraphBuilder/`: Python 图解析和 LLVM pass 源码。`cfg_graph_builder.py` 输出 `(src_start, src_end, dst_start, dst_end, probability)`，`ddg_graph_builder.py` 输出 `(src_start, src_end, dst_start, dst_end)`。
 - `Tokenizer/`: LLVM IR tokenizer、normalizer 和 tokenizer 文件。
@@ -95,34 +94,15 @@ bash Scripts/train_test_fused_opt.sh O0
 bash Scripts/train_test_fused_opt.sh O2 --max-length 4096
 bash Scripts/train_test_fused_opt.sh Os --skip-train
 bash Scripts/train_test_oc_graph_ablation.sh ddg
-bash Scripts/run_oc2_fair_train_eval_resume.sh
 ```
 
 `docs/TRAINING_STEPS_GUIDE.md` 说明了当前默认更偏向按 epoch 训练：`num_train_epochs=1`、`max_steps=-1`、`save_steps=10000`。短 smoke test 才临时设置 `max_steps`。
 
-## Ray fused 数据生成
+## 大规模数据生成
 
-大规模 Dataset-1 fused 数据优先看：
+大规模 Dataset-1 fused 数据（Ray / Slurm，多机）在 `rope-gnn-cluster` 分支上维护和运行（Shaheen 集群），本分支不再保留 `Scripts/ray_opt_ablation/`。需要查看或修改 fused 流水线时切到该分支。
 
-```bash
-conda run -n ReLL python Scripts/ray_opt_ablation/ray_fused_pipeline.py \
-  --repo-root /home/damaoooo/Downloads/regraphv2 \
-  --dataset-path IR/Dataset-1-new/Dataset-1 \
-  --output-path IR/Dataset-1-new/Dataset-1-Oc-fused \
-  --opt-level Oc \
-  --resume \
-  --task3-csv-filter-dir IR/csv_list \
-  --task3-prefilter-uninformative \
-  --task3-prefilter-max-stub-tokens 128 \
-  --task3-dedup-input-ids \
-  --final-uninformative-filter \
-  --final-uninformative-filter-splits train,validation,test \
-  --final-uninformative-max-stub-tokens 128
-```
-
-实际可参考 `tmp/run_oc_fused_pipeline_tmux.sh` 和 `tmp/run_oc2_fused_pipeline_tmux.sh`。这些脚本会设置 `REGRAPH_CACHE_ROOT`、`RAY_TMPDIR`、`TMPDIR`，并限制 BLAS/OpenMP 线程，避免 Ray worker 过度抢资源。
-
-`Oc` / `Oc2` 是项目内自定义的保守 canonicalization/reoptimization 设置，不要直接等同于 clang `-O?`。查看/修改 pass 时优先读 `Scripts/task2_reoptimize.py` 和 `Scripts/ray_opt_ablation/ray_fused_pipeline.py` 里的 pass 表。
+`Oc` / `Oc2` / `Oc3` 是项目内自定义的保守 canonicalization/reoptimization 设置，不要直接等同于 clang `-O?`。本分支查看/修改 pass 时读 `Scripts/task2_reoptimize.py` 里的 pass 表。
 
 ## 推理和 API
 
@@ -172,7 +152,6 @@ evaluation.py
 遇到数据生成/reoptimization 问题，优先读：
 
 ```text
-Scripts/ray_opt_ablation/ray_fused_pipeline.py
 Scripts/task1_lift.py
 Scripts/task2_reoptimize.py
 Scripts/task3_extract.py
