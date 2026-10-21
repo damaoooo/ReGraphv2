@@ -8,6 +8,7 @@ Step 2: Use ida2llvm.py to convert .i64 files to LLVM IR
 Both steps use parallel processing with separate progress bars for efficiency.
 """
 import os
+import json
 import typer
 import multiprocessing
 import logging
@@ -24,7 +25,24 @@ from utils import console, ensure_directory, file_exists_and_not_empty
 # Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BINARY_PATH = "/home/damaoooo/Downloads/regraphv2/Binaries"
-IDA_PATH = "/home/damaoooo/ida-pro-9.3"  # Update this path to your IDA Pro installation
+
+
+def default_ida_path() -> str:
+    """IDADIR > ~/.idapro/ida-config.json（py-activate-idalib.py 写入）> ~/ida-pro-9.4"""
+    env_path = os.environ.get("IDADIR")
+    if env_path:
+        return env_path
+    try:
+        with open(os.path.expanduser("~/.idapro/ida-config.json")) as handle:
+            config_path = json.load(handle)["Paths"]["ida-install-dir"]
+        if config_path:
+            return config_path
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return os.path.expanduser("~/ida-pro-9.4")
+
+
+IDA_PATH = default_ida_path()
 LOG_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_PATH = os.path.join(LOG_DIR, "lift_task1_log.txt")
@@ -288,6 +306,9 @@ def main(
     if backend == "ida" and not os.path.exists(os.path.join(ida_path, "idat")) and not start_from_step2:
         console.print(f"[red]Error: IDA idat not found under {ida_path}. Use --backend ghidra for artifact runs.[/red]")
         raise typer.Exit(code=1)
+    if backend == "ida":
+        # ida2llvm.py 子进程通过 idalib 加载 IDA，统一指向同一个安装目录
+        os.environ["IDADIR"] = ida_path
     
     # Setup logging
     logging.basicConfig(

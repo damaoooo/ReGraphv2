@@ -2079,21 +2079,27 @@ class BIN2LLVMController():
                 arch = "aarch64" if is_64 else "arm"
             elif proc in ("aarch64", "arm64"):
                 arch = "aarch64"
-            elif proc == "mips":
+            elif proc.lower().startswith("mips"):
+                # IDA 用 mipsb/mipsl/mipsr... 表示不同字节序的 MIPS
                 arch = "mips64" if is_64 else "mips"
-            elif proc in ("ppc", "ppc64"):
+                if not ida_ida.inf_is_be():
+                    arch += "el"
+            elif proc.lower().startswith("ppc"):
                 arch = "powerpc64" if is_64 else "powerpc"
+                if not ida_ida.inf_is_be():
+                    arch += "le"
             elif proc == "riscv":
                 arch = "riscv64" if is_64 else "riscv32"
 
+            # IDA 的 Python 接口没有导出 OSTYPE_* 常量，按文件格式推断 OS
             os_name = "unknown"
             with suppress(Exception):
-                ostype = ida_ida.inf_get_ostype()
-                if hasattr(ida_ida, "OSTYPE_WIN") and ostype == ida_ida.OSTYPE_WIN:
-                    os_name = "windows"
-                elif hasattr(ida_ida, "OSTYPE_LINUX") and ostype == ida_ida.OSTYPE_LINUX:
+                filetype = ida_ida.inf_get_filetype()
+                if filetype == ida_ida.f_ELF:
                     os_name = "linux"
-                elif hasattr(ida_ida, "OSTYPE_MACOS") and ostype == ida_ida.OSTYPE_MACOS:
+                elif filetype == ida_ida.f_PE:
+                    os_name = "windows"
+                elif filetype == ida_ida.f_MACHO:
                     os_name = "darwin"
 
             self.m.triple = f"{arch}-unknown-{os_name}"

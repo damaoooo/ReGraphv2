@@ -33,7 +33,7 @@ lsp_start_server(server_id="bash", workspace_root="/home/damaoooo/Downloads/regr
 - `envs/containers/`: 本地 Apptainer/Singularity 镜像；`logs/`: 数据生成和 lifting 日志。
 - `Scripts/`: 数据生成、lift、reopt 脚本；`Scripts/train/` 是训练/评估包装脚本，`Scripts/baselines/` 放基线数据生成（如 `ida2asm.py` 汇编基线）。
 - `Scripts/pipeline.py`: 传统 Typer pipeline，串起 task1/task2/task3/task4。
-- `Scripts/task1_lift.py`: 用 IDA 生成 `.i64`，再调用 `Scripts/ida2llvm.py` lift 到 LLVM IR。IDA 路径硬编码为 `/home/damaoooo/ida-pro-9.3`。
+- `Scripts/task1_lift.py`: 用 IDA 生成 `.i64`，再调用 `Scripts/ida2llvm.py` lift 到 LLVM IR。当前用 IDA 9.4（`~/ida-pro-9.4`）；IDA 路径按 `--ida-path` > `IDADIR` > `~/.idapro/ida-config.json` 解析，并以 `IDADIR` 传给 lifter 子进程。uv 的 `.venv` 没有安装 `idapro`，lift 时用 `PYTHONPATH=$IDADIR/idalib/python uv run --locked --extra pipeline python ...`。
 - `Scripts/task2_reoptimize.py`: `.ll -> .bc`，支持 `O0/O1/O2/O3/Os/Og/Oz/Oc`，其中 `Oc` 是论文使用的保守 canonicalization pass 组合。
 - `Scripts/task3_extract.py`: 对 `.bc` 调 `Scripts/split_llvm_ir.sh` 提取函数级 IR。
 - `Scripts/task4_recompile.py`: `.bc -> .re`，用于把优化后的 bitcode 重新编译成可执行/对象侧产物。
