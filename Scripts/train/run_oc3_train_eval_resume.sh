@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/home/damaoooo/Downloads/regraphv2}"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/IR/Dataset-1-Oc3-fused}"
 RUN_ROOT="${RUN_ROOT:-${REPO_ROOT}/runs/dataset1_oc3_fused}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"

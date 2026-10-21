@@ -31,7 +31,7 @@ lsp_start_server(server_id="bash", workspace_root="/home/damaoooo/Downloads/regr
 - `docs/`: 使用说明，包括 `TRAINING_STEPS_GUIDE.md`。
 - `Scripts/benchmarks/speedtest.py`: 模型测速入口，命令从仓库根目录执行。
 - `envs/containers/`: 本地 Apptainer/Singularity 镜像；`logs/`: 数据生成和 lifting 日志。
-- `Scripts/`: 数据生成、lift、reopt、训练评估包装脚本。
+- `Scripts/`: 数据生成、lift、reopt 脚本；`Scripts/train/` 是训练/评估包装脚本，`Scripts/baselines/` 放基线数据生成（如 `ida2asm.py` 汇编基线）。
 - `Scripts/pipeline.py`: 传统 Typer pipeline，串起 task1/task2/task3/task4。
 - `Scripts/task1_lift.py`: 用 IDA 生成 `.i64`，再调用 `Scripts/ida2llvm.py` lift 到 LLVM IR。IDA 路径硬编码为 `/home/damaoooo/ida-pro-9.3`。
 - `Scripts/task2_reoptimize.py`: `.ll -> .bc`，支持 `O0/O1/O2/O3/Os/Og/Oz/Oc/Oc2`，其中 `Oc/Oc2` 是保守 canonicalization pass 组合。
@@ -90,10 +90,10 @@ python -m Pretrain.run_pretrain train \
 常用包装脚本：
 
 ```bash
-bash Scripts/train_test_fused_opt.sh O0
-bash Scripts/train_test_fused_opt.sh O2 --max-length 4096
-bash Scripts/train_test_fused_opt.sh Os --skip-train
-bash Scripts/train_test_oc_graph_ablation.sh ddg
+bash Scripts/train/train_test_fused_opt.sh O0
+bash Scripts/train/train_test_fused_opt.sh O2 --max-length 4096
+bash Scripts/train/train_test_fused_opt.sh Os --skip-train
+bash Scripts/train/train_test_oc_graph_ablation.sh ddg
 ```
 
 `docs/TRAINING_STEPS_GUIDE.md` 说明了当前默认更偏向按 epoch 训练：`num_train_epochs=1`、`max_steps=-1`、`save_steps=10000`。短 smoke test 才临时设置 `max_steps`。
@@ -128,7 +128,7 @@ python api_server.py
 
 - 本项目很多默认路径是本机绝对路径，尤其 `Pretrain/pretrain_config.py`、`Scripts/task1_lift.py` 和若干 shell 脚本。运行前先确认路径，不要盲目搬命令。
 - 训练和评估默认会很久、吃 GPU、写大量 checkpoint/embedding。除非用户明确要跑，先只做静态分析或给命令。
-- 旧 `Scripts/ablation.sh` 已归档并移除，其历史调用混用了训练池和测试映射。新任务参考 `Scripts/train_test_oc_graph_ablation.sh`、`Scripts/run_modernbert_comparison.sh` 和当前 `evaluation.py`；旧产物恢复说明见 NAS 上的 `/mnt/nas/ReLL-archives/2026-10-21-roformer-retirement/README.md`。
+- 旧 `Scripts/ablation.sh` 已归档并移除，其历史调用混用了训练池和测试映射。新任务参考 `Scripts/train/train_test_oc_graph_ablation.sh`、`Scripts/train/run_modernbert_comparison.sh` 和当前 `evaluation.py`；旧产物恢复说明见 NAS 上的 `/mnt/nas/ReLL-archives/2026-10-21-roformer-retirement/README.md`。
 - `DataProcess` 依赖 `results.db`，数据库中 `results` 表记录 `input_path` 等 graph generation 结果。
 - CFG 图边有第 5 个 probability/edge_attr，DDG 图边没有 edge_attr。`Model/graph_utils.py` 的 `build_batched_span_graph_tensors(..., include_edge_attr=True/False)` 是训练和评估 collator 的共同关键路径。
 - `PretrainConfig.__setattr__` 会同步 `max_seq_length` 和 `max_position_embeddings`，改序列长度时不要只改其中一个。

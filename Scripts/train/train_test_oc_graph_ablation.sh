@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEFAULT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 REPO_ROOT="${REPO_ROOT:-${DEFAULT_REPO_ROOT}}"
 CONDA_ENV="${CONDA_ENV:-}"
@@ -29,7 +29,7 @@ USE_CONDA=1
 print_help() {
   cat <<'EOF'
 Usage:
-  bash Scripts/train_test_oc_graph_ablation.sh MODE [OPTIONS]
+  bash Scripts/train/train_test_oc_graph_ablation.sh MODE [OPTIONS]
 
 MODE:
   ddg       Train/evaluate with DDG only: --no-cfg --ddg
@@ -65,10 +65,10 @@ Environment:
   OUTPUT_ROOT            Same as --output-root.
 
 Examples:
-  bash Scripts/train_test_oc_graph_ablation.sh ddg
-  CONDA_ENV=myenv bash Scripts/train_test_oc_graph_ablation.sh ddg
-  bash Scripts/train_test_oc_graph_ablation.sh cfg --steps 50000
-  bash Scripts/train_test_oc_graph_ablation.sh all --reuse-embeddings
+  bash Scripts/train/train_test_oc_graph_ablation.sh ddg
+  CONDA_ENV=myenv bash Scripts/train/train_test_oc_graph_ablation.sh ddg
+  bash Scripts/train/train_test_oc_graph_ablation.sh cfg --steps 50000
+  bash Scripts/train/train_test_oc_graph_ablation.sh all --reuse-embeddings
 EOF
 }
 

@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="/home/damaoooo/Downloads/regraphv2"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 PYTHON_CMD=${PYTHON_CMD:-$(which python)}
 
 steps=""
@@ -21,7 +21,7 @@ output_root=""
 print_help() {
 	cat <<'EOF'
 Usage:
-  bash Scripts/train_test_fused_opt.sh OPT_LEVEL [OPTIONS]
+  bash Scripts/train/train_test_fused_opt.sh OPT_LEVEL [OPTIONS]
 
 OPT_LEVEL:
   O0, O1, O2, O3, Os, Og, or aliases 0/1/2/3/s/g.
@@ -51,10 +51,10 @@ Environment:
 	PYTHON_CMD             Python runner. Default: output of `which python`
 
 Example:
-  bash Scripts/train_test_fused_opt.sh O0
-  bash Scripts/train_test_fused_opt.sh O2 --max-length 4096
-  bash Scripts/train_test_fused_opt.sh Os --skip-train
-  bash Scripts/train_test_fused_opt.sh Og --steps 10000
+  bash Scripts/train/train_test_fused_opt.sh O0
+  bash Scripts/train/train_test_fused_opt.sh O2 --max-length 4096
+  bash Scripts/train/train_test_fused_opt.sh Os --skip-train
+  bash Scripts/train/train_test_fused_opt.sh Og --steps 10000
 EOF
 }
 

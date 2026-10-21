@@ -1,110 +1,81 @@
-# Pipeline Scripts Usage Guide
+# Scripts
 
-原来的 `lift_dataset1.py` 脚本已经被拆分成了4个独立的Python文件，每个都支持断点续传功能。
+所有命令都从仓库根目录执行，Python 用 `conda run -n ReLL python ...`。
 
-## 文件说明
-
-- `utils.py` - 通用工具函数
-- `task1_lift.py` - 任务1：二进制文件提升到LLVM IR  
-- `task2_reoptimize.py` - 任务2：重新优化LLVM IR文件
-- `task3_extract.py` - 任务3：提取单个函数
-- `pipeline.py` - 主控制脚本，可以运行单个任务或完整流水线
-
-## 使用方法
-
-### 1. 运行完整流水线（推荐）
-
-```bash
-# 运行完整流水线
-python3 pipeline.py pipeline --output /path/to/output
-
-# 使用Dataset-1作为输入
-python3 pipeline.py pipeline --db1 --output /path/to/output
-
-# 自定义输入路径
-python3 pipeline.py pipeline --input-path /path/to/input --output /path/to/output
-
-# 断点续传
-python3 pipeline.py pipeline --output /path/to/output --resume
-
-# 从第2个任务开始运行
-python3 pipeline.py pipeline --output /path/to/output --start-from 2
-
-# 自定义工作进程数
-python3 pipeline.py pipeline --output /path/to/output --workers 8
-
-# Task 2 使用 Os 而不是默认 O3
-python3 pipeline.py pipeline --output /path/to/output --opt-level Os
+```text
+Scripts/
+├── ida2llvm.py            # IDA (idalib) microcode -> LLVM IR
+├── pcode2llvm.py          # Ghidra P-Code -> LLVM IR（配合 ghidra/PcodeDump.java）
+├── ghidra/
+├── pipeline.py            # task1~4 的统一入口（inference.py 也通过它做 lift）
+├── task1_lift.py          # 二进制 -> .i64 -> .ll（IDA）或 二进制 -> .ll（Ghidra）
+├── task2_reoptimize.py    # .ll -> .bc，按 --opt-level 重新优化
+├── task3_extract.py       # .bc -> <name>_functions/ 函数级 IR（调用 split_llvm_ir.sh）
+├── task4_recompile.py     # 可选：.bc -> .re
+├── split_llvm_ir.sh
+├── utils.py               # task1~4 共用
+├── build_db2.sh           # Dataset-2 构建流程（graph -> HF dataset -> wash -> final_set）
+├── baselines/
+│   └── ida2asm.py         # 汇编基线：把每个 IDA 函数导出为 .asm
+├── train/                 # 训练 + 评估包装脚本
+│   ├── train_test_fused_opt.sh
+│   ├── train_test_oc_graph_ablation.sh
+│   ├── run_oc3_train_eval_resume.sh
+│   └── run_modernbert_comparison.sh
+└── benchmarks/
+    └── speedtest.py       # 模型吞吐/显存测速
 ```
 
-### 2. 运行单个任务
+大规模 fused 数据（Ray / Slurm 多机预处理）不在本分支，见 `rope-gnn-cluster` 分支。
 
-#### 任务1：二进制文件提升到LLVM IR
+## 数据管线（task1 ~ task4）
+
 ```bash
-# 基本用法
-python3 pipeline.py task1 --output /path/to/output
+# 完整流水线：lift -> reopt -> 函数提取（task4 默认关闭）
+python Scripts/pipeline.py pipeline --input-path Binaries/Dataset-1 --output IR/Dataset-1-new --workers 32
 
-# 自定义输入路径
-python3 pipeline.py task1 --input-path /path/to/binaries --output /path/to/output
+# 断点续传 / 从某个任务开始
+python Scripts/pipeline.py pipeline --input-path ... --output ... --resume
+python Scripts/pipeline.py pipeline --input-path ... --output ... --start-from 2 --opt-level Oc
 
-# 断点续传
-python3 pipeline.py task1 --output /path/to/output --resume
+# 已有 .i64，跳过 IDA 建库直接 lift
+python Scripts/pipeline.py pipeline --input-path ... --output ... --task1-start-from-step2
 
-# 直接运行任务脚本
-python3 task1_lift.py --output /path/to/output
+# 用 Ghidra 后端
+python Scripts/pipeline.py pipeline --input-path ... --output ... --lifter-backend ghidra --ghidra-home <GHIDRA_DIR>
+
+# 单独跑某个任务
+python Scripts/pipeline.py task2 --input-path IR/xxx --opt-level O0 --resume
+python Scripts/pipeline.py task3 --input-path IR/xxx --resume
 ```
 
-#### 任务2：重新优化LLVM IR文件  
+- task1 在 `--output` 下镜像输入目录结构；失败记录写到 `logs/lift_task1_log.txt`，`ida2llvm.py` 的详细日志写到 `logs/ida2llvm.log`。
+- task2 在原目录把 `x.ll` 写成 `x.bc`；`--opt-level` 支持 `O0/O1/O2/O3/Os/Og/Oz/Oc/Oc2`，`--arch auto` 按文件名推断 `-m32/-m64`。
+- task3 为每个 `x.bc` 生成 `x_functions/`。
+- 所有任务都支持 `--resume` 和 `--workers`。
+
+单个二进制的 lift 也可以直接调用：
+
 ```bash
-# 通过pipeline运行
-python3 pipeline.py task2 --input-path /path/to/ll/files
-
-# 指定优化等级
-python3 pipeline.py task2 --input-path /path/to/ll/files --opt-level O0
-
-# 直接运行任务脚本
-python3 task2_reoptimize.py --input-path /path/to/ll/files --resume --opt-level Os
+python Scripts/ida2llvm.py -f <file.i64> -o <out.ll>
 ```
 
-#### 任务3：提取单个函数
-```bash
-# 通过pipeline运行
-python3 pipeline.py task3 --input-path /path/to/bc/files
+`ida2llvm.py` 关闭数据库时不保存，输入的 `.i64` 不会被修改，同一个 `.i64` 重复运行结果一致；结束时在 stderr 打印 `lift stats: defined=… failed=… no_decompile=…`。
 
-# 直接运行任务脚本
-python3 task3_extract.py --input-path /path/to/bc/files --resume
+## 训练和评估
+
+```bash
+bash Scripts/train/train_test_fused_opt.sh O0              # 不同优化级别 fused 数据：训练 + 测试
+bash Scripts/train/train_test_fused_opt.sh O2 --skip-train
+bash Scripts/train/train_test_oc_graph_ablation.sh ddg     # 图分支消融：cfg / ddg / none / all
+bash Scripts/train/run_oc3_train_eval_resume.sh            # OC3 训练 + 评估（可断点续训）
+bash Scripts/train/run_modernbert_comparison.sh            # ModernBERT 与归档 RoFormer 结果对比
 ```
 
-## 主要改进
+脚本会按自身位置推断仓库根目录，也可以用 `REPO_ROOT=...` 覆盖；各脚本的数据/输出路径参数见 `--help`。
 
-1. **模块化设计**：每个任务都是独立的脚本，可以单独运行
-2. **断点续传**：所有任务都支持 `--resume` 参数，跳过已经处理的文件
-3. **更好的错误处理**：每个任务都有独立的错误处理和统计
-4. **灵活的控制**：可以从任意任务开始运行流水线
-5. **清晰的进度显示**：每个任务都有独立的进度条
-6. **更好的日志**：任务1有独立的日志文件 `logs/lift_task1_log.txt`（相对于仓库根目录）
-7. **Task 2 优化级别可配置**：支持 `--opt-level O0/O1/O2/O3/Os/Oz/...`，默认 `O3`
+## 测速
 
-## 典型使用场景
-
-### 场景1：首次运行完整流水线
 ```bash
-python3 pipeline.py pipeline --db1 --output /path/to/output --workers 16
+python Scripts/benchmarks/speedtest.py --help
 ```
-
-### 场景2：中途中断后继续运行
-```bash
-python3 pipeline.py pipeline --db1 --output /path/to/output --resume
-```
-
-### 场景3：只想重新优化已有的.ll文件
-```bash
-python3 pipeline.py task2 --input-path /path/to/existing/ll/files --resume --opt-level O1
-```
-
-### 场景4：从任务2开始运行（任务1已完成）
-```bash
-python3 pipeline.py pipeline --db1 --output /path/to/output --start-from 2
-```
-
-这样的设计让你可以更灵活地控制处理流程，并且在遇到问题时可以轻松地从中断点继续。
