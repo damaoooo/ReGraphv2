@@ -24,6 +24,7 @@ import io
 import zlib
 import llvmlite.binding as llvm
 from llvmlite import ir
+from llvmlite.ir import _utils as llvm_ir_utils
 
 from contextlib import suppress
 from pathlib import Path
@@ -61,6 +62,12 @@ abi_size_cache = {}
 type_size_cache = {}
 target_data = None
 lift_stats = {"defined": 0, "failed": 0, "no_decompile": 0}
+# 每个 binary 独立的 LLVM 类型上下文，避免同名结构体在同一进程处理多个 binary 时串用
+llvm_context = ir.Context()
+# 全局数据项地址 -> ir.GlobalVariable，用于把指针初始值解析成符号引用
+global_by_ea = {}
+# microcode 字符串常量的独立编号，不受模块中其他全局对象数量影响
+cstr_counter = [0]
 _CACHE_MISS = object()
 
 # 线程局部存储段大小（Windows FS段标准大小）
@@ -151,7 +158,7 @@ LLVM_INT_RE = re.compile(r"i\d+$")
 
 def _reset_lift_state():
     """清理一次 binary lift 过程中的全局缓存。"""
-    global target_data
+    global target_data, llvm_context
     ptext.clear()
     refreshed_funcs.clear()
     lifting_funcs.clear()
@@ -166,6 +173,9 @@ def _reset_lift_state():
     for key in lift_stats:
         lift_stats[key] = 0
     target_data = None
+    llvm_context = ir.Context()
+    global_by_ea.clear()
+    cstr_counter[0] = 0
 
 
 def _init_target_state():
@@ -408,7 +418,7 @@ def _lift_udt(tif: ida_typeinf.tinfo_t) -> ir.Type:
         digest = zlib.crc32(tif.dstr().encode("utf-8", "replace"))
         type_name = f"anon.{kind}.{size}.{digest:08x}"
 
-    context = ir.context.global_context
+    context = llvm_context
     if type_name in context.identified_types:
         return context.identified_types[type_name]
 
@@ -834,6 +844,9 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
         for index, blk in enumerate(res.blocks):
             blk.next_blk = res.blocks[index + 1] if index + 1 < len(res.blocks) else None
 
+        # mop_S 的偏移是 mba 栈帧内的字节偏移，范围 [0, fullsize)
+        res.stack_size = max(int(getattr(mba, "fullsize", 0) or 0), ptrsize // 8)
+
         # Map IDA block start addresses to LLVM blocks for jump resolution.
         res.block_by_ea = {}
         for index in range(mba.qty):
@@ -903,16 +916,27 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
                     builder.ret_void()
                 else:
                     builder.ret(builder.load(res.lvars["funcresult"]))
+        stack_slot = res.lvars.get("stack")
+        if stack_slot is not None:
+            # .cold 等拆分出的函数片段会访问父函数栈帧，fullsize 不一定覆盖全部访问
+            needed = max(res.stack_size, getattr(res, "stack_extent", 0))
+            if needed != stack_slot.allocated_type.count:
+                stack_slot.allocated_type = ir.ArrayType(i8, needed)
+                stack_slot.type = stack_slot.allocated_type.as_pointer()
         with suppress(AttributeError):
             del res.block_by_ea
         with suppress(AttributeError):
             del res.lvars
+        with suppress(AttributeError):
+            del res.stack_size
+        with suppress(AttributeError):
+            del res.stack_extent
         for blk in res.blocks:
             with suppress(AttributeError):
                 del blk.next_blk
         return res
 
-    return _constant_from_bytes(typ, _read_bytes(ea, _type_size(typ)), 0)
+    return _constant_from_bytes(module, typ, _read_bytes(ea, _type_size(typ)), 0)
 
 
 def _read_bytes(ea: int, size: int) -> bytes:
@@ -925,7 +949,56 @@ def _read_bytes(ea: int, size: int) -> bytes:
     return data
 
 
-def _constant_from_bytes(typ: ir.Type, data: bytes, off: int):
+def _resolve_thunk(ea: int) -> int:
+    """thunk 函数解析到真实目标，与调用点（lift_mop 的 mop_v）一致。"""
+    func = _get_func_cached(ea)
+    if func is not None and func.flags & ida_funcs.FUNC_THUNK:
+        target, _ = ida_funcs.calc_thunk_func_target(func)
+        if target != ida_idaapi.BADADDR:
+            return target
+    return ea
+
+
+def _declare_function_at(module: ir.Module, ea: int):
+    """为函数起始地址取得（必要时创建）函数声明；名字被非函数全局占用时返回 None。"""
+    ea = _resolve_thunk(ea)
+    name = _get_name_cached(ea) or f"data_{hex(ea)[2:]}"
+    existing = module.globals.get(name)
+    if existing is not None:
+        return existing if isinstance(existing, ir.Function) else None
+    tif = lift_type_from_address(ea)
+    if tif.is_funcptr():
+        tif = tif.get_ptrarr_object()
+    if not tif.is_func():
+        tif = _default_function_tinfo()
+    with suppress(Exception):
+        return lift_function(module, name, True, ea, tif)
+    return None
+
+
+def _pointer_constant(module: ir.Module, typ: ir.PointerType, value: int):
+    """
+    把指针初始值解析成符号引用：数据项 -> @global（或其内部偏移），函数 -> @func。
+    无法解析时保留原始地址（inttoptr），不冒充 null。
+    """
+    if value == 0:
+        return ir.Constant(typ, None)
+    target = global_by_ea.get(value)
+    if target is None:
+        func = _get_func_cached(value)
+        if func is not None and func.start_ea == value:
+            target = _declare_function_at(module, value)
+    if target is not None:
+        return target if target.type == typ else target.bitcast(typ)
+    head = ida_bytes.get_item_head(value)
+    target = global_by_ea.get(head)
+    if target is not None and head != value:
+        inner = target.bitcast(i8ptr).gep([ir.Constant(ir.IntType(ptrsize), value - head)])
+        return inner if typ == i8ptr else inner.bitcast(typ)
+    return ir.Constant(ir.IntType(ptrsize), value).inttoptr(typ)
+
+
+def _constant_from_bytes(module: ir.Module, typ: ir.Type, data: bytes, off: int):
     """按被分析 binary 的字节序，从已读出的字节中构造 LLVM 常量。"""
     if isinstance(typ, ir.IntType):
         nbytes = max(1, (typ.width + 7) // 8)
@@ -939,27 +1012,34 @@ def _constant_from_bytes(typ: ir.Type, data: bytes, off: int):
         value = struct.unpack_from(fmt, data, off)[0]
         return typ(np.float32(value) if fmt[-1] == "f" else np.float64(value))
     if isinstance(typ, ir.PointerType):
-        return ir.Constant(typ, None)
+        nbytes = ptrsize // 8
+        return _pointer_constant(module, typ, int.from_bytes(data[off:off + nbytes], byteorder))
     if isinstance(typ, ir.ArrayType):
         element = typ.element
         sub_size = _type_size(element)
+        end = off + sub_size * typ.count
+        if not any(data[off:end]):
+            # 全零数组：zeroinitializer，避免为每个元素构造 Python/LLVM 常量对象
+            return ir.Constant(typ, None)
+        if isinstance(element, ir.IntType) and element.width == 8:
+            return ir.Constant(typ, bytearray(data[off:end]))
         if isinstance(element, ir.IntType) and element.width % 8 == 0:
             nbytes = element.width // 8
             values = [
                 int.from_bytes(data[pos:pos + nbytes], byteorder)
-                for pos in range(off, off + sub_size * typ.count, sub_size)
+                for pos in range(off, end, sub_size)
             ]
             return ir.Constant(typ, values)
-        if isinstance(element, ir.PointerType):
-            return ir.Constant(typ, [ir.Constant(element, None)] * typ.count)
         return ir.Constant.literal_array([
-            _constant_from_bytes(element, data, pos)
-            for pos in range(off, off + sub_size * typ.count, sub_size)
+            _constant_from_bytes(module, element, data, pos)
+            for pos in range(off, end, sub_size)
         ])
     if isinstance(typ, (ir.LiteralStructType, ir.IdentifiedStructType)):
+        if not any(data[off:off + _type_size(typ)]):
+            return ir.Constant(typ, None)
         elements = []
         for el in typ.elements:
-            elements.append(_constant_from_bytes(el, data, off))
+            elements.append(_constant_from_bytes(module, el, data, off))
             off += _type_size(el)
         return ir.Constant(typ, elements)
     raise NotImplementedError(f"unsupported constant type {typ}")
@@ -1184,6 +1264,8 @@ def _retype_function(func: ir.Function, ftype: ir.FunctionType):
     """把一个尚无函数体的 ir.Function 改成新的函数类型。"""
     func.ftype = ftype
     func.type = ftype.as_pointer()
+    # 声明还没有函数体，重置命名空间，形参和后续 SSA 编号与直接定义时一致
+    func.scope = llvm_ir_utils.NameScope()
     func.args = tuple(ir.Argument(func, t) for t in ftype.args)
     func.return_value = ir.ReturnValue(func, ftype.return_type)
 
@@ -1368,9 +1450,17 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
         name = "stack"
         func = blk.parent
         if name not in func.lvars:
+            stack_size = getattr(func, "stack_size", ptrsize // 8)
             with builder.goto_entry_block():
-                func.lvars[name] = builder.alloca(ir.IntType(ptrsize), name = name)
-        llvm_arg = get_offset_to(builder, func.lvars[name], mop.s.off)
+                slot = builder.alloca(ir.ArrayType(i8, stack_size), name = name)
+                func.lvars[name] = slot
+                func.lvars["stack.i8"] = builder.bitcast(slot, i8ptr)
+        # 按字节偏移访问，栈槽大小在函数提升完后按实际访问范围再定
+        off = mop.s.off
+        base = func.lvars["stack.i8"]
+        llvm_arg = base if off == 0 else builder.gep(base, (ir.Constant(ir.IntType(ptrsize), off),))
+        width = mop.size if mop.size > 0 else ptrsize // 8
+        func.stack_extent = max(getattr(func, "stack_extent", 0), off + width)
         llvm_arg = _cast_slot(llvm_arg, mop.size, knowntyp, builder)
         return llvm_arg if dest else builder.load(llvm_arg)
     elif t == ida_hexrays.mop_b: # 基本块编号（用于jmp/call指令）
@@ -1414,6 +1504,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
             g_cmt = lift_from_address(module, ea, typ)
             g = ir.GlobalVariable(module, g_cmt.type, name = name)
             g.initializer = g_cmt
+            global_by_ea[ea] = g
 
         if isinstance(g.type.pointee, (ir.IdentifiedStructType, ir.ArrayType)):
             g = builder.gep(g, (ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)))
@@ -1455,7 +1546,8 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
     elif t == ida_hexrays.mop_str: # 字符串常量
         str_csnt = mop.cstr
         strType = ir.ArrayType(ir.IntType(8), len(str_csnt))
-        g = ir.GlobalVariable(blk.parent.parent, strType, name=f"cstr_{len(blk.parent.parent.globals)}")
+        g = ir.GlobalVariable(blk.parent.parent, strType, name=f"cstr_{cstr_counter[0]}")
+        cstr_counter[0] += 1
         g.initializer = ir.Constant(strType, bytearray(str_csnt.encode("utf-8")))
         g.linkage = "private"
         g.global_constant = True
@@ -2024,7 +2116,7 @@ class BIN2LLVMController():
     """
     def __init__(self, target_mode: str = "host"):
         """使用空的LLVM模块初始化控制器。"""
-        self.m = ir.Module()
+        self.m = ir.Module(context=llvm_context)
         self._name_cache = {}
         self._func_cache = {}
         self._function_eas = []
@@ -2137,7 +2229,7 @@ class BIN2LLVMController():
         if not isinstance(func, ir.Function) or getattr(func, "_streamed_definition", False):
             return
         func.blocks.clear()
-        for attr in ("lvars", "block_by_ea"):
+        for attr in ("lvars", "block_by_ea", "stack_size", "stack_extent"):
             with suppress(AttributeError):
                 delattr(func, attr)
 
@@ -2181,7 +2273,7 @@ class BIN2LLVMController():
             # 释放 Hex-Rays 内部缓存的 cfunc，不影响后续反编译结果，显著降低峰值内存
             ida_hexrays.mark_cfunc_dirty(ea, False)
 
-    def create_global(self, ea, width, str_dict):
+    def create_global(self, ea, width, str_dict, pending):
         """
         Creates LLVM global variables for IDA data items.
         
@@ -2196,6 +2288,8 @@ class BIN2LLVMController():
         :param ea: Address of the data item
         :param width: Size of the data item in bytes
         :param str_dict: Dictionary mapping addresses to string data
+        :param pending: 收集 (global, ea, type)，初始值在所有全局变量创建后再计算，
+                        这样指针初始值可以引用任意位置的全局变量
         """
         # 获取数据项名称和类型信息
         name = self._get_name(ea)
@@ -2213,6 +2307,7 @@ class BIN2LLVMController():
             g.initializer = ir.Constant(strType, bytearray(str_csnt))
             g.linkage = "private"
             g.global_constant = True
+            global_by_ea[ea] = g
             return
 
         tif = ida_typeinf.tinfo_t()
@@ -2247,9 +2342,9 @@ class BIN2LLVMController():
         # 其他数据项，可能是 int/float/数组/结构体
         else:
             typ = lift_tif(tif, width)
-            g_cmt = lift_from_address(self.m, ea, typ)
             g = ir.GlobalVariable(self.m, typ, name = name)
-            g.initializer = g_cmt
+            global_by_ea[ea] = g
+            pending.append((g, ea, typ))
 
     def initialize(self):
         """
@@ -2281,7 +2376,8 @@ class BIN2LLVMController():
         for s in idautils.Strings():
             str_dict[s.ea] = s.length
 
-        # 步骤3：为非执行段中的所有数据项创建全局变量
+        # 步骤3：为非执行段中的所有数据项创建全局变量（先建符号，再算初始值）
+        pending = []
         for i in range(idaapi.get_segm_qty()):
             segm = idaapi.getnseg(i)
             if segm is None:
@@ -2292,7 +2388,9 @@ class BIN2LLVMController():
                 end = ida_bytes.get_item_end(head)
                 if end <= head:
                     continue
-                self.create_global(head, end - head, str_dict)
+                self.create_global(head, end - head, str_dict, pending)
+        for g, ea, typ in pending:
+            g.initializer = lift_from_address(self.m, ea, typ)
 
     def begin_stream_to_file(self, filename):
         self._stream_file = open(filename, 'w')
@@ -2320,7 +2418,11 @@ class BIN2LLVMController():
     def _stream_new_type_declarations(self):
         if self._stream_file is None:
             return
-        for type_name, typ in self.m.get_identified_types().items():
+        types = self.m.get_identified_types()
+        if len(types) == len(self._streamed_types):
+            # 类型只增不减：数量没变就没有新类型，跳过 O(T) 扫描
+            return
+        for type_name, typ in types.items():
             if type_name in self._streamed_types:
                 continue
             _write_sanitized_llvm_ir(typ.get_declaration(), self._stream_file)
