@@ -5,6 +5,7 @@ Task 3: fused function extraction, graph building, tokenization, and parquet out
 from __future__ import annotations
 
 import csv
+import fcntl
 import hashlib
 import json
 import math
@@ -1064,32 +1065,56 @@ def is_uninformative_stub(decoded: str, token_len: int, max_tokens: int) -> Opti
     return None
 
 
+_claim_cache: Dict[str, set] = {}
+
 def claim_input_hash(hash_root: Path, split: Optional[str], input_hash: str, item: Dict[str, Any]) -> Optional[Path]:
     prefix = safe_path_token(input_hash.split(":", 1)[-1][:2] or "xx")
-    digest = safe_path_token(input_hash.replace(":", "_"))
-    marker_dir = hash_root / split_key(split) / prefix
+    marker_dir = hash_root / split_key(split)
     ensure_directory(str(marker_dir))
-    marker_path = marker_dir / digest
-    try:
-        fd = os.open(str(marker_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
+    registry_path = marker_dir / f"{prefix}.jsonl"
+    cache_key = str(registry_path)
+
+    # Check process-local cache first
+    seen = _claim_cache.get(cache_key)
+    if seen is not None and input_hash in seen:
         return None
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "input_hash": input_hash,
-                    "split": split_label(split),
-                    "binary_name": item.get("binary_name"),
-                    "function_name": item.get("function_name"),
-                    "file_path": f"{item.get('bc_path')}::{item.get('function_name')}",
-                },
-                ensure_ascii=True,
-                sort_keys=True,
-            )
-            + "\n"
-        )
-    return marker_path
+
+    entry = json.dumps(
+        {
+            "input_hash": input_hash,
+            "split": split_label(split),
+            "binary_name": item.get("binary_name"),
+            "function_name": item.get("function_name"),
+            "file_path": f"{item.get('bc_path')}::{item.get('function_name')}",
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+
+    with open(str(registry_path), "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            if seen is None:
+                # First access: load existing hashes into cache
+                handle.seek(0)
+                seen = set()
+                for line in handle:
+                    try:
+                        seen.add(json.loads(line.rstrip("\n")).get("input_hash"))
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+                _claim_cache[cache_key] = seen
+
+            if input_hash in seen:
+                return None
+
+            handle.write(entry + "\n")
+            handle.flush()
+            seen.add(input_hash)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    return registry_path
 
 
 def seed_input_hashes_from_raw_shards(output_root: Path, record_format: str) -> Dict[str, Any]:
