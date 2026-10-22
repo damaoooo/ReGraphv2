@@ -2960,6 +2960,22 @@ def _verify_llvm_file(path: str) -> tuple[bool, str]:
     return proc.returncode == 0, (proc.stderr or "")[-2000:]
 
 
+def _release_heap():
+    """把已释放的 malloc 堆归还给系统（glibc），否则关闭数据库后的空闲内存仍计入本进程 RSS。"""
+    with suppress(Exception):
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+
+
+def _current_rss_kb():
+    with suppress(OSError):
+        with open("/proc/self/status") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    return None
+
+
 def _previous_output(out: str, sidecar: str):
     """本次运行前已存在的输出及其状态；失败重跑时原样保留，只在 sidecar 中记录其身份。"""
     if not os.path.exists(out):
@@ -3032,6 +3048,8 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
         database_open = False
         _reset_lift_state()
         gc.collect()
+        _release_heap()
+        result["rss_before_verify_kb"] = _current_rss_kb()
         lift_stats.update(snapshot[0])
         unsupported_reasons.update(snapshot[1])
         function_records.extend(snapshot[2])
