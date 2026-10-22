@@ -332,7 +332,7 @@ def _benchmark_forward(
     with torch.inference_mode():
         with autocast_context:
             for _ in range(warmup_steps):
-                outputs = model.encode(
+                outputs = model.forward_embedding(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     return_dict=True,
@@ -346,7 +346,7 @@ def _benchmark_forward(
                 end_event = torch.cuda.Event(enable_timing=True)
                 for _ in range(steps):
                     start_event.record()
-                    outputs = model.encode(
+                    outputs = model.forward_embedding(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         return_dict=True,
@@ -359,7 +359,7 @@ def _benchmark_forward(
             else:
                 for _ in range(steps):
                     start_time = time.perf_counter()
-                    outputs = model.encode(
+                    outputs = model.forward_embedding(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         return_dict=True,

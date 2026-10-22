@@ -23,6 +23,7 @@ class ModernBertPretrainModel(ModernBertPreTrainedModel):
             raise ValueError("This branch requires a ModernBERT checkpoint; RoFormer weights are incompatible.")
         super().__init__(config)
         self.graph_encoder = ModernBertGraph(config)
+        # Keep registered module names stable for existing checkpoints.
         self.head = ModernBertPredictionHead(config)
         self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=config.decoder_bias)
 
@@ -33,6 +34,21 @@ class ModernBertPretrainModel(ModernBertPreTrainedModel):
             nn.LayerNorm(config.embedding_size),
         )
         self.post_init()
+
+    @property
+    def mlm_transform(self) -> ModernBertPredictionHead:
+        """Per-token feature transform before vocabulary prediction."""
+        return self.head
+
+    @property
+    def mlm_decoder(self) -> nn.Linear:
+        """Vocabulary projection, optionally tied to input embeddings."""
+        return self.decoder
+
+    @property
+    def embedding_projection(self) -> nn.Sequential:
+        """Project fused text/graph features into the retrieval space."""
+        return self.linear
 
     def tie_weights(self, **kwargs):
         """Tie the ModernBERT MLM decoder to the graph encoder's token table."""
@@ -55,7 +71,7 @@ class ModernBertPretrainModel(ModernBertPreTrainedModel):
     def set_output_embeddings(self, value):
         self.decoder = value
 
-    def encode(
+    def forward_embedding(
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.FloatTensor,
@@ -69,15 +85,15 @@ class ModernBertPretrainModel(ModernBertPreTrainedModel):
         return_dict: Optional[bool] = None,
         **kwargs,
     ) -> Union[Tuple, Dict[str, torch.Tensor]]:
-        """Inference-only embedding path.
+        """Return retrieval embeddings without computing MLM predictions.
 
-        This bypasses the MLM head entirely and returns only the normalized
-        contrastive embedding (plus attentions when explicitly requested).
+        Used by the MoCo key branch and retrieval inference. Callers control
+        training mode and gradient tracking; this method changes neither.
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         output_attentions = bool(kwargs.pop("output_attentions", False))
 
-        encoder_out = self.graph_encoder(
+        encoder_outputs = self.graph_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             ddg_node_spans=ddg_node_spans,
@@ -90,18 +106,22 @@ class ModernBertPretrainModel(ModernBertPreTrainedModel):
             output_attentions=output_attentions,
         )
 
-        contrastive_embed = self.linear(encoder_out["fused_feature"])
-        contrastive_embed = F.normalize(contrastive_embed, p=2, dim=1)
+        retrieval_embedding = self.embedding_projection(encoder_outputs["fused_feature"])
+        retrieval_embedding = F.normalize(retrieval_embedding, p=2, dim=1)
 
         if not return_dict:
-            return (contrastive_embed,)
+            return (retrieval_embedding,)
 
         result = {
-            "embedding": contrastive_embed,
+            "embedding": retrieval_embedding,
         }
         if output_attentions:
-            result["attentions"] = encoder_out.get("attentions")
+            result["attentions"] = encoder_outputs.get("attentions")
         return result
+
+    def encode(self, *args, **kwargs):
+        """Compatibility entry point; use forward_embedding in new code."""
+        return self.forward_embedding(*args, **kwargs)
 
     def forward(
         self,
@@ -121,7 +141,7 @@ class ModernBertPretrainModel(ModernBertPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         output_attentions = bool(kwargs.pop("output_attentions", False))
 
-        encoder_out = self.graph_encoder(
+        encoder_outputs = self.graph_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             ddg_node_spans=ddg_node_spans,
@@ -134,32 +154,42 @@ class ModernBertPretrainModel(ModernBertPreTrainedModel):
             output_attentions=output_attentions,
         )
 
-        sequence_output = encoder_out["sequence_output"]
-        fused_feature = encoder_out["fused_feature"]
+        sequence_output = encoder_outputs["sequence_output"]
+        fused_feature = encoder_outputs["fused_feature"]
 
-        prediction_logits = self.decoder(self.head(sequence_output))
-
+        # Preserve full logits for tuple callers; training only needs MLM targets.
+        mlm_logits = None
+        if not return_dict:
+            mlm_logits = self.mlm_decoder(self.mlm_transform(sequence_output))
         mlm_loss = None
         if labels is not None:
-            if (labels != -100).any():
-                loss_fct = nn.CrossEntropyLoss()
-                mlm_loss = loss_fct(prediction_logits.view(-1, self.config.vocab_size), labels.view(-1))
+            mlm_positions = labels != -100
+            if mlm_positions.any():
+                if return_dict:
+                    masked_mlm_logits = self.mlm_decoder(
+                        self.mlm_transform(sequence_output[mlm_positions])
+                    )
+                    mlm_loss = F.cross_entropy(masked_mlm_logits, labels[mlm_positions])
+                else:
+                    mlm_loss = F.cross_entropy(
+                        mlm_logits.view(-1, self.config.vocab_size), labels.view(-1)
+                    )
             else:
-                mlm_loss = prediction_logits.new_zeros(())
+                mlm_loss = sequence_output.new_zeros(())
 
-        contrastive_embed = self.linear(fused_feature)
-        contrastive_embed = F.normalize(contrastive_embed, p=2, dim=1)
+        retrieval_embedding = self.embedding_projection(fused_feature)
+        retrieval_embedding = F.normalize(retrieval_embedding, p=2, dim=1)
 
         if not return_dict:
-            output = (prediction_logits, contrastive_embed)
+            output = (mlm_logits, retrieval_embedding)
             return ((mlm_loss,) + output) if mlm_loss is not None else output
 
         result = {
             "loss": mlm_loss,
-            "embedding": contrastive_embed,
+            "embedding": retrieval_embedding,
         }
         if output_attentions:
-            result["attentions"] = encoder_out.get("attentions")
+            result["attentions"] = encoder_outputs.get("attentions")
         return result
 
 
@@ -181,6 +211,7 @@ class MoCoPretrainModel(nn.Module):
         self.moco_momentum = config.moco_momentum
         self.moco_temperature = config.moco_temperature
 
+        # Query learns by backpropagation; key tracks it via momentum updates.
         self.encoder_q = ModernBertPretrainModel(config)
         self.encoder_k = ModernBertPretrainModel(config)
         self.encoder_k.load_state_dict(self.encoder_q.state_dict())
@@ -239,31 +270,35 @@ class MoCoPretrainModel(nn.Module):
         self.encoder_q.gradient_checkpointing_disable()
 
     def forward(self, view1: Dict, view2: Dict, return_loss: bool = True):
-        q_outputs = self.encoder_q(**view1)
-        q_emb = q_outputs["embedding"]
-        mlm_loss = q_outputs["loss"]
+        """Use a masked query view and an unmasked positive key view."""
+        query_outputs = self.encoder_q(**view1)
+        query_embedding = query_outputs["embedding"]
+        mlm_loss = query_outputs["loss"]
 
         with torch.no_grad():
             if self.training:
                 self._momentum_update_key_encoder()
-            k_outputs = self.encoder_k(**view2)
-            k_emb = k_outputs["embedding"]
+            key_outputs = self.encoder_k.forward_embedding(**view2)
+            key_embedding = key_outputs["embedding"]
 
-        l_pos = torch.einsum("nc,nc->n", [q_emb, k_emb]).unsqueeze(-1)
-        l_neg = torch.einsum("nc,ck->nk", [q_emb, self.queue.clone().detach()])
+        positive_logits = torch.einsum("nc,nc->n", [query_embedding, key_embedding]).unsqueeze(-1)
+        negative_logits = torch.einsum("nc,ck->nk", [query_embedding, self.queue.clone().detach()])
 
-        q_labels = view1["group_ids"].view(-1, 1)
-        k_labels = self.queue_labels.view(1, -1)
-        l_neg = l_neg.masked_fill(torch.eq(q_labels, k_labels), -1e9)
+        query_group_ids = view1["group_ids"].view(-1, 1)
+        queue_group_ids = self.queue_labels.view(1, -1)
+        negative_logits = negative_logits.masked_fill(torch.eq(query_group_ids, queue_group_ids), -1e9)
 
-        logits = torch.cat([l_pos, l_neg], dim=1)
-        logits /= self.moco_temperature
+        contrastive_logits = torch.cat([positive_logits, negative_logits], dim=1)
+        contrastive_logits /= self.moco_temperature
 
-        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
-        contrastive_loss = nn.CrossEntropyLoss()(logits, labels)
+        # Column zero holds the positive key; other columns hold queued negatives.
+        positive_targets = torch.zeros(
+            contrastive_logits.shape[0], dtype=torch.long, device=contrastive_logits.device
+        )
+        contrastive_loss = F.cross_entropy(contrastive_logits, positive_targets)
 
         if self.training:
-            self._dequeue_and_enqueue(k_emb, view2["group_ids"])
+            self._dequeue_and_enqueue(key_embedding, view2["group_ids"])
 
         total_loss = mlm_loss + contrastive_loss
 

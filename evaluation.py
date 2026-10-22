@@ -505,7 +505,7 @@ def generate_embeddings_with_model(
                 with torch.inference_mode():
                     if use_bf16:
                         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                            outputs = model.encode(
+                            outputs = model.forward_embedding(
                                 input_ids=input_ids, 
                                 attention_mask=attention_mask, 
                                 return_dict=True,
@@ -513,7 +513,7 @@ def generate_embeddings_with_model(
                             )
                             embeddings = outputs['embedding']
                     else:
-                        outputs = model.encode(
+                        outputs = model.forward_embedding(
                             input_ids=input_ids, 
                             attention_mask=attention_mask, 
                             return_dict=True,
@@ -1108,7 +1108,7 @@ def export_resumable_embeddings(args):
             batch = {key: value.cuda() if isinstance(value, torch.Tensor) else value
                      for key, value in batch.items()}
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                vectors = model.encode(**batch)["embedding"]
+                vectors = model.forward_embedding(**batch)["embedding"]
             vectors = vectors.float().cpu().numpy()
             if not np.isfinite(vectors).all():
                 raise ValueError(f"Nonfinite embeddings at row {offset}")

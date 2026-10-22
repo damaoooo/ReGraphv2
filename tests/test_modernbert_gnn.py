@@ -2,6 +2,7 @@
 
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -49,13 +50,13 @@ class ModernBertTests(unittest.TestCase):
                         ))
                 model.eval()
                 with torch.no_grad():
-                    expected = model.encode(**batch)["embedding"]
+                    expected = model.forward_embedding(**batch)["embedding"]
                     torch.testing.assert_close(expected.norm(dim=1), torch.ones(2))
                 with tempfile.TemporaryDirectory() as directory:
                     model.save_pretrained(directory, safe_serialization=False)
                     restored = ModernBertPretrainModel.from_pretrained(directory).eval()
                     with torch.no_grad():
-                        torch.testing.assert_close(restored.encode(**batch)["embedding"], expected)
+                        torch.testing.assert_close(restored.forward_embedding(**batch)["embedding"], expected)
                     self.assertIs(restored.get_input_embeddings().weight, restored.decoder.weight)
 
     def test_moco_checkpointing_and_attention(self):
@@ -69,12 +70,71 @@ class ModernBertTests(unittest.TestCase):
         self.assertTrue(all(p.grad is None for p in model.encoder_k.parameters()))
         model.eval()
         with self.assertRaisesRegex(ValueError, "export is disabled"):
-            model.encoder_q.encode(**batch, output_attentions=True)
+            model.encoder_q.forward_embedding(**batch, output_attentions=True)
         self.assertEqual(model.config._attn_implementation, "sdpa")
 
     def test_reject_old_config(self):
         with self.assertRaises(ValueError):
             self.config(model_type="roformer")
+
+    def test_sparse_mlm_matches_full_loss_and_gradients(self):
+        model = ModernBertPretrainModel(self.config(use_cfg=True, use_ddg=True)).eval()
+        batch = self.batch()
+        batch["labels"][:] = -100
+        batch["labels"][:, 2] = batch["input_ids"][:, 2]
+        full_loss, logits, full_embedding = model(**batch, return_dict=False)
+        self.assertEqual(logits.shape, (2, 16, 64))
+        (full_loss + full_embedding[:, 0].sum()).backward()
+        expected = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+        model.zero_grad(set_to_none=True)
+        with patch.object(model.mlm_decoder, "forward", wraps=model.mlm_decoder.forward) as decoder:
+            sparse = model(**batch, return_dict=True)
+            self.assertEqual(decoder.call_args.args[0].shape, (2, 32))
+        torch.testing.assert_close(sparse["loss"], full_loss)
+        torch.testing.assert_close(sparse["embedding"], full_embedding)
+        (sparse["loss"] + sparse["embedding"][:, 0].sum()).backward()
+        actual = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+        self.assertEqual(actual.keys(), expected.keys())
+        for name in expected:
+            torch.testing.assert_close(actual[name], expected[name], atol=2e-6, rtol=2e-4)
+
+    def test_mlm_empty_and_missing_labels_skip_decoder(self):
+        model = ModernBertPretrainModel(self.config())
+        batch = self.batch()
+        batch["labels"][:] = -100
+        with patch.object(model.mlm_decoder, "forward", side_effect=AssertionError("unused decoder")):
+            result = model(**batch)
+            self.assertEqual(result["loss"].item(), 0)
+            (result["loss"] + result["embedding"][:, 0].sum()).backward()
+            del batch["labels"]
+            self.assertIsNone(model(**batch)["loss"])
+
+    def test_key_skips_mlm(self):
+        model = MoCoPretrainModel(self.config())
+        batch = self.batch()
+        with patch.object(model.encoder_k.mlm_transform, "forward", side_effect=AssertionError("key MLM")):
+            result = model(batch, batch)
+            result["loss"].backward()
+        self.assertTrue(model.encoder_k.training)
+        self.assertTrue(all(p.grad is None for p in model.encoder_k.parameters()))
+
+    def test_embedding_api_and_checkpoint_names_remain_compatible(self):
+        model = ModernBertPretrainModel(self.config()).eval()
+        batch = self.batch()
+        with torch.no_grad():
+            expected = model.forward_embedding(**batch)["embedding"]
+            torch.testing.assert_close(model.encode(**batch)["embedding"], expected)
+            torch.testing.assert_close(
+                model.forward_embedding(**batch, return_dict=False)[0], expected
+            )
+        self.assertIs(model.mlm_transform, model.head)
+        self.assertIs(model.mlm_decoder, model.decoder)
+        self.assertIs(model.embedding_projection, model.linear)
+        state = model.state_dict()
+        for prefix in ("head.", "decoder.", "linear."):
+            self.assertTrue(any(key.startswith(prefix) for key in state))
+        for prefix in ("mlm_transform.", "mlm_decoder.", "embedding_projection."):
+            self.assertFalse(any(key.startswith(prefix) for key in state))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
     def test_cuda_bfloat16(self):
