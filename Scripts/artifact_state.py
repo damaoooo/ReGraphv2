@@ -191,19 +191,54 @@ def write_failed_lift_state(ll_path: str, input_path: str, status: str, error: s
     })
 
 
-def check_reopt_output(bc_path: str) -> tuple[bool, str, dict | None]:
+def _upstream_missing(path: str, allow_detached: bool, what: str) -> tuple[bool, str]:
+    """
+    Detached artifacts: if the recorded upstream file no longer exists (e.g. only .bc/function files
+    were copied elsewhere), the artifact can only be vouched for by its own state. That is refused by
+    default and accepted only with allow_detached, where the reason says so explicitly.
+    """
+    if allow_detached:
+        return True, f"detached: {what} {path} missing, upstream not re-validated"
+    return False, f"upstream {what} {path} missing (detached artifact)"
+
+
+def check_reopt_output(bc_path: str, allow_detached: bool = False) -> tuple[bool, str, dict | None]:
+    """
+    A task2 .bc is valid if its state is ok, the .bc has the recorded hash, and the upstream .ll it was
+    made from is still exactly the recorded content AND still a valid task1 output whose .lift.json is
+    byte-identical to the one recorded (a failed or changed upstream rerun invalidates the .bc).
+    """
     state = read_json(bc_path + REOPT_SUFFIX)
     ok, reason = check_output(state, bc_path)
-    if ok:
-        # the input it was made from must still be the recorded, valid lift output
-        src = (state.get("input") or {}).get("path")
-        if src and os.path.isfile(src) and sha256_file(src) != state["input"].get("sha256"):
-            ok, reason = False, "input .ll changed after this .bc was produced"
-    return ok, reason, state
+    if not ok:
+        return ok, reason, state
+    recorded = state.get("input") or {}
+    src = recorded.get("path")
+    if not src or not os.path.isfile(src):
+        ok, reason = _upstream_missing(src, allow_detached, ".ll")
+        return ok, reason, state
+    if sha256_file(src) != recorded.get("sha256"):
+        return False, "input .ll changed after this .bc was produced", state
+    if recorded.get("state") == "legacy-unverified":
+        return True, "ok (legacy-unverified upstream)", state
+    lift_state_path = src + LIFT_SUFFIX
+    if not os.path.isfile(lift_state_path):
+        return False, "upstream .lift.json missing", state
+    if "lift_state_sha256" in recorded and sha256_file(lift_state_path) != recorded["lift_state_sha256"]:
+        return False, "upstream .lift.json changed after this .bc was produced (rerun, failure or new provenance)", state
+    lift_ok, lift_reason, _ = check_lift_output(src, recorded.get("memory_contract"))
+    if not lift_ok:
+        return False, f"upstream lift no longer valid: {lift_reason}", state
+    return True, "ok", state
 
 
-def check_extract_dir(function_dir: str, verify_files: bool = True) -> tuple[bool, str, dict | None]:
-    """A task3 function directory is valid if its state is ok and every listed file has the recorded hash."""
+def check_extract_dir(function_dir: str, verify_files: bool = True,
+                      allow_detached: bool = False) -> tuple[bool, str, dict | None]:
+    """
+    A task3 function directory is valid if its state is ok, every listed file has the recorded hash,
+    and the .bc it was split from is still the recorded content and a valid task2 output whose
+    .reopt.json is the recorded one (recursively validating the .ll and .lift.json behind it).
+    """
     function_dir = function_dir.rstrip(os.sep)
     state = read_json(function_dir + EXTRACT_SUFFIX)
     if state is None:
@@ -217,7 +252,22 @@ def check_extract_dir(function_dir: str, verify_files: bool = True) -> tuple[boo
             path = os.path.join(function_dir, entry["file"])
             if not os.path.isfile(path) or sha256_file(path) != entry["sha256"]:
                 return False, f"function file {entry['file']} differs from extract state", state
-    return True, "ok", state
+    recorded = state.get("input") or {}
+    bc = recorded.get("path")
+    if not bc or not os.path.isfile(bc):
+        ok, reason = _upstream_missing(bc, allow_detached, ".bc")
+        return ok, reason, state
+    if sha256_file(bc) != recorded.get("sha256"):
+        return False, "input .bc changed after these functions were extracted", state
+    if recorded.get("state") == "legacy-unverified" and not os.path.exists(bc + REOPT_SUFFIX):
+        return True, "ok (legacy-unverified upstream)", state
+    if "reopt_state_sha256" in recorded:
+        if not os.path.isfile(bc + REOPT_SUFFIX) or sha256_file(bc + REOPT_SUFFIX) != recorded["reopt_state_sha256"]:
+            return False, "upstream .reopt.json changed after extraction (rerun, failure or new provenance)", state
+    reopt_ok, reopt_reason, _ = check_reopt_output(bc, allow_detached)
+    if not reopt_ok:
+        return False, f"upstream reopt no longer valid: {reopt_reason}", state
+    return True, reopt_reason if reopt_reason.startswith("detached") else "ok", state
 
 
 def iter_function_dirs(root: str):
@@ -234,7 +284,8 @@ def _is_function_ir(name: str) -> bool:
     return name.endswith(".ll") and not name.endswith(("_purified.ll", "_instrumented.ll"))
 
 
-def select_function_files(root: str, allow_legacy: bool = False, verify_files: bool = True):
+def select_function_files(root: str, allow_legacy: bool = False, verify_files: bool = True,
+                          allow_detached: bool = False):
     """
     Function IR files that downstream stages may use, with their provenance:
     {abs_path: {"sha256", "llvm_name", "lift", "input_state", "memory_contract", "extract_state"}}.
@@ -244,7 +295,7 @@ def select_function_files(root: str, allow_legacy: bool = False, verify_files: b
     from collections import Counter
     selected, rejected = {}, Counter()
     for function_dir in iter_function_dirs(root):
-        ok, reason, state = check_extract_dir(function_dir, verify_files)
+        ok, reason, state = check_extract_dir(function_dir, verify_files, allow_detached)
         if ok:
             for entry in state.get("functions", []):
                 path = os.path.abspath(os.path.join(function_dir, entry["file"]))
@@ -255,6 +306,8 @@ def select_function_files(root: str, allow_legacy: bool = False, verify_files: b
                     "input_state": state["input"].get("state"),
                     "memory_contract": state["input"].get("memory_contract"),
                     "extract_state": function_dir + EXTRACT_SUFFIX,
+                    "extract_state_sha256": sha256_file(function_dir + EXTRACT_SUFFIX),
+                    "detached": reason.startswith("detached"),
                 }
         elif state is None and allow_legacy:
             for name in sorted(os.listdir(function_dir)):
@@ -262,7 +315,7 @@ def select_function_files(root: str, allow_legacy: bool = False, verify_files: b
                     path = os.path.abspath(os.path.join(function_dir, name))
                     selected[path] = {"sha256": sha256_file(path), "llvm_name": None, "lift": None,
                                       "input_state": "legacy-unverified", "memory_contract": None,
-                                      "extract_state": None}
+                                      "extract_state": None, "extract_state_sha256": None, "detached": False}
         else:
             rejected[reason] += 1
     return selected, rejected

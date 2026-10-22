@@ -44,15 +44,23 @@ def check_task3_input(bc_path: str, allow_legacy_inputs: bool) -> tuple[bool, st
         "config_token": state.get("config_token"),
         "approx": state.get("approx", []),
         "lift_input": state["input"].get("path"),
+        "lift_state_sha256": state["input"].get("lift_state_sha256"),
         "memory_contract": state["input"].get("memory_contract"),
     }
 
 
-def lift_records_by_llvm_name(ll_path: str | None) -> dict:
-    """llvm name -> lifter record (status, approximation tags) from the task1 state of the source .ll."""
-    if not ll_path:
+def lift_records_by_llvm_name(ll_path: str | None, expected_sha256: str | None) -> dict:
+    """
+    llvm name -> lifter record (status, approximation tags) from the task1 state of the source .ll.
+    The .lift.json must be the one recorded when the .bc was produced; a different (rerun/failed)
+    state is never attached to an older .bc.
+    """
+    if not ll_path or not expected_sha256:
         return {}
-    lift_state = artifact_state.read_json(ll_path + artifact_state.LIFT_SUFFIX) or {}
+    state_path = ll_path + artifact_state.LIFT_SUFFIX
+    if not os.path.isfile(state_path) or artifact_state.sha256_file(state_path) != expected_sha256:
+        raise RuntimeError("upstream .lift.json differs from the one this .bc was produced from")
+    lift_state = artifact_state.read_json(state_path) or {}
     records = {}
     for record in lift_state.get("functions", []):
         name = record.get("llvm_name")
@@ -85,7 +93,7 @@ def extract_functions(file_path: str, output_path: str, input_info: dict, timeou
         map_path = os.path.join(tmp_dir, "function_map.csv")
         if not os.path.exists(map_path):
             raise RuntimeError(f"no defined functions found: {(stderr or stdout)[-300:]}")
-        lift_records = lift_records_by_llvm_name(input_info.get("lift_input"))
+        lift_records = lift_records_by_llvm_name(input_info.get("lift_input"), input_info.get("lift_state_sha256"))
         functions, record_status = [], Counter()
         with open(map_path, newline="") as handle:
             for row in csv.DictReader(handle):

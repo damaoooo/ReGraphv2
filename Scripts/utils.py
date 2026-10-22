@@ -28,7 +28,7 @@ def normalize_clang_opt_level(opt_level: str) -> str:
 
     return normalized
 
-def run_command(command, description="", timeout=3600, memory_limit_gb=10, tail_bytes=8000):
+def run_command(command, description="", timeout=3600, memory_limit_gb=10, tail_bytes=8000, kill_grace_s=30):
     """Run a command and return (success, stdout_tail, stderr_tail).
 
     Output is spooled to temporary files rather than held in memory, and only the last
@@ -41,8 +41,8 @@ def run_command(command, description="", timeout=3600, memory_limit_gb=10, tail_
         timeout: Timeout in seconds (default: 3600; 0 or None disables it)
         memory_limit_gb: Address-space limit in GB (default: 10)
     """
-    import signal
     import tempfile
+    from job_runner import kill_group, reap_group
 
     def set_limits():
         memory_limit_bytes = memory_limit_gb * 1024 * 1024 * 1024
@@ -62,17 +62,9 @@ def run_command(command, description="", timeout=3600, memory_limit_gb=10, tail_
             return False, "", str(e)
         try:
             p.wait(timeout=timeout or None)
+            reap_group(p)
         except subprocess.TimeoutExpired:
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.killpg(p.pid, sig)
-                except ProcessLookupError:
-                    break
-                try:
-                    p.wait(timeout=30)
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
+            kill_group(p, grace_s=kill_grace_s)
             return False, tail(out), f"Command timed out after {timeout} seconds\n{tail(err)}"
         return p.returncode == 0, tail(out), tail(err)
 

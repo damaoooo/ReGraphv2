@@ -84,12 +84,15 @@ def select_inputs(input_dir: str, db_file_origin: str, policy: dict, allow_legac
             "lift": info.get("lift"),
             "input_state": info.get("input_state"),
             "memory_contract": info.get("memory_contract"),
+            "extract_state_sha256": info.get("extract_state_sha256"),
+            "detached": info.get("detached", False),
             "selected": reason is None,
             "exclusion": reason,
         })
 
-    selection_digest = hashlib.sha256("".join(sorted(f"{r['input_path']}:{r['sha256']};" for r in provenance
-                                                     if r["selected"])).encode()).hexdigest()
+    # 选择摘要包含每个函数的来源信息（不只是内容 hash）：上游状态或标签变化时不能续用旧的输出目录
+    selection_digest = hashlib.sha256("\n".join(sorted(json.dumps(r, sort_keys=True) for r in provenance
+                                                       if r["selected"])).encode()).hexdigest()
     summary = {
         "policy": {k: v for k, v in policy.items() if not k.startswith("_")},
         "policy_path": policy.get("_path"),

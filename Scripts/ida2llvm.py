@@ -1859,12 +1859,104 @@ def _store_as(l: ir.Value, d: ir.Value, blk: ir.Block, builder: ir.IRBuilder, d_
     return builder.store(l, d)
 
 
+# ============================================================================
+# 访存对齐：LLVM 中不写 align 的 load/store 表示"按类型的 ABI 对齐"，这是一个保证而不是"未知"。
+# 源程序的访存（任意地址、packed 结构体成员、栈帧字节数组中的偏移）没有这种保证，
+# 所以只保留能从基对象（alloca/全局变量）和常量偏移证明的对齐，其余一律 align 1。
+# 显式指定了对齐的访问（_mm_load_si128 的 align 16 等）和原子指令不受影响。
+# ============================================================================
+
+def _abi_alignment(typ: ir.Type) -> int:
+    """类型在输出 layout 下的 ABI 对齐；无法计算时返回 1（只会让访存更保守，不会多给保证）。"""
+    if isinstance(typ, ir.PointerType):
+        typ = i8ptr  # 指针的对齐与指向的类型无关，避免对具名结构体单独求值
+    elif isinstance(typ, ir.ArrayType):
+        return _abi_alignment(typ.element)
+    elif isinstance(typ, (ir.IdentifiedStructType, ir.LiteralStructType)) and typ.packed:
+        return 1
+    key = ("align", id(typ))
+    entry = abi_size_cache.get(key)
+    if entry is None:
+        try:
+            align = typ.get_abi_alignment(_get_target_data(), context=llvm_context)
+        except Exception:
+            align = 1
+        entry = (typ, align)
+        abi_size_cache[key] = entry
+    return entry[1]
+
+
+def _gep_constant_offset(gep) -> int | None:
+    """常量下标 GEP 相对其基指针的字节偏移；含变量下标或非 packed 结构体时返回 None。"""
+    cur = gep.pointer.type.pointee
+    offset = 0
+    for position, index in enumerate(gep.indices):
+        if not isinstance(index, ir.Constant) or not isinstance(index.constant, int):
+            return None
+        if position == 0:
+            offset += index.constant * _type_size(cur)
+        elif isinstance(cur, ir.ArrayType):
+            cur = cur.element
+            offset += index.constant * _type_size(cur)
+        elif isinstance(cur, (ir.IdentifiedStructType, ir.LiteralStructType)) and cur.packed:
+            offset += sum(_type_size(el) for el in cur.elements[:index.constant])
+            cur = cur.elements[index.constant]
+        else:
+            return None
+    return offset
+
+
+def _known_alignment(ptr: ir.Value) -> int:
+    """能证明的 ptr 对齐字节数：沿 bitcast / 常量 GEP 回溯到 alloca 或全局变量；否则为 1。"""
+    offset = 0
+    while True:
+        if isinstance(ptr, ir.CastInstr) and ptr.opname == "bitcast":
+            ptr = ptr.operands[0]
+        elif isinstance(ptr, ir.GEPInstr):
+            step = _gep_constant_offset(ptr)
+            if step is None:
+                return 1
+            offset += step
+            ptr = ptr.pointer
+        else:
+            break
+    if isinstance(ptr, ir.AllocaInstr):
+        base = ptr.align or _abi_alignment(ptr.allocated_type)
+    elif isinstance(ptr, ir.GlobalVariable):
+        base = ptr.align or _abi_alignment(ptr.value_type)
+    else:
+        return 1  # inttoptr / 函数参数 / 加载出的指针：源地址的对齐未知
+    if offset:
+        base = min(base, offset & -offset)
+    return max(1, base)
+
+
+def _set_conservative_alignment(inst):
+    """load/store 未显式指定对齐时，写入可证明的对齐（不低于类型 ABI 对齐时保持默认）。"""
+    if inst.align is not None:
+        return
+    ptr = inst.operands[1] if isinstance(inst, ir.StoreInstr) else inst.operands[0]
+    access_type = ptr.type.pointee
+    known = _known_alignment(ptr)
+    if known < _abi_alignment(access_type):
+        inst.align = known
+
+
+def _apply_conservative_alignment(func: ir.Function):
+    for block in func.blocks:
+        for inst in block.instructions:
+            if isinstance(inst, (ir.LoadInstr, ir.StoreInstr)):
+                _set_conservative_alignment(inst)
+
+
 def _store_to_address(value: ir.Value, address: ir.Value, builder: ir.IRBuilder):
-    """把 value 写到 address（一个地址值，整数或指针）指向的内存。"""
+    """把 value 写到 address（一个地址值，整数或指针）指向的内存；对齐不作任何假设。"""
     if value is None or isinstance(value.type, ir.VoidType):
         return None
     ptr = typecast(address, value.type.as_pointer(), builder)
-    return builder.store(value, ptr)
+    store = builder.store(value, ptr)
+    _set_conservative_alignment(store)
+    return store
 
 def create_intrinsic_function(module: ir.Module, func_name: str, ftif):
     """
@@ -2350,6 +2442,7 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
             typ = ir.IntType(d_mop.size * 8)
         r = typecast(r, typ.as_pointer(), builder)
         r = builder.load(r)
+        _set_conservative_alignment(r)
         d = storecast(r, d, builder)
         return _store_as(r, d, blk, builder)
     elif op == ida_hexrays.m_stx:  # stx  l, {r=sel, d=off}  写入 d 指向的内存
@@ -2817,6 +2910,7 @@ class BIN2LLVMController():
             return
 
         self._stream_new_type_declarations()
+        _apply_conservative_alignment(func)
         self._stream_file.write(str(func))
         self._stream_file.write("\n")
         self._streamed_functions.add(func.name)
@@ -2904,6 +2998,8 @@ def _write_module_remainder(module: ir.Module, output, skip_type_names=None):
     for global_value in module.globals.values():
         if isinstance(global_value, ir.Function) and getattr(global_value, "_streamed_definition", False):
             continue
+        if isinstance(global_value, ir.Function) and not global_value.is_declaration:
+            _apply_conservative_alignment(global_value)  # __readfs*/__writefs* 等 lifter 自带的函数体
         _write_llvm_text(str(global_value), output)
 
     for metadata_line in module._get_metadata_lines():

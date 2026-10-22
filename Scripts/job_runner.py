@@ -49,19 +49,50 @@ def default_workers(mem_per_job_mb: int, reserve_mb: int = 8192) -> int:
     return max(1, min(cpus, (available - reserve_mb) // mem_per_job_mb))
 
 
-def _kill_group(proc: subprocess.Popen, grace_s: float):
+def _group_alive(pgid: int) -> bool:
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(pgid, 0)
     except ProcessLookupError:
-        return
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def kill_group(proc: subprocess.Popen, grace_s: float):
+    """
+    SIGTERM the job's process group; after the grace period SIGKILL whatever is left of the group,
+    also when the leader already exited (children that ignore SIGTERM would otherwise survive).
+    Only the job's own group is signalled: it was created by start_new_session, so its id is the
+    leader's pid, which the kernel does not reuse while any member of the group exists.
+    """
+    pgid = proc.pid
     try:
-        proc.wait(timeout=grace_s)
-    except subprocess.TimeoutExpired:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.time() + grace_s
+    while time.time() < deadline:
+        if proc.poll() is not None and not _group_alive(pgid):
+            break
+        time.sleep(min(0.05, grace_s))
+    if _group_alive(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    proc.wait()
+
+
+def reap_group(proc: subprocess.Popen):
+    """After a normal exit, kill members the job left behind in its group (none are expected)."""
+    if _group_alive(proc.pid):
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        proc.wait()
+        return True
+    return False
 
 
 def run_logged(cmd, log_path: str, timeout_s: float | None = None, env=None, cwd=None,
@@ -80,8 +111,10 @@ def run_logged(cmd, log_path: str, timeout_s: float | None = None, env=None, cwd
         try:
             returncode = proc.wait(timeout=timeout_s if timeout_s and timeout_s > 0 else None)
             timed_out = False
+            if reap_group(proc):
+                log.write("\n[job_runner] killed processes left in the job's group after it exited\n")
         except subprocess.TimeoutExpired:
-            _kill_group(proc, grace_s)
+            kill_group(proc, grace_s)
             returncode, timed_out = proc.returncode, True
             log.write(f"\n[job_runner] killed process group after {timeout_s}s timeout\n")
         log.write(f"[job_runner] returncode={returncode} elapsed={time.time() - started:.1f}s\n")

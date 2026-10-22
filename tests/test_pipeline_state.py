@@ -310,7 +310,27 @@ def test_task3_rejects_unverified_bitcode(tmp_path):
 
 # --------------------------------------------------------------------- GraphBuilder / DataProcess
 
+def make_chain(root: Path, name: str, lift_status="ok"):
+    """A consistent task1 -> task2 chain (states as the stages write them), without running LLVM."""
+    ll = make_lifted(root, name, GOOD_FN)
+    lift_state_path = Path(str(ll) + artifact_state.LIFT_SUFFIX)
+    if lift_status != "ok":
+        state = json.loads(lift_state_path.read_text())
+        state["status"] = lift_status
+        lift_state_path.write_text(json.dumps(state))
+    bc = root / f"{name}.bc"
+    bc.write_bytes(b"bitcode of " + name.encode())
+    reopt = {"schema": artifact_state.SCHEMA, "stage": "reopt", "status": "ok",
+             "input": {**artifact_state.file_identity(str(ll)), "state": "verified",
+                       "memory_contract": "source-layout",
+                       "lift_state_sha256": artifact_state.sha256_file(str(lift_state_path))},
+             "output": artifact_state.file_identity(str(bc))}
+    Path(str(bc) + artifact_state.REOPT_SUFFIX).write_text(json.dumps(reopt))
+    return ll, bc
+
+
 def make_function_dir(root: Path, name: str, functions: dict, approx=None, status="ok"):
+    ll, bc = make_chain(root, name)
     fdir = root / f"{name}_functions"
     fdir.mkdir(parents=True)
     entries = []
@@ -320,7 +340,9 @@ def make_function_dir(root: Path, name: str, functions: dict, approx=None, statu
         entries.append({"llvm_name": llvm_name, "file": path.name, "sha256": artifact_state.sha256_file(str(path)),
                         "lift": {"status": "lifted", "approx": (approx or {}).get(llvm_name, [])}})
     state = {"schema": artifact_state.SCHEMA, "stage": "extract", "status": status, "output_dir": str(fdir),
-             "input": {"state": "verified", "memory_contract": "source-layout"}, "functions": entries}
+             "input": {**artifact_state.file_identity(str(bc)), "state": "verified", "memory_contract": "source-layout",
+                       "reopt_state_sha256": artifact_state.sha256_file(str(bc) + artifact_state.REOPT_SUFFIX)},
+             "functions": entries}
     (root / f"{name}_functions.extract.json").write_text(json.dumps(state))
     return fdir
 
@@ -452,3 +474,140 @@ def test_output_of_a_changed_lift_input_is_rejected(lift_env, L):
     src.write_bytes(b"database v2")
     ok, reason, _ = artifact_state.check_lift_output(str(out))
     assert not ok and "input changed" in reason
+
+
+# ------------------------------------------------------------- provenance chain (final-audit P1)
+
+def rewrite_state(path, **changes):
+    state = json.loads(Path(path).read_text())
+    state.update(changes)
+    Path(path).write_text(json.dumps(state))
+
+
+def test_bc_rejected_after_failed_upstream_rerun(tmp_path):
+    ll, bc = make_chain(tmp_path, "a")
+    assert artifact_state.check_reopt_output(str(bc))[0]
+    rewrite_state(str(ll) + artifact_state.LIFT_SUFFIX, status="timeout")  # rerun failed, old .ll kept
+    ok, reason, _ = artifact_state.check_reopt_output(str(bc))
+    assert not ok and ".lift.json changed" in reason
+
+
+def test_bc_rejected_after_sidecar_only_change(tmp_path):
+    """Same .ll bytes, new provenance (e.g. different approximation tags): the old .bc must be redone."""
+    ll, bc = make_chain(tmp_path, "a")
+    rewrite_state(str(ll) + artifact_state.LIFT_SUFFIX, functions=[{"llvm_name": "good", "approx": ["virtual_fs"]}])
+    assert not artifact_state.check_reopt_output(str(bc))[0]
+    assert not task2_reoptimize.reopt_output_reusable(str(ll), str(bc), "any-token")
+
+
+def test_function_dir_rejected_after_bc_change_or_upstream_failure(tmp_path):
+    fdir = make_function_dir(tmp_path, "a", {"f": GOOD_FN})
+    assert artifact_state.check_extract_dir(str(fdir))[0]
+    bc = tmp_path / "a.bc"
+    original = bc.read_bytes()
+    bc.write_bytes(b"new bitcode")
+    ok, reason, _ = artifact_state.check_extract_dir(str(fdir))
+    assert not ok and ".bc changed" in reason
+    bc.write_bytes(original)
+    assert artifact_state.check_extract_dir(str(fdir))[0]
+    rewrite_state(str(tmp_path / "a.ll") + artifact_state.LIFT_SUFFIX, status="crashed")  # two stages upstream
+    ok, reason, _ = artifact_state.check_extract_dir(str(fdir))
+    assert not ok and "upstream reopt no longer valid" in reason
+    assert not artifact_state.select_function_files(str(tmp_path))[0]
+
+
+def test_function_dir_rejected_after_reopt_state_change(tmp_path):
+    fdir = make_function_dir(tmp_path, "a", {"f": GOOD_FN})
+    rewrite_state(str(tmp_path / "a.bc") + artifact_state.REOPT_SUFFIX, approx=["dropped_illegal_bitcast_stores"])
+    ok, reason, _ = artifact_state.check_extract_dir(str(fdir))
+    assert not ok and ".reopt.json changed" in reason
+    assert not task3_extract.extract_output_reusable(str(tmp_path / "a.bc"), str(fdir))
+
+
+def test_detached_artifacts_need_explicit_flag(tmp_path):
+    fdir = make_function_dir(tmp_path, "a", {"f": GOOD_FN})
+    (tmp_path / "a.ll").unlink()  # e.g. only .bc + functions were copied to another machine
+    assert not artifact_state.check_extract_dir(str(fdir))[0]
+    ok, reason, _ = artifact_state.check_extract_dir(str(fdir), allow_detached=True)
+    assert ok and reason.startswith("detached")
+    selected, _ = artifact_state.select_function_files(str(tmp_path), allow_detached=True)
+    assert all(info["detached"] for info in selected.values())
+
+
+def test_lift_records_are_not_attached_to_an_older_bc(tmp_path):
+    ll = make_lifted(tmp_path, "a", GOOD_FN, llvm_names=("good",))
+    recorded = artifact_state.sha256_file(str(ll) + artifact_state.LIFT_SUFFIX)
+    assert task3_extract.lift_records_by_llvm_name(str(ll), recorded)["good"]["approx"] == ["virtual_fs"]
+    rewrite_state(str(ll) + artifact_state.LIFT_SUFFIX, functions=[])
+    with pytest.raises(RuntimeError):
+        task3_extract.lift_records_by_llvm_name(str(ll), recorded)
+
+
+def test_selection_digest_tracks_provenance_with_identical_bytes(tmp_path):
+    fdir = make_function_dir(tmp_path, "a", {"f": GOOD_FN})
+    digest = artifact_state.sha256_file(str(fdir / "f.ll"))
+    db = make_results_db(tmp_path, [(str(fdir / "f.ll"), digest)])
+    policy = provenance.load_policy(provenance.DEFAULT_POLICY)
+    first = provenance.select_inputs(str(tmp_path), db, policy)[2]["selection_digest"]
+    extract_state = str(fdir) + artifact_state.EXTRACT_SUFFIX
+    state = json.loads(Path(extract_state).read_text())
+    state["functions"][0]["lift"]["approx"] = ["opaque_helper:x"]  # same function bytes, new provenance
+    Path(extract_state).write_text(json.dumps(state))
+    second = provenance.select_inputs(str(tmp_path), db, policy)[2]["selection_digest"]
+    assert first != second  # DataProcess refuses to resume an output dir built from the old metadata
+
+
+# ------------------------------------------------------------- process cleanup (final-audit P2)
+
+def _alive(pid):
+    stat = Path(f"/proc/{pid}/stat")
+    return stat.exists() and stat.read_text().split(")")[1].split()[0] != "Z"
+
+
+def test_timeout_kills_child_that_ignores_sigterm_after_parent_exits(tmp_path):
+    pidfile = tmp_path / "pid"
+    child = ("import signal,time,os; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+             f"open({str(pidfile)!r},'w').write(str(os.getpid())); time.sleep(60)")
+    parent = f"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',{child!r}]); time.sleep(60)"
+    pid = None
+    try:
+        result = job_runner.run_logged([sys.executable, "-c", parent], str(tmp_path / "log"), timeout_s=1, grace_s=0.3)
+        assert result.timed_out
+        pid = int(pidfile.read_text())
+        time.sleep(0.1)
+        assert not _alive(pid)
+    finally:
+        if pid and _alive(pid):
+            os.kill(pid, 9)
+
+
+def test_processes_left_in_group_after_normal_exit_are_reaped(tmp_path):
+    pidfile = tmp_path / "pid"
+    cmd = ["sh", "-c", f"sleep 60 & echo $! > {pidfile}; exit 0"]
+    result = job_runner.run_logged(cmd, str(tmp_path / "log"))
+    assert result.ok
+    pid = int(pidfile.read_text())
+    time.sleep(0.1)
+    try:
+        assert not _alive(pid) and "left in the job's group" in job_runner.log_tail(result.log_path)
+    finally:
+        if _alive(pid):
+            os.kill(pid, 9)
+
+
+def test_run_command_timeout_kills_sigterm_ignoring_child(tmp_path):
+    from utils import run_command
+    pidfile = tmp_path / "pid"
+    child = ("import signal,time,os; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+             f"open({str(pidfile)!r},'w').write(str(os.getpid())); time.sleep(60)")
+    parent = f"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',{child!r}]); time.sleep(60)"
+    started = time.time()
+    success, _, err = run_command([sys.executable, "-c", parent], timeout=1, kill_grace_s=0.3)
+    pid = int(pidfile.read_text())
+    try:
+        assert not success and "timed out" in err and time.time() - started < 40
+        time.sleep(0.1)
+        assert not _alive(pid)
+    finally:
+        if _alive(pid):
+            os.kill(pid, 9)
