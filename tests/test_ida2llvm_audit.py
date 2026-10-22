@@ -3,12 +3,10 @@
 Same approach as test_ida2llvm_microcode.py: the real Scripts/ida2llvm.py is imported with
 stub IDA modules. Semantic checks build IR, run the paper's Oc pass list with `opt`, then
 execute the optimized code with MCJIT, so they test behavior rather than only `verify`.
-C01/C02 (source pointer layout / big-endian byte views) are contract decisions left to the
-user and are kept as xfail.
+The source memory-layout contract (C01/C02) is covered by test_ida2llvm_target_layout.py, output
+publication / resume / downstream state by test_pipeline_state.py, helpers by test_ida2llvm_helpers.py.
 """
 import ctypes
-import json
-import os
 import shutil
 import struct
 import subprocess
@@ -23,7 +21,6 @@ from test_ida2llvm_microcode import L, callinfo, insn, mop, new_function, stub_o
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "Scripts"
 sys.path.insert(0, str(SCRIPTS))
-import task1_lift  # noqa: E402
 import task2_reoptimize  # noqa: E402
 
 OC_PASSES = ",".join(task2_reoptimize.TASK2_CANONICALIZE_PASSES_BY_OPT_LEVEL["-Oc"])
@@ -401,90 +398,7 @@ def test_text_writer_does_not_repair_ir(L):
     assert "".join(out) == "define i32 @missing() {\nentry:\n}\n"
 
 
-# --------------------------------------------------------------- C12 / C13 output contract
-
-@pytest.fixture
-def fake_ida(L, monkeypatch):
-    for name in ("open_database", "close_database"):
-        monkeypatch.setattr(L.idapro, name, lambda *args: 0)
-    monkeypatch.setattr(L.ida_auto, "auto_wait", lambda: None)
-    monkeypatch.setattr(L, "_init_target_state", lambda: None)
-
-    def use(insert_all):
-        class Controller(L.BIN2LLVMController):
-            def initialize(self):
-                pass
-
-            def insertAllFunctions(self):
-                insert_all(self)
-        monkeypatch.setattr(L, "BIN2LLVMController", Controller)
-    return use
-
-
-def test_successful_lift_publishes_output_and_sidecar(L, fake_ida, tmp_path):
-    def insert_all(ctrl):
-        L.function_records.append({"ea": "0x10", "name": "f", "status": "lifted", "approx": ["virtual_fs"]})
-        L.lift_stats["defined"] = 1
-    fake_ida(insert_all)
-    src = tmp_path / "in.i64"
-    src.write_bytes(b"db")
-    out = tmp_path / "out.ll"
-    result = L.run_lift(str(src), str(out))
-    assert result["status"] == "ok" and L._exit_code(result) == 0
-    text = out.read_text()
-    assert text.startswith(f"; ida2llvm lifter={L.LIFTER_ID}")
-    side = json.loads((tmp_path / "out.ll.lift.json").read_text())
-    assert side["status"] == "ok" and side["lifter_id"] == L.LIFTER_ID
-    assert side["input"]["size"] == 2 and side["approx_reasons"] == {"virtual_fs": 1}
-    assert not list(tmp_path.glob("*.tmp.*"))
-
-
-def test_interrupted_lift_publishes_nothing(L, fake_ida, tmp_path):
-    def insert_all(ctrl):
-        ctrl._stream_file.write("define i32 @unfinished() {\n")
-        raise RuntimeError("simulated interruption")
-    fake_ida(insert_all)
-    out = tmp_path / "out.ll"
-    out.write_text("; stale output of an earlier run\n")
-    assert not L.lift_binary_to_llvm("in.i64", str(out))
-    assert not out.exists() and not list(tmp_path.glob("*.tmp.*"))
-    side = json.loads((tmp_path / "out.ll.lift.json").read_text())
-    assert side["status"] == "error" and "simulated interruption" in side["error"]
-
-
-def test_all_failed_is_not_success(L, fake_ida, tmp_path):
-    def insert_all(ctrl):
-        L.lift_stats["failed"] = 10
-    fake_ida(insert_all)
-    result = L.run_lift("in.i64", str(tmp_path / "out.ll"))
-    assert result["status"] == "no_functions_lifted" and L._exit_code(result) == 3
-    assert not (tmp_path / "out.ll").exists()
-
-
-# ------------------------------------------------------------------------- task1 / task2
-
-def test_resume_requires_matching_ok_sidecar(tmp_path):
-    src, out = tmp_path / "a.i64", tmp_path / "a.ll"
-    src.write_bytes(b"database")
-    out.write_text("define void @f() {\n  ret void\n}\n")
-    lifter = task1_lift.ida2llvm_lifter_id()
-    assert not task1_lift.lift_output_reusable(str(src), str(out), lifter)  # no sidecar
-    st = os.stat(src)
-    side = {"status": "ok", "lifter_id": lifter, "input": {"size": st.st_size, "mtime_ns": st.st_mtime_ns}}
-    (tmp_path / "a.ll.lift.json").write_text(json.dumps(side))
-    assert task1_lift.lift_output_reusable(str(src), str(out), lifter)
-    assert not task1_lift.lift_output_reusable(str(src), str(out), "0" * 16)  # different lifter
-    os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
-    assert not task1_lift.lift_output_reusable(str(src), str(out), lifter)  # input changed
-    side["status"] = "no_functions_lifted"
-    os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns))
-    (tmp_path / "a.ll.lift.json").write_text(json.dumps(side))
-    assert not task1_lift.lift_output_reusable(str(src), str(out), lifter)
-
-
-def test_task1_lifter_id_matches_lifter(L):
-    assert task1_lift.ida2llvm_lifter_id() == L.LIFTER_ID
-
+# ------------------------------------------------------------------------- task2 unsafe fallback
 
 @needs_opt
 def test_task2_sanitizer_is_function_scoped_and_store_survives_oc(tmp_path):
@@ -500,32 +414,3 @@ def test_task2_sanitizer_is_function_scoped_and_store_survives_oc(tmp_path):
     ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_int64))(engine.get_function_address("valid"))(ctypes.byref(cell))
     assert cell.value == 3
     assert not list(tmp_path.glob("*.tmp.*"))
-
-
-# ------------------------------------------------------------- contracts left to the user
-
-@pytest.mark.xfail(reason="C01: source32 pointer layout vs host output layout is a user contract decision", strict=True)
-def test_source32_packed_layout_matches_output_layout(L, monkeypatch):
-    monkeypatch.setattr(L, "ptrsize", 32)
-    ctrl = L.BIN2LLVMController("host")
-    typ = ctrl.m.context.get_identified_type("audit_pointer_struct")
-    typ.packed = True
-    typ.set_body(ir.IntType(8).as_pointer(), ir.IntType(32))
-    ir.GlobalVariable(ctrl.m, typ, "layout_probe")
-    parsed = binding.parse_assembly(str(ctrl.m))
-    actual = binding.create_target_data(ctrl.m.data_layout).get_abi_size(parsed.get_struct_type("audit_pointer_struct"))
-    assert actual == L._type_size(typ)
-
-
-@pytest.mark.xfail(reason="C02: big-endian source bytes on a little-endian host is a user contract decision", strict=True)
-def test_big_endian_global_byte_view_is_preserved(L, monkeypatch):
-    monkeypatch.setattr(L, "byteorder", "big")
-    monkeypatch.setattr(L, "is_big_endian", True)
-    module = L.BIN2LLVMController("host").m
-    g = ir.GlobalVariable(module, ir.IntType(32), "word")
-    g.initializer = L._constant_from_bytes(module, ir.IntType(32), bytes([1, 2, 3, 4]), 0)
-    f = ir.Function(module, ir.FunctionType(ir.IntType(8), []), "first_byte")
-    b = ir.IRBuilder(f.append_basic_block())
-    b.ret(b.load(b.bitcast(g, ir.IntType(8).as_pointer())))
-    engine = jit(str(module))
-    assert ctypes.CFUNCTYPE(ctypes.c_ubyte)(engine.get_function_address("first_byte"))() == 1

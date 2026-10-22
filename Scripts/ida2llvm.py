@@ -15,10 +15,11 @@ import ida_auto
 import idaapi
 import logging
 import array
+import re
 import hashlib
-import json
 import os
 import struct
+import subprocess
 import time
 from collections import Counter
 import numpy as np
@@ -33,6 +34,9 @@ from llvmlite.ir.values import FormattedConstant
 
 from contextlib import suppress
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import artifact_state  # noqa: E402
 
 log_dir = Path(__file__).resolve().parents[1] / "logs"
 log_dir.mkdir(parents=True, exist_ok=True)
@@ -137,6 +141,7 @@ def _reset_lift_state():
     current_approx.clear()
     function_records.clear()
     unresolved_data_items.clear()
+    _set_sizing_layout(None)
     target_data = None
     llvm_context = ir.Context()
     global_by_ea.clear()
@@ -144,9 +149,90 @@ def _reset_lift_state():
     pending_type_decls.clear()
 
 
+# 源 binary 的目标三元组与 data layout，取自 clang-18 对该 triple 的默认值（tests 中逐项与 clang 核对）。
+# 键：(处理器族, 位宽, 字节序)。只支持 ELF；其他格式/处理器没有可靠的 layout，source 模式下直接失败。
+SOURCE_TARGETS = {
+    ("x86", 64, "little"): ("x86_64-unknown-linux-gnu",
+                            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"),
+    ("x86", 32, "little"): ("i386-unknown-linux-gnu",
+                            "e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-i128:128-f64:32:64-f80:32-n8:16:32-S128"),
+    ("arm", 32, "little"): ("arm-unknown-linux-gnueabi", "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64"),
+    ("arm", 64, "little"): ("aarch64-unknown-linux-gnu", "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"),
+    ("mips", 32, "big"): ("mips-unknown-linux-gnu", "E-m:m-p:32:32-i8:8:32-i16:16:32-i64:64-n32-S64"),
+    ("mips", 32, "little"): ("mipsel-unknown-linux-gnu", "e-m:m-p:32:32-i8:8:32-i16:16:32-i64:64-n32-S64"),
+    ("mips", 64, "big"): ("mips64-unknown-linux-gnuabi64", "E-m:e-i8:8:32-i16:16:32-i64:64-n32:64-S128"),
+    ("mips", 64, "little"): ("mips64el-unknown-linux-gnuabi64", "e-m:e-i8:8:32-i16:16:32-i64:64-n32:64-S128"),
+    ("ppc", 32, "big"): ("powerpc-unknown-linux-gnu", "E-m:e-p:32:32-Fn32-i64:64-n32"),
+    ("ppc", 64, "big"): ("powerpc64-unknown-linux-gnu", "E-m:e-Fi64-i64:64-n32:64-S128-v256:256:256-v512:512:512"),
+    ("ppc", 64, "little"): ("powerpc64le-unknown-linux-gnu", "e-m:e-Fn32-i64:64-n32:64-S128-v256:256:256-v512:512:512"),
+    ("riscv", 32, "little"): ("riscv32-unknown-linux-gnu", "e-m:e-p:32:32-i64:64-n32-S128"),
+    ("riscv", 64, "little"): ("riscv64-unknown-linux-gnu", "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"),
+}
+# 输出模式：source（默认）= 源目标的 triple/layout，类型大小、成员偏移、指针宽度、端序与源 binary 一致；
+# host = 旧行为的兼容模式：宿主 triple/layout，但类型大小按源指针宽度计算，二者不一致，不做内存语义转换
+TARGET_MODES = ("source", "host")
+MEMORY_CONTRACTS = {"source": "source-layout", "host": "host-compat-unconverted"}
+# 计算类型大小所用的 layout；None 表示 host 兼容模式下沿用旧的 "e/E[-p:32:32]" 计算方式
+sizing_layout = None
+int_alloc_size_cache = {}
+# 源处理器族（x86/arm/mips/...），部分 helper 的语义依赖它（如 __CFSUB__ 在 ARM/PPC 上取反）
+source_family = None
+
+
+class UnsupportedTarget(RuntimeError):
+    """source 模式下无法确定源目标的 triple/data layout。"""
+
+
+def _processor_family(proc: str) -> str:
+    name = proc.lower()
+    if name == "metapc":
+        return "x86"
+    for family in ("arm", "mips", "ppc", "riscv"):
+        if name.startswith(family):
+            return family
+    if name in ("aarch64", "arm64"):
+        return "arm"
+    raise UnsupportedTarget(f"processor {proc!r}")
+
+
+def _layout_pointer_bits(layout: str) -> int:
+    for spec in layout.split("-"):
+        if spec.startswith("p:"):
+            return int(spec.split(":")[1])
+    return 64  # LLVM 默认地址空间 0 指针为 64 位
+
+
+def source_target_spec(proc: str, bits: int, big_endian: bool, is_elf: bool = True) -> dict:
+    """源 binary 对应的 LLVM 目标；layout 的指针宽度和端序必须与 IDA 一致，否则失败而不是猜。"""
+    if not is_elf:
+        raise UnsupportedTarget("only ELF inputs have a source target table")
+    endian = "big" if big_endian else "little"
+    key = (_processor_family(proc), bits, endian)
+    if key not in SOURCE_TARGETS:
+        raise UnsupportedTarget(f"no data layout for {key}")
+    triple, layout = SOURCE_TARGETS[key]
+    if _layout_pointer_bits(layout) != bits or layout.startswith("E") != big_endian:
+        raise UnsupportedTarget(f"layout {layout!r} disagrees with source {key}")
+    return {"triple": triple, "datalayout": layout, "family": key[0], "bits": bits, "endian": endian}
+
+
+def _set_sizing_layout(layout):
+    """设置类型大小计算所用的 layout，并清空依赖它的缓存。"""
+    global sizing_layout, target_data
+    sizing_layout = layout
+    target_data = None
+    int_alloc_size_cache.clear()
+    llvm_type_cache.clear()
+    abi_size_cache.clear()
+    type_size_cache.clear()
+
+
 def _init_target_state():
     """在 open_database 之后读取当前 binary 的指针宽度和字节序。"""
-    global ptrsize, is_big_endian, byteorder, target_data
+    global ptrsize, is_big_endian, byteorder, target_data, source_family
+    source_family = None
+    with suppress(Exception):
+        source_family = _processor_family(ida_ida.inf_get_procname())
     ptrsize = 64 if ida_ida.inf_is_64bit() else 32
     is_big_endian = bool(ida_ida.inf_is_be())
     byteorder = "big" if is_big_endian else "little"
@@ -157,14 +243,25 @@ def _init_target_state():
 
 
 def _get_target_data():
-    """复用 llvmlite target data，避免热路径重复构造。"""
+    """复用 llvmlite target data，避免热路径重复构造。source 模式下就是输出模块的 data layout。"""
     global target_data
     if target_data is None:
-        layout = "E" if is_big_endian else "e"
-        if ptrsize == 32:
-            layout += "-p:32:32"
+        if sizing_layout is not None:
+            layout = sizing_layout
+        else:
+            layout = "E" if is_big_endian else "e"
+            if ptrsize == 32:
+                layout += "-p:32:32"
         target_data = llvm.create_target_data(layout)
     return target_data
+
+
+def _int_alloc_size(width: int) -> int:
+    size = int_alloc_size_cache.get(width)
+    if size is None:
+        size = ir.IntType(width).get_abi_size(_get_target_data())
+        int_alloc_size_cache[width] = size
+    return size
 
 
 def _get_abi_size(typ: ir.Type) -> int:
@@ -178,9 +275,14 @@ def _get_abi_size(typ: ir.Type) -> int:
 
 
 def _type_size(typ: ir.Type) -> int:
-    """按被分析 binary 的指针宽度计算类型字节大小（结构体都是 packed 的）。"""
+    """
+    类型在内存中占用的字节数（结构体都是 packed 的）。source 模式下与输出 data layout 的
+    alloc size 完全一致（如 i80 在 x86_64 上占 16 字节），保证成员偏移和数组步长与 LLVM 一致。
+    """
     if isinstance(typ, ir.IntType):
-        return (typ.width + 7) // 8
+        if sizing_layout is None:
+            return (typ.width + 7) // 8
+        return _int_alloc_size(typ.width)
     if isinstance(typ, ir.PointerType):
         return ptrsize // 8
     if isinstance(typ, ir.FloatType):
@@ -323,7 +425,11 @@ def _lift_tif_uncached(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
         if count == 0:
             # 元素数量不确定的数组 = 指针类型
             tif.convert_array_to_ptr()
-            return lift_tif(tif)      
+            return lift_tif(tif)
+        element_size = child_tif.get_size()
+        if sizing_layout is not None and 0 < element_size != ida_typeinf.BADSIZE:
+            # 元素在输出 layout 下的步长必须等于源 binary 的元素大小（如 i386 的 long double 是 12 字节）
+            element = _sized_member_type(element, element_size)
         return ir.ArrayType(element, count)
 
     elif tif.is_void():
@@ -357,6 +463,9 @@ def _lift_tif_uncached(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
     ):
         # 整数、枚举、long double 等都按字节宽度映射为整数
         size_bits = tif.get_size() * 8
+        if sizing_layout is not None and 16 < tif.get_size() != ida_typeinf.BADSIZE:
+            # 超过 128 位的算术类型（如 __m256 的整体视图）保留原始字节数，不收缩成指针宽度
+            return ir.ArrayType(i8, size_bits // 8)
         # 防止创建过大的整数类型（限制为128位）
         if size_bits > 128 or size_bits <= 0:
             # logging.warning(f"Invalid type size {tif.get_size()} bytes, using pointer size instead")
@@ -376,7 +485,7 @@ def _sized_member_type(llvm_type: ir.Type, size: int) -> ir.Type:
     """成员的 LLVM 类型大小和 IDA 不一致时，用同样字节数的整数/字节数组替代。"""
     if _type_size(llvm_type) == size:
         return llvm_type
-    if size in (1, 2, 4, 8, 16):
+    if size in (1, 2, 4, 8, 16) and _type_size(ir.IntType(size * 8)) == size:
         return ir.IntType(size * 8)
     return ir.ArrayType(i8, size)
 
@@ -1197,6 +1306,166 @@ def lift_intrinsic_function(module: ir.Module, func_name: str):
     else:
         raise NotImplementedError(f"不支持的内置函数: {func_name}")  
 
+# ============================================================================
+# 有确定语义的 Hex-Rays helper：实现为宽度正确的 LLVM 运算 / 标准 intrinsic
+# 依据 IDA 9.4 include/defs.h（行号见注释）和 MSVC intrinsic 的文档语义；不在此表中的 helper
+# 保持为不透明外部调用并打 approx 标记。
+# ============================================================================
+
+def _llvm_intrinsic(module: ir.Module, name: str, fnty: ir.FunctionType) -> ir.Function:
+    existing = module.globals.get(name)
+    if isinstance(existing, ir.Function):
+        return existing
+    return ir.Function(module, fnty, name)
+
+
+def _int_arg(value: ir.Value, width: int, builder: ir.IRBuilder) -> ir.Value:
+    return typecast(value, ir.IntType(width), builder)
+
+
+def _rotate(builder, value, count, width, right):
+    """defs.h:233 __ROL__：count>0 时左移 count%W；否则右移 (-count)%W。等价于 fshl(x, x, count mod W)
+    （W 是 2 的幂，count 的补码低位即模 W 的余数）；count 为 W 的倍数时机器语义为恒等，fshl 亦然。"""
+    module = builder.block.parent.parent
+    ty = ir.IntType(width)
+    x = _int_arg(value, width, builder)
+    amount = count if count.type == ty else (
+        builder.trunc(count, ty) if count.type.width > width else builder.sext(count, ty))
+    if right:  # defs.h:260-263：__RORn__(v, c) == __ROL__(v, -c)
+        amount = builder.sub(ty(0), amount)
+    fshl = _llvm_intrinsic(module, f"llvm.fshl.i{width}", ir.FunctionType(ty, [ty, ty, ty]))
+    return builder.call(fshl, [x, x, amount])
+
+
+def _pair(builder, high, low, width):
+    """defs.h:181-188 __PAIRn__/__SPAIRn__：(high << W/2) | (uintW/2)low，结果位模式与高半是否有符号无关。"""
+    half = width // 2
+    ty = ir.IntType(width)
+    hi = builder.zext(_int_arg(high, half, builder), ty)
+    lo = builder.zext(_int_arg(low, half, builder), ty)
+    return builder.or_(builder.shl(hi, ty(half)), lo)
+
+
+def _sign_bit(builder, value, width):
+    return builder.icmp_signed("<", value, ir.IntType(width)(0))
+
+
+def _flag_helper(name, builder, x, y, width):
+    """defs.h:278-349 __OFSUB__/__OFADD__/__CFSUB__/__CFADD__（两个操作数同宽时）。结果为 int8 0/1。"""
+    x, y = _int_arg(x, width, builder), _int_arg(y, width, builder)
+    if name == "__CFADD__":
+        flag = builder.icmp_unsigned(">", x, builder.add(x, y))
+    elif name == "__CFSUB__":
+        flag = builder.icmp_unsigned("<", x, y)
+        if source_family in ("arm", "ppc"):  # defs.h:312 SUB_WITH_CARRY
+            flag = builder.not_(flag)
+    else:
+        result = builder.sub(x, y) if name == "__OFSUB__" else builder.add(x, y)
+        sx, sy, sr = (_sign_bit(builder, v, width) for v in (x, y, result))
+        # OFSUB: (sx ^ sy) & (sx ^ sr)；OFADD: (!sx ^ sy) & (sx ^ sr)
+        lhs = builder.xor(sx, sy) if name == "__OFSUB__" else builder.xor(builder.not_(sx), sy)
+        flag = builder.and_(lhs, builder.xor(sx, sr))
+    return builder.zext(flag, ir.IntType(8))
+
+
+_HELPER_WIDTH_SUFFIX = {"1": 8, "2": 16, "4": 32, "8": 64}
+_INTERLOCKED_RMW = {"Exchange": "xchg", "ExchangeAdd": "add", "Or": "or", "And": "and", "Xor": "xor"}
+
+
+def _interlocked_width(suffix: str):
+    return {"": 32, "8": 8, "16": 16, "64": 64}.get(suffix)
+
+
+def _lift_semantic_helper(name: str, ret_type: ir.Type, args: list, builder: ir.IRBuilder):
+    """
+    精确实现 name 对应的 helper：返回结果值；没有返回值的 helper（store/fence）返回 True；
+    不认识或无法确定语义的 helper 返回 None（由调用方声明为不透明外部函数）。
+    宽度以调用信息为准并与名字中的宽度交叉校验，不一致时拒绝。
+    """
+    ret_width = ret_type.width if isinstance(ret_type, ir.IntType) else None
+
+    m = re.fullmatch(r"__RO([LR])([1248])__", name)
+    if m and len(args) == 2:
+        width = _HELPER_WIDTH_SUFFIX[m.group(2)]
+        if ret_width != width:
+            raise UnsupportedMicrocode("helper_width_mismatch", f"{name} returns {ret_type}")
+        count = args[1] if isinstance(args[1].type, ir.IntType) else _as_int(args[1], 4, builder)
+        return _rotate(builder, args[0], count, width, right=m.group(1) == "R")
+
+    m = re.fullmatch(r"__S?PAIR(16|32|64|128)__", name)
+    if m and len(args) == 2:
+        width = int(m.group(1))
+        if ret_width != width:
+            raise UnsupportedMicrocode("helper_width_mismatch", f"{name} returns {ret_type}")
+        return _pair(builder, args[0], args[1], width)
+
+    bswap = {"_byteswap_ushort": 16, "_byteswap_ulong": 32, "_byteswap_uint64": 64}
+    if name in bswap and len(args) == 1:
+        width = bswap[name]
+        if ret_width != width:
+            raise UnsupportedMicrocode("helper_width_mismatch", f"{name} returns {ret_type}")
+        ty = ir.IntType(width)
+        fn = _llvm_intrinsic(builder.block.parent.parent, f"llvm.bswap.i{width}", ir.FunctionType(ty, [ty]))
+        return builder.call(fn, [_int_arg(args[0], width, builder)])
+
+    if name == "__clz" and len(args) == 1 and ret_width:
+        # ARM CLZ：输入为 0 时结果为位宽（ctlz 的 is_zero_poison = false）
+        width = args[0].type.width if isinstance(args[0].type, ir.IntType) else ret_width
+        ty = ir.IntType(width)
+        fn = _llvm_intrinsic(builder.block.parent.parent, f"llvm.ctlz.i{width}",
+                             ir.FunctionType(ty, [ty, ir.IntType(1)]))
+        return typecast(builder.call(fn, [_int_arg(args[0], width, builder), ir.IntType(1)(0)]), ret_type, builder)
+
+    if name in ("__CFADD__", "__CFSUB__", "__OFADD__", "__OFSUB__") and len(args) == 2:
+        widths = {a.type.width for a in args if isinstance(a.type, ir.IntType)}
+        if len(widths) == 1 and len(args) == 2 and (name != "__CFSUB__" or source_family is not None):
+            return typecast(_flag_helper(name, builder, args[0], args[1], widths.pop()), ret_type, builder)
+        return None  # 混合宽度依赖 C 的整型提升与符号性，调用信息不足以确定：保持不透明
+
+    if name in ("_mm_load_si128", "_mm_loadu_si128") and len(args) == 1:
+        if _type_size(ret_type) != 16:
+            raise UnsupportedMicrocode("helper_width_mismatch", f"{name} returns {ret_type}")
+        ptr = typecast(args[0], ret_type.as_pointer(), builder)
+        return builder.load(ptr, align=16 if name == "_mm_load_si128" else 1)
+
+    if name in ("_mm_store_si128", "_mm_storeu_si128") and len(args) == 2:
+        if _type_size(args[1].type) != 16:
+            raise UnsupportedMicrocode("helper_width_mismatch", f"{name} stores {args[1].type}")
+        ptr = typecast(args[0], args[1].type.as_pointer(), builder)
+        builder.store(args[1], ptr, align=16 if name == "_mm_store_si128" else 1)
+        return True
+
+    if name == "_mm_mfence" and not args:
+        builder.fence("seq_cst")
+        return True
+
+    if name == "alloca" and len(args) == 1:
+        size = args[0] if isinstance(args[0].type, ir.IntType) else _as_int(args[0], ptrsize // 8, builder)
+        return typecast(builder.alloca(i8, size=size), ret_type, builder)
+
+    m = re.fullmatch(r"_Interlocked(CompareExchange|Exchange|ExchangeAdd|Or|And|Xor|Increment|Decrement)(8|16|64)?", name)
+    if m:
+        op, width = m.group(1), _interlocked_width(m.group(2) or "")
+        expected_args = {"CompareExchange": 3, "Increment": 1, "Decrement": 1}.get(op, 2)
+        if width is None or len(args) != expected_args or ret_width not in (None, width):
+            raise UnsupportedMicrocode("helper_width_mismatch", f"{name}({len(args)} args) returns {ret_type}")
+        ty = ir.IntType(width)
+        ptr = typecast(args[0], ty.as_pointer(), builder)
+        if op == "CompareExchange":  # (Destination, Exchange, Comparand) -> 初值
+            pair = builder.cmpxchg(ptr, _int_arg(args[2], width, builder), _int_arg(args[1], width, builder),
+                                   "seq_cst", "seq_cst")
+            result = builder.extract_value(pair, 0)
+        elif op in ("Increment", "Decrement"):  # 返回新值
+            rmw = "add" if op == "Increment" else "sub"
+            old = builder.atomic_rmw(rmw, ptr, ty(1), "seq_cst")
+            result = builder.add(old, ty(1)) if op == "Increment" else builder.sub(old, ty(1))
+        else:  # 返回旧值
+            result = builder.atomic_rmw(_INTERLOCKED_RMW[op], ptr, _int_arg(args[1], width, builder), "seq_cst")
+        return typecast(result, ret_type, builder) if ret_width else result
+
+    return None
+
+
 def _retype_function(func: ir.Function, ftype: ir.FunctionType):
     """把一个尚无函数体的 ir.Function 改成新的函数类型。"""
     func.ftype = ftype
@@ -1514,13 +1783,12 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
         if dest:
             # 写入寄存器对需要拆分高低两半，调用 __PAIR 的结果不是可写存储
             raise UnsupportedMicrocode("pair_destination", mop.dstr())
-        _note_helper(f"__PAIR{mop.size*8}__")
-        f = lift_intrinsic_function(blk.parent.parent, f"__PAIR{mop.size*8}__")
-        l = lift_mop(mop.pair.hop, blk, builder, dest)
-        r = lift_mop(mop.pair.lop, blk, builder, dest)
-        l = typecast(l, ir.IntType(mop.size*4), builder)
-        r = typecast(r, ir.IntType(mop.size*4), builder)
-        return builder.call(f, (l, r))
+        width = mop.size * 8
+        if width not in PAIR_HELPER_TYPES:
+            raise UnsupportedMicrocode(f"pair_width_{width}", mop.dstr())
+        high = lift_mop(mop.pair.hop, blk, builder, dest)
+        low = lift_mop(mop.pair.lop, blk, builder, dest)
+        return _pair(builder, high, low, width)
     elif t == ida_hexrays.mop_sc:
         pass
     elif t == ida_hexrays.mop_z:
@@ -2045,8 +2313,18 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
     # 指令目标通常是写入地址；call/icall 的 d 是调用信息，stx 的 d 是要写入的内存地址值
     d = None if op in _SKIP_D_OPS else lift_mop(d_mop, blk, builder, op not in _D_AS_VALUE_OPS)
 
-    # 为未知的内置函数创建声明
+    # 有确定语义的 helper 直接展开成 LLVM 运算；其余声明为不透明外部函数并标记
     if l is None and op == ida_hexrays.m_call and l_mop.t == ida_hexrays.mop_h:
+        _check_single_retreg(ida_insn)
+        rets, args = d
+        ret_type = _callinfo_return_type(ida_insn) or ir.VoidType()
+        value = _lift_semantic_helper(l_mop.helper, ret_type, args, builder)
+        if value is not None:
+            if value is True:  # 没有返回值的 helper（store/fence）
+                return None
+            if rets:
+                _store_as(value, rets[0], blk, builder)
+            return value
         _note_helper(l_mop.helper)
         l = create_intrinsic_function(blk.parent.parent, l_mop.helper, d_mop.f)
 
@@ -2256,7 +2534,7 @@ class BIN2LLVMController():
     3. 将.text段函数提升为LLVM IR
     4. 将生成的IR模块保存到文件
     """
-    def __init__(self, target_mode: str = "host"):
+    def __init__(self, target_mode: str = "source"):
         """使用空的LLVM模块初始化控制器。"""
         self.m = ir.Module(context=llvm_context)
         self._name_cache = {}
@@ -2265,10 +2543,17 @@ class BIN2LLVMController():
         self._stream_file = None
         self._streamed_functions = set()
         self._streamed_types = set()
+        if target_mode == "ida":
+            target_mode = "source"  # 旧名字：现在的 source 模式给出完整的源目标 layout
+        if target_mode not in TARGET_MODES:
+            raise ValueError(f"target_mode must be one of {TARGET_MODES}")
+        self.target_mode = target_mode
+        self.memory_contract = MEMORY_CONTRACTS[target_mode]
         if target_mode == "host":
             self._set_module_target_from_host()
+            _set_sizing_layout(None)
         else:
-            self._set_module_target_from_ida()
+            self._set_module_target_from_source()
 
     def _get_name(self, ea):
         return _get_name_cached(ea)
@@ -2277,69 +2562,26 @@ class BIN2LLVMController():
         return _get_func_cached(ea)
 
     def _set_module_target_from_host(self):
-        """Sets module target triple and data layout based on host LLVM."""
-        try:
-            # Try to initialize LLVM targets if available
-            try:
-                # These calls may raise deprecation warnings but are necessary for proper initialization
-                if hasattr(llvm, 'initialize_all_targets'):
-                    llvm.initialize_all_targets()
-                if hasattr(llvm, 'initialize_all_asmprinters'):
-                    llvm.initialize_all_asmprinters()
-            except:
-                # Initialization may fail in some environments, continue anyway
-                pass
-            
-            triple = llvm.get_default_triple()
-            target = llvm.Target.from_triple(triple)
-            target_machine = target.create_target_machine()
-            self.m.triple = triple
-            self.m.data_layout = str(target_machine.target_data)
-        except Exception as exc:
-            # If host mode fails, fall back to IDA mode
-            logging.debug(f"Host mode target setup failed: {exc}, falling back to IDA mode")
-            self._set_module_target_from_ida()
+        """
+        host 兼容模式：宿主 triple/layout。类型大小仍按源指针宽度计算，32 位/大端源 binary 的
+        内存布局与输出 layout 不一致（不做内存语义转换），只用于复现旧数据。
+        """
+        llvm.initialize_all_targets()
+        llvm.initialize_all_asmprinters()
+        triple = llvm.get_default_triple()
+        target_machine = llvm.Target.from_triple(triple).create_target_machine()
+        self.m.triple = triple
+        self.m.data_layout = str(target_machine.target_data)
 
-    def _set_module_target_from_ida(self):
-        """Sets module target triple based on IDA's analysis information."""
-        try:
-            proc = ida_ida.inf_get_procname()
-            is_64 = ida_ida.inf_is_64bit()
-            arch = "unknown"
-
-            if proc == "metapc":
-                arch = "x86_64" if is_64 else "i386"
-            elif proc in ("arm", "ARM"):
-                arch = "aarch64" if is_64 else "arm"
-            elif proc in ("aarch64", "arm64"):
-                arch = "aarch64"
-            elif proc.lower().startswith("mips"):
-                # IDA 用 mipsb/mipsl/mipsr... 表示不同字节序的 MIPS
-                arch = "mips64" if is_64 else "mips"
-                if not ida_ida.inf_is_be():
-                    arch += "el"
-            elif proc.lower().startswith("ppc"):
-                arch = "powerpc64" if is_64 else "powerpc"
-                if not ida_ida.inf_is_be():
-                    arch += "le"
-            elif proc == "riscv":
-                arch = "riscv64" if is_64 else "riscv32"
-
-            # IDA 的 Python 接口没有导出 OSTYPE_* 常量，按文件格式推断 OS
-            os_name = "unknown"
-            with suppress(Exception):
-                filetype = ida_ida.inf_get_filetype()
-                if filetype == ida_ida.f_ELF:
-                    os_name = "linux"
-                elif filetype == ida_ida.f_PE:
-                    os_name = "windows"
-                elif filetype == ida_ida.f_MACHO:
-                    os_name = "darwin"
-
-            self.m.triple = f"{arch}-unknown-{os_name}"
-            self.m.data_layout = ""
-        except Exception as exc:
-            logging.warning(f"Failed to set module target from IDA: {exc}")
+    def _set_module_target_from_source(self):
+        """source 模式：源目标的 triple 与 data layout，类型大小按同一 layout 计算。"""
+        is_elf = True
+        with suppress(AttributeError):
+            is_elf = ida_ida.inf_get_filetype() == ida_ida.f_ELF
+        spec = source_target_spec(ida_ida.inf_get_procname(), ptrsize, is_big_endian, is_elf)
+        self.m.triple = spec["triple"]
+        self.m.data_layout = spec["datalayout"]
+        _set_sizing_layout(spec["datalayout"])
 
     def insertAllFunctions(self):
         """
@@ -2410,6 +2652,7 @@ class BIN2LLVMController():
                 # 写出之后才计为成功
                 lift_stats["defined"] += 1
                 record["status"] = "lifted"
+                record["llvm_name"] = lifted.name
                 if current_approx:
                     lift_stats["approx"] += 1
                     record["approx"] = sorted(current_approx)
@@ -2683,41 +2926,61 @@ def _input_info(path: str) -> dict:
     return info
 
 
-def _write_json_atomic(path: Path, data: dict):
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+def _verify_llvm_file(path: str) -> tuple[bool, str]:
+    """发布前用 llvm-as 解析并校验整个模块；工具缺失、超时或校验失败都不发布。"""
+    tool = os.environ.get("REGRAPH_LLVM_AS", "llvm-as")
+    timeout = int(os.environ.get("REGRAPH_VERIFY_TIMEOUT", "3600"))
     try:
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=1)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    finally:
-        with suppress(FileNotFoundError):
-            tmp.unlink()
+        proc = subprocess.run([tool, "-o", os.devnull, path], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return False, f"verifier {tool!r} not found"
+    except subprocess.TimeoutExpired:
+        return False, f"verifier timed out after {timeout}s"
+    return proc.returncode == 0, (proc.stderr or "")[-2000:]
 
 
-def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "host") -> dict:
+def _previous_output(out: str, sidecar: str):
+    """本次运行前已存在的输出及其状态；失败重跑时原样保留，只在 sidecar 中记录其身份。"""
+    if not os.path.exists(out):
+        return None
+    state = artifact_state.read_json(sidecar)
+    valid, reason = artifact_state.check_output(state, out)
+    info = {"path": out, "valid": valid, "reason": reason}
+    if state:
+        info.update(status=state.get("status"), lifter_id=state.get("lifter_id"),
+                    sha256=(state.get("output") or {}).get("sha256"))
+    return info
+
+
+def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source", verifier=_verify_llvm_file) -> dict:
     """
-    提升一个 binary：先写 <output>.tmp.<pid>，只有至少一个函数成功时才原子替换成 <output>；
-    无论成败都写 <output>.lift.json（版本、输入、目标、计数、拒绝/近似原因、逐函数状态）。
-    返回 sidecar 内容；"status" 为 ok / no_functions_lifted / error。
+    提升一个 binary 并发布 <output> 与 <output>.lift.json：
+      1. 流式写 <output>.tmp.<host>.<pid> 并 fsync；
+      2. 至少一个函数成功时，用 llvm-as 校验临时文件；
+      3. 记录输出的 sha256/size，原子替换成 <output>，再原子写 sidecar。
+    没有成功函数、校验失败或异常时不发布：已有的 <output> 原样保留（不删除），sidecar 记录本次失败和
+    旧产物身份，下游据 status/sha256 拒绝把旧产物当成本次结果。在两次替换之间被杀时，新 <output> 与
+    旧 sidecar 的 sha256 不一致，同样被拒绝。返回 sidecar 内容。
     """
     _reset_lift_state()
     started = time.time()
-    out = Path(output_llvm_ir)
-    tmp = out.with_name(f"{out.name}.tmp.{os.getpid()}")
-    sidecar = out.with_name(out.name + ".lift.json")
-    # 先删除旧 sidecar：本次中途崩溃时不能留下一个与旧输出对应的 "ok"
-    with suppress(FileNotFoundError):
-        sidecar.unlink()
+    out = os.path.abspath(output_llvm_ir)
+    sidecar = out + artifact_state.LIFT_SUFFIX
+    artifact_state.cleanup_stale_tmp(out)
+    artifact_state.cleanup_stale_tmp(sidecar)
+    tmp = artifact_state.tmp_path_for(out)
     result = {
-        "schema": 1,
+        "schema": artifact_state.SCHEMA,
+        "stage": "lift",
         "status": "error",
         "lifter_id": LIFTER_ID,
         "ida_version": None,
+        "ida_install_id": artifact_state.ida_install_id(os.environ.get("IDADIR")),
         "input": _input_info(input_binary),
-        "output": str(out),
+        "output_path": out,
         "target_mode": target_mode,
+        "previous_output": _previous_output(out, sidecar),
     }
     bin2llvm = None
     try:
@@ -2727,35 +2990,44 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "host") 
         result["ida_version"] = _ida_version()
         result["source"] = _source_info()
         bin2llvm = BIN2LLVMController(target_mode=target_mode)
-        bin2llvm.initialize()
         result["target"] = {"triple": str(bin2llvm.m.triple), "datalayout": str(bin2llvm.m.data_layout)}
+        result["memory_contract"] = bin2llvm.memory_contract
+        bin2llvm.initialize()
         source = result["source"]
         header = [
-            f"ida2llvm lifter={LIFTER_ID} ida={result['ida_version']} target_mode={target_mode}",
+            f"ida2llvm lifter={LIFTER_ID} ida={result['ida_version']} target_mode={target_mode} "
+            f"memory_contract={bin2llvm.memory_contract}",
             f"source proc={source.get('proc')} bits={source['bits']} endian={source['endian']}",
         ]
-        bin2llvm.begin_stream_to_file(str(tmp), header)
+        bin2llvm.begin_stream_to_file(tmp, header)
         bin2llvm.insertAllFunctions()
         bin2llvm.finish_stream_to_file(fsync=True)
-        if lift_stats["defined"] > 0:
-            os.replace(tmp, out)
-            result["status"] = "ok"
-        else:
+        if lift_stats["defined"] == 0:
             result["status"] = "no_functions_lifted"
+        else:
+            verify_started = time.time()
+            ok, message = verifier(tmp)
+            result["verify_s"] = round(time.time() - verify_started, 3)
+            if not ok:
+                result["status"] = "verify_failed"
+                result["error"] = message
+            else:
+                result["output"] = {"path": out, "size": os.path.getsize(tmp),
+                                    "sha256": artifact_state.sha256_file(tmp)}
+                result["status"] = "ok"
+                os.replace(tmp, out)
+                artifact_state.fsync_dir(os.path.dirname(out))
     except Exception as e:
+        result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"[:1000]
         logging.error(f"Failed to lift binary: {e}")
         logging.error(traceback.format_exc())
     finally:
-        if result["status"] != "ok":
-            # 本次没有成功：删除同名旧输出，避免下游读到与 sidecar 不一致的陈旧 IR
-            with suppress(FileNotFoundError):
-                out.unlink()
         if bin2llvm is not None:
             with suppress(Exception):
                 bin2llvm.close_stream()
         with suppress(FileNotFoundError):
-            tmp.unlink()
+            os.remove(tmp)
         with suppress(Exception):
             # 不保存：lift 不应修改输入数据库，且保证同一 .i64 重复运行结果一致
             idapro.close_database(False)
@@ -2769,8 +3041,9 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "host") 
             functions=list(function_records),
         )
         try:
-            _write_json_atomic(sidecar, result)
+            artifact_state.write_json_atomic(sidecar, result)
         except OSError as e:
+            # 新 .ll 已发布但 sidecar 没写成：旧 sidecar（若有）的 sha256 与之不符，下游会拒绝
             logging.error(f"Failed to write {sidecar}: {e}")
             result["status"] = "error"
     return result
@@ -2783,7 +3056,7 @@ def _exit_code(result: dict) -> int:
 def lift_binary_to_llvm(
     input_binary: str,
     output_llvm_ir: str,
-    target_mode: str = "host",
+    target_mode: str = "source",
     verbose: bool = False
 ) -> bool:
     """
@@ -2792,14 +3065,15 @@ def lift_binary_to_llvm(
     参数:
         input_binary (str): 输入的二进制 / IDA 数据库路径
         output_llvm_ir (str): 输出的 LLVM IR 文件路径 (.ll)；同目录写 <output>.lift.json 状态文件
-        target_mode (str): "host"（默认，当前主机目标三元组）或 "ida"（IDA 检测到的架构）
+        target_mode (str): "source"（默认，源 binary 的 triple/data layout）或 "host"（旧行为兼容模式，
+            输出宿主 layout 而类型大小按源指针宽度计算，不做内存语义转换）
         verbose (bool): 是否打印详细日志（默认 False）
 
     返回值:
         bool: 至少一个函数成功提升且输出已原子发布时返回 True；否则 False（不抛异常）
     """
-    if target_mode not in ("host", "ida"):
-        logging.error(f"Invalid target_mode '{target_mode}'. Must be 'host' or 'ida'")
+    if target_mode not in TARGET_MODES:
+        logging.error(f"Invalid target_mode '{target_mode}'. Must be one of {TARGET_MODES}")
         return False
 
     if verbose:
@@ -2831,14 +3105,18 @@ def main(
         False, "-v", "--verbose", help="Enable verbose logging"
     ),
     target: str = typer.Option(
-        "host", "--target", help="Target triple source: host (default) or ida"
+        "source", "--target",
+        help="source (default): source binary triple/data layout; host: legacy host-layout compatibility "
+             "mode without memory-semantics conversion",
     ),
 ):
     """
     作为独立应用程序运行（使用 IDA Pro 9+ idalib）。
     """
-    if target not in ("host", "ida"):
-        raise typer.BadParameter("must be one of: host, ida")
+    if target == "ida":
+        target = "source"
+    if target not in TARGET_MODES:
+        raise typer.BadParameter(f"must be one of: {', '.join(TARGET_MODES)}")
 
     if verbose:
         logging.basicConfig(level=logging.DEBUG)
