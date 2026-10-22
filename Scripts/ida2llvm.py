@@ -15,6 +15,7 @@ import ida_auto
 import idaapi
 import logging
 import array
+import gc
 import re
 import hashlib
 import os
@@ -1543,6 +1544,7 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
         if isinstance(typ, ir.PointerType):
             logging.debug(f"Unexpected pointer type for function {func_name}: {typ}")
         res = ir.Function(module, typ, func_name)
+        res._source_ea = func_ea
 
     if is_declare:
         return res
@@ -1714,6 +1716,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
             typ = lift_tif(tif)
             g_cmt = lift_from_address(module, ea, typ)
             g = ir.GlobalVariable(module, typ if g_cmt is None else g_cmt.type, name = name)
+            g._source_ea = ea
             if g_cmt is not None:
                 g.initializer = g_cmt
             global_by_ea[ea] = g
@@ -2746,6 +2749,7 @@ class BIN2LLVMController():
         else:
             typ = lift_tif(tif, width)
             g = ir.GlobalVariable(self.m, typ, name = name)
+            g._source_ea = ea
             global_by_ea[ea] = g
             pending.append((g, ea, typ))
 
@@ -2874,8 +2878,24 @@ def _write_module_header(module: ir.Module, output):
     output.write(f'target datalayout = "{module.data_layout}"\n\n')
 
 
+def _mark_weak_declarations(module: ir.Module):
+    """
+    源 binary 中的弱符号（如 __gmon_start__、_ITM_deregisterTMCloneTable）可能未定义，代码会先判空再用。
+    普通外部声明会让 LLVM 假定其地址非空并删除这些判断，所以弱符号的声明使用 extern_weak。
+    """
+    for value in module.globals.values():
+        ea = getattr(value, "_source_ea", None)
+        if ea is None:
+            continue
+        is_declaration = (value.is_declaration if isinstance(value, ir.Function)
+                          else isinstance(value, ir.GlobalVariable) and value.initializer is None)
+        if is_declaration and ida_name.is_weak_name(ea):
+            value.linkage = "extern_weak"
+
+
 def _write_module_remainder(module: ir.Module, output, skip_type_names=None):
     skip_type_names = skip_type_names or set()
+    _mark_weak_declarations(module)
     for type_name, typ in module.get_identified_types().items():
         if type_name in skip_type_names:
             continue
@@ -2983,8 +3003,10 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
         "previous_output": _previous_output(out, sidecar),
     }
     bin2llvm = None
+    database_open = False
     try:
         idapro.open_database(input_binary, True)
+        database_open = True
         ida_auto.auto_wait()
         _init_target_state()
         result["ida_version"] = _ida_version()
@@ -3002,6 +3024,18 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
         bin2llvm.begin_stream_to_file(tmp, header)
         bin2llvm.insertAllFunctions()
         bin2llvm.finish_stream_to_file(fsync=True)
+        # 校验前释放 IDA 数据库和 lifter 的模块/缓存：llvm-as 对大模块的峰值内存与 lifter 相当，
+        # 避免两者同时驻留（逐函数记录先保存下来）
+        snapshot = (dict(lift_stats), Counter(unsupported_reasons), list(function_records), list(unresolved_data_items))
+        bin2llvm = None
+        idapro.close_database(False)
+        database_open = False
+        _reset_lift_state()
+        gc.collect()
+        lift_stats.update(snapshot[0])
+        unsupported_reasons.update(snapshot[1])
+        function_records.extend(snapshot[2])
+        unresolved_data_items.extend(snapshot[3])
         if lift_stats["defined"] == 0:
             result["status"] = "no_functions_lifted"
         else:
@@ -3028,9 +3062,10 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
                 bin2llvm.close_stream()
         with suppress(FileNotFoundError):
             os.remove(tmp)
-        with suppress(Exception):
-            # 不保存：lift 不应修改输入数据库，且保证同一 .i64 重复运行结果一致
-            idapro.close_database(False)
+        if database_open:
+            with suppress(Exception):
+                # 不保存：lift 不应修改输入数据库，且保证同一 .i64 重复运行结果一致
+                idapro.close_database(False)
         approx_reasons = Counter(tag for rec in function_records for tag in rec.get("approx", ()))
         result.update(
             elapsed_s=round(time.time() - started, 3),

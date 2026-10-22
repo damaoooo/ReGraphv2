@@ -336,6 +336,9 @@ def pipeline(
         args = ["--input-path", final_output_path, "--workers", str(workers)]
         args.extend(["--opt-level", normalized_opt_level])
         args.extend(["--arch", arch])
+        if ida_target_mode == "host":
+            # host 兼容模式的 task1 输出不做内存语义转换，task2 只有显式允许时才接受
+            args.append("--allow-host-compat")
         if resume:
             args.append("--resume")
         
