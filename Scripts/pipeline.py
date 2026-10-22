@@ -43,6 +43,12 @@ def task1(
         help="Conda environment for lifter subprocesses; empty uses current Python",
     ),
     ida_path: str = typer.Option("", "--ida-path", help="Path to IDA Pro for the ida backend"),
+    ida_target_mode: str = typer.Option(
+        "source",
+        "--target-mode",
+        help="ida2llvm output target: source (source triple/data layout, default) or host "
+             "(legacy host-layout compatibility mode, no memory-semantics conversion)",
+    ),
     ghidra_home: str = typer.Option("", "--ghidra-home", help="Ghidra installation root for the ghidra backend"),
     analyze_headless: str = typer.Option(
         "",
@@ -93,6 +99,7 @@ def task1(
         args.extend(["--ghidra-home", ghidra_home])
     if analyze_headless:
         args.extend(["--analyze-headless", analyze_headless])
+    args.extend(["--target-mode", ida_target_mode])
     args.extend(["--ghidra-target", ghidra_target])
     args.extend(["--ghidra-max-cpu", str(ghidra_max_cpu)])
     args.extend(["--ghidra-decompile-timeout", str(ghidra_decompile_timeout)])
@@ -191,6 +198,12 @@ def pipeline(
     db1: bool = typer.Option(False, help="Use DataProcess-1 as input"),
     input_path: str = typer.Option("", help="Custom input directory"),
     ida_path: str = typer.Option("", help="Path to IDA Pro"),
+    ida_target_mode: str = typer.Option(
+        "source",
+        "--target-mode",
+        help="ida2llvm output target: source (source triple/data layout, default) or host "
+             "(legacy host-layout compatibility mode, no memory-semantics conversion)",
+    ),
     lifter_backend: str = typer.Option("ida", "--lifter-backend", help="Task 1 lifter backend: ida or ghidra"),
     conda_env: str = typer.Option(
         os.environ.get("REGRAPH_CONDA_ENV", ""),
@@ -296,6 +309,7 @@ def pipeline(
             args.extend(["--ghidra-home", ghidra_home])
         if analyze_headless:
             args.extend(["--analyze-headless", analyze_headless])
+        args.extend(["--target-mode", ida_target_mode])
         args.extend(["--ghidra-target", ghidra_target])
         args.extend(["--ghidra-max-cpu", str(ghidra_max_cpu)])
         args.extend(["--ghidra-decompile-timeout", str(ghidra_decompile_timeout)])

@@ -6,7 +6,9 @@ from Utils.utils import *
 import pickle
 import sqlite3
 import multiprocessing
-from DataProcess.dataset_utils import FileFilter, find_llvm_files, cleanup_residual_temp_files
+from DataProcess.dataset_utils import FileFilter, cleanup_residual_temp_files
+from Scripts import artifact_state
+import hashlib
 import typer
 
 from rich.console import Console
@@ -151,12 +153,13 @@ def process_one_file(llvm_ir_path: str) -> Optional[Tuple[str, str, str, str]]:
     return llvm_ir_path, purified_llvm_ir_path, instrumented_file, cfg_dot_file, ddg_dot_file
 
 
-def process_chunk(file_paths: List[str], queue: multiprocessing.Queue) -> List[Optional[Tuple[str, str, str, str]]]:
+def process_chunk(files: List[Tuple[str, str]], queue: multiprocessing.Queue) -> None:
+    """files: (path, sha256 recorded by the task3 extract state)."""
     results = []
-    for file_path in file_paths:
+    for file_path, sha256 in files:
         result = process_one_file(file_path)
         if result is not None:
-            results.append(result)
+            results.append((*result, sha256))
     queue.put(results)  # Send results back to the main process
 
 
@@ -175,6 +178,10 @@ def init_database(output_db_path: str):
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_input_path ON results(input_path)")
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(results)")}
+        if "input_sha256" not in columns:
+            # 旧数据库加列：旧行为 NULL，DataProcess 视其为未验证的 legacy 行
+            cursor.execute("ALTER TABLE results ADD COLUMN input_sha256 TEXT")
         conn.commit()
 
 
@@ -189,8 +196,8 @@ def file_writer(queue: multiprocessing.Queue, output_db_path: str):
             
             # Use executemany for batch insert - much more efficient
             cursor.executemany("""
-                INSERT OR REPLACE INTO results (input_path, purify_path, instrumented_path, cfg_dot, ddg_dot)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO results (input_path, purify_path, instrumented_path, cfg_dot, ddg_dot, input_sha256)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, results)
             
             # Commit every batch_size batches instead of every batch
@@ -200,44 +207,49 @@ def file_writer(queue: multiprocessing.Queue, output_db_path: str):
         conn.commit()
 
 
-def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs: int = multiprocessing.cpu_count()):
+def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs: int = multiprocessing.cpu_count(),
+             allow_legacy_inputs: bool = False):
     if cleanup:
         cleanup_residual_temp_files(input_dir)
 
+    # 只使用 task3 状态有效（status ok、文件 hash 与记录一致）的函数文件
+    selected, rejected = artifact_state.select_function_files(input_dir, allow_legacy=allow_legacy_inputs)
+    for reason, count in rejected.items():
+        console.print(f"[red]Rejected {count} function directories: {reason}[/red]")
+    legacy = sum(1 for info in selected.values() if info["input_state"] == "legacy-unverified")
+    if legacy:
+        console.print(f"[yellow]Using {legacy} legacy-unverified function files (--allow-legacy-inputs)[/yellow]")
 
+    # 文件列表缓存以本次选择（路径 + hash）为键，输入变化时不会复用旧列表
+    selection_key = hashlib.sha256("".join(f"{p}:{i['sha256']};" for p, i in sorted(selected.items())).encode()).hexdigest()
     cache_path = os.path.join(input_dir, 'filecache.pkl')
     db_path = os.path.join(input_dir, 'results.db')
+    cached = None
     if use_cache and os.path.exists(cache_path):
         with open(cache_path, 'rb') as f:
-            valid_files = pickle.load(f)
-            console.print(f"[green]Loaded {len(valid_files)} valid files from cache.[/green]")
-
+            cached = pickle.load(f)
+    if isinstance(cached, dict) and cached.get("selection_key") == selection_key:
+        valid_files = cached["valid_files"]
+        console.print(f"[green]Loaded {len(valid_files)} valid files from cache.[/green]")
     else:
         console.print("[yellow]Start to build the file and save to cache...[/yellow]")
-        llvm_files = find_llvm_files(input_dir, pattern="**/*_functions/*.ll")
-        llvm_files = [os.path.abspath(f) for f in llvm_files]
-        
-        # Remove those files end with '.dot' or '_instrumented.ll' or '_purified.ll'
-        llvm_files = [f for f in llvm_files if not (f.endswith('.dot') or 
-                                                    f.endswith('_instrumented.ll') or 
-                                                    f.endswith('_purified.ll'))]
         file_filter = FileFilter(num_processes=multiprocessing.cpu_count())
-        valid_files = file_filter.filter_files_parallel(llvm_files)
+        valid_files = file_filter.filter_files_parallel(sorted(selected))
         if use_cache:
             with open(cache_path, 'wb') as f:
-                pickle.dump(valid_files, f)
+                pickle.dump({"selection_key": selection_key, "valid_files": valid_files}, f)
             console.print(f"[green]Saved {len(valid_files)} valid files to cache.[/green]")
 
     console.print(f"[yellow]Filtering finished Files...[/yellow]")
     init_database(db_path)
 
-    # Get all input_path from database and filter out already processed files
+    # 已处理且 hash 未变的文件跳过；hash 变化（或旧库没有 hash）的重新生成
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT input_path FROM results")
-        processed_files: set = {row[0] for row in cursor.fetchall()}
-    
-    valid_files = [f for f in valid_files if f not in processed_files]
+        cursor.execute("SELECT input_path, input_sha256 FROM results")
+        processed = {row[0]: row[1] for row in cursor.fetchall()}
+
+    valid_files = [(f, selected[f]["sha256"]) for f in valid_files if processed.get(f) != selected[f]["sha256"]]
     console.print(f"[green]Filtered {len(valid_files)} files to process.[/green]")
     queue = multiprocessing.Manager().Queue()
     writer_process = multiprocessing.Process(target=file_writer, args=(queue, db_path))
@@ -281,7 +293,10 @@ def main(
     input_dir: str = typer.Argument(..., help="Input directory containing LLVM IR files"),
     cleanup: bool = typer.Option(True, "--cleanup/--no-cleanup", help="Clean up residual temp files before processing"),
     use_cache: bool = typer.Option(True, "--cache/--no-cache", help="Use cached file list if available"),
-    jobs: int = typer.Option(multiprocessing.cpu_count(), "--jobs", "-j", help="Number of parallel jobs to run (default: number of CPU cores)")
+    jobs: int = typer.Option(multiprocessing.cpu_count(), "--jobs", "-j", help="Number of parallel jobs to run (default: number of CPU cores)"),
+    allow_legacy_inputs: bool = typer.Option(
+        False, "--allow-legacy-inputs",
+        help="Also use *_functions directories without a task3 .extract.json (marked legacy-unverified)"),
 ):
     """
     Process LLVM IR files to generate purified IR, DDG, and CFG files.
@@ -293,7 +308,7 @@ def main(
     
     Results are stored in a SQLite database for efficient querying.
     """
-    pipeline(input_dir, cleanup, use_cache, jobs)
+    pipeline(input_dir, cleanup, use_cache, jobs, allow_legacy_inputs)
 
 if __name__ == "__main__":
     app()

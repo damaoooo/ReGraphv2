@@ -1,0 +1,7 @@
+{
+  "name": "keep_all_v1",
+  "description": "Keep every function whose provenance is verified. Approximation tags (virtual_fs/stack canary, opaque helpers, ...) are recorded and counted but not used for exclusion, to avoid selection bias.",
+  "exclude_lift_status": [],
+  "exclude_approx_tags": [],
+  "exclude_approx_prefixes": []
+}
