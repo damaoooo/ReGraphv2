@@ -25,6 +25,7 @@ import zlib
 import llvmlite.binding as llvm
 from llvmlite import ir
 from llvmlite.ir import _utils as llvm_ir_utils
+from llvmlite.ir.values import FormattedConstant
 
 from contextlib import suppress
 from pathlib import Path
@@ -68,6 +69,8 @@ llvm_context = ir.Context()
 global_by_ea = {}
 # microcode 字符串常量的独立编号，不受模块中其他全局对象数量影响
 cstr_counter = [0]
+# 新建、尚未输出声明的结构体类型（流式输出时只处理新增部分）
+pending_type_decls = []
 _CACHE_MISS = object()
 
 # 线程局部存储段大小（Windows FS段标准大小）
@@ -176,6 +179,7 @@ def _reset_lift_state():
     llvm_context = ir.Context()
     global_by_ea.clear()
     cstr_counter[0] = 0
+    pending_type_decls.clear()
 
 
 def _init_target_state():
@@ -257,6 +261,11 @@ def _get_segtype_cached(ea):
         segtype = ida_segment.segtype(ea)
         segtype_cache[ea] = segtype
     return segtype
+
+
+def _is_extern_segment(ea) -> bool:
+    """segtype() 返回的是枚举值（SEG_DATA=3、SEG_BSS=9 ...），不能按位与 SEG_XTRN(=1)。"""
+    return _get_segtype_cached(ea) == ida_segment.SEG_XTRN
 
 
 def _tif_cache_key(tif: ida_typeinf.tinfo_t, width: int = -1):
@@ -449,6 +458,7 @@ def _lift_udt(tif: ida_typeinf.tinfo_t) -> ir.Type:
         if cur < size:
             elements.append(ir.ArrayType(i8, size - cur))
     struct_t.set_body(*elements)
+    pending_type_decls.append(struct_t)
     return struct_t
 
 
@@ -652,7 +662,7 @@ def _default_function_tinfo() -> ida_typeinf.tinfo_t:
 
 def lift_type_from_address(ea: int, pfunc=None):
     """从地址获取类型信息。"""
-    if _get_func_cached(ea) != None and _get_segtype_cached(ea) & ida_segment.SEG_XTRN:
+    if _get_func_cached(ea) != None and _is_extern_segment(ea):
         # 假设这是一个返回void且接受可变参数的函数
         return _default_function_tinfo()
 
@@ -882,7 +892,10 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
 
             # if function is variadic, declare va_start intrinsic
             if tif.is_vararg_cc() and typ.var_arg:  
-                ptr = builder.alloca(ir.IntType(8).as_pointer(), name = "ArgList")
+                # va_list 布局依赖目标 ABI（x86-64 SysV 24 字节、AArch64 32 字节、
+                # i386/ARM32/MIPS 为一个指针），统一分配 32 字节、16 字节对齐以覆盖常见目标
+                ptr = builder.alloca(ir.ArrayType(i8, 32), name = "ArgList")
+                ptr.align = 16
                 res.lvars["ArgList"] = ptr
                 va_start = module.declare_intrinsic('llvm.va_start', fnty=ir.FunctionType(ir.VoidType(), [ir.IntType(8).as_pointer()]))
                 # va_start 的参数是 va_list 存储本身的地址
@@ -989,6 +1002,10 @@ def _pointer_constant(module: ir.Module, typ: ir.PointerType, value: int):
         if func is not None and func.start_ea == value:
             target = _declare_function_at(module, value)
     if target is not None:
+        if isinstance(target, ir.Function):
+            # 函数定义时可能按反编译签名改类型；ir 的 bitcast() 在类型相同时直接返回函数本身，
+            # 之后改类型会让初始值与全局变量类型不一致，所以强制生成类型固定的 bitcast 常量
+            return FormattedConstant(typ, f"bitcast ({target.type} {target.get_reference()} to {typ})")
         return target if target.type == typ else target.bitcast(typ)
     head = ida_bytes.get_item_head(value)
     target = global_by_ea.get(head)
@@ -1294,7 +1311,7 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
         return lift_intrinsic_function(module, func_name)
 
     func_ea = ida_name.get_name_ea(ida_idaapi.BADADDR, func_name)
-    if func_ea != ida_idaapi.BADADDR and _get_segtype_cached(func_ea) & ida_segment.SEG_XTRN:
+    if func_ea != ida_idaapi.BADADDR and _is_extern_segment(func_ea):
         is_declare = True 
 
     if func_ea == ida_idaapi.BADADDR:
@@ -1479,7 +1496,9 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
             tif = lift_type_from_address(ea)
             func = _get_func_cached(ea)
             is_func_start = func is not None and func.start_ea == ea
-            if tif.is_func() or tif.is_funcptr() or is_func_start:
+            is_xtrn = _is_extern_segment(ea)
+            # 函数指针变量（非导入）按数据处理：作为调用目标时先加载其值再间接调用
+            if tif.is_func() or is_func_start or (tif.is_funcptr() and is_xtrn):
                 if tif.is_funcptr():
                     tif = tif.get_ptrarr_object()
                 if not tif.is_func():
@@ -1544,13 +1563,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
             return lift_intrinsic_function(blk.parent.parent, mop.helper)
         return None
     elif t == ida_hexrays.mop_str: # 字符串常量
-        str_csnt = mop.cstr
-        strType = ir.ArrayType(ir.IntType(8), len(str_csnt))
-        g = ir.GlobalVariable(blk.parent.parent, strType, name=f"cstr_{cstr_counter[0]}")
-        cstr_counter[0] += 1
-        g.initializer = ir.Constant(strType, bytearray(str_csnt.encode("utf-8")))
-        g.linkage = "private"
-        g.global_constant = True
+        g = _make_cstr_global(blk.parent.parent, mop.cstr)
         return typecast(g, ir.IntType(8).as_pointer(), builder)
     elif t == ida_hexrays.mop_c: # switch分支和目标
         mcases = {}
@@ -1599,6 +1612,26 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
                 ida_hexrays.mop_sc: "分散操作信息"
     }
     raise NotImplementedError(f"未实现: {mop.dstr()} 类型 {mop_descs[t]}")
+
+def _make_cstr_global(module: ir.Module, text: str) -> ir.GlobalVariable:
+    """microcode 字符串常量 -> 私有常量全局：按 UTF-8 字节定长，补结尾 \\0，名字不与已有符号冲突。"""
+    try:
+        raw = text.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        raw = text.encode("utf-8", "replace")
+    raw += b"\x00"  # C 字符串字面量，原始二进制中以 \0 结尾
+    str_type = ir.ArrayType(i8, len(raw))
+    while True:
+        name = f"cstr_{cstr_counter[0]}"
+        cstr_counter[0] += 1
+        if name not in module.globals:
+            break
+    g = ir.GlobalVariable(module, str_type, name=name)
+    g.initializer = ir.Constant(str_type, bytearray(raw))
+    g.linkage = "private"
+    g.global_constant = True
+    return g
+
 
 def _store_as(l: ir.Value, d: ir.Value, blk: ir.Block, builder: ir.IRBuilder, d_typ: ir.Type = None, signed: bool = True):
     """
@@ -2316,8 +2349,9 @@ class BIN2LLVMController():
                 return
             ida_typeinf.guess_tinfo(tif, ea)
 
-        # 如果数据项是外部函数，创建声明
-        if tif.is_func() or tif.is_funcptr():
+        # 如果数据项是外部函数，创建声明；普通数据段里的函数指针变量按数据处理
+        is_xtrn = _is_extern_segment(ea)
+        if tif.is_func() or (tif.is_funcptr() and is_xtrn):
             if tif.is_funcptr():
                 tif = tif.get_ptrarr_object()
             # if function is a thunk function, define the actual function instead
@@ -2335,7 +2369,7 @@ class BIN2LLVMController():
             # 或者函数是库函数，
             or (func.flags & ida_funcs.FUNC_LIB) 
             # 或者函数在XTRN段中声明，
-            or _get_segtype_cached(ea) & ida_segment.SEG_XTRN):
+            or _is_extern_segment(ea)):
                 # 返回函数声明
                 g = lift_function(self.m, name, True, ea, tif)
 
@@ -2418,15 +2452,13 @@ class BIN2LLVMController():
     def _stream_new_type_declarations(self):
         if self._stream_file is None:
             return
-        types = self.m.get_identified_types()
-        if len(types) == len(self._streamed_types):
-            # 类型只增不减：数量没变就没有新类型，跳过 O(T) 扫描
-            return
-        for type_name, typ in types.items():
-            if type_name in self._streamed_types:
+        # 只输出上次之后新建的类型，总开销 O(F + T)
+        for typ in pending_type_decls:
+            if typ.name in self._streamed_types:
                 continue
             _write_sanitized_llvm_ir(typ.get_declaration(), self._stream_file)
-            self._streamed_types.add(type_name)
+            self._streamed_types.add(typ.name)
+        pending_type_decls.clear()
 
     def finish_stream_to_file(self):
         if self._stream_file is None:
