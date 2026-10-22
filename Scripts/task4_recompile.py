@@ -14,7 +14,7 @@ import typer
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from task2_reoptimize import ARCH_TO_CLANG_FLAG, normalize_arch_mode, resolve_arch
-from utils import clang_target_args, console, ensure_directory, file_exists_and_not_empty, run_command
+from utils import console, ensure_directory, file_exists_and_not_empty, run_command
 
 app = typer.Typer()
 TASK4_STATE_DIRNAME = ".task4_recompile_state"
@@ -39,20 +39,15 @@ def marker_path_for_output(input_root: str, output_path: str, arch: str) -> str:
     )
 
 
-def recompile_file(file_path: str, output_path: str, arch: str | None, marker_path: str,
-                   allow_host_retarget: bool = False):
-    """Recompile a single optimized .bc file to a .re binary artifact for the module's own target."""
+def recompile_file(file_path: str, output_path: str, arch: str, marker_path: str):
+    """Recompile a single optimized .bc file to a .re binary artifact."""
     if os.path.exists(marker_path):
         os.remove(marker_path)
 
-    arch_flag = ARCH_TO_CLANG_FLAG.get(arch) if arch else None
-    try:
-        target_args, target_info = clang_target_args(file_path, arch_flag, allow_host_retarget)
-    except ValueError as exc:
-        return False, "", str(exc)
+    arch_flag = ARCH_TO_CLANG_FLAG[arch]
     command = [
         "clang",
-        *target_args,
+        arch_flag,
         "-c",
         *TASK4_CLANG_RECOMPILE_FLAGS,
         file_path,
@@ -68,8 +63,7 @@ def recompile_file(file_path: str, output_path: str, arch: str | None, marker_pa
         ensure_directory(os.path.dirname(marker_path))
         with open(marker_path, "w", encoding="utf-8") as handle:
             handle.write(f"arch={arch}\n")
-            for key, value in target_info.items():
-                handle.write(f"{key}={value}\n")
+            handle.write(f"arch_flag={arch_flag}\n")
             handle.write(f"flags={' '.join(TASK4_CLANG_RECOMPILE_FLAGS)}\n")
 
     return success, stdout, stderr
@@ -88,16 +82,10 @@ def main(
     arch: str = typer.Option(
         "auto",
         "--arch",
-        help="Bitness for --allow-host-retarget only: auto, m32, or m64.",
-    ),
-    allow_host_retarget: bool = typer.Option(
-        False,
-        "--allow-host-retarget",
-        help="Legacy: compile with -m32/-m64 for the host, overriding the module's own triple/data layout "
-             "(breaks the source memory layout; recorded in the resume marker).",
+        help="Target bitness for clang: auto, m32, or m64. auto infers from dataset-style file names.",
     ),
 ):
-    """Recompile optimized .bc files to .re files with clang for each module's own target triple."""
+    """Recompile optimized .bc files to .re files with clang."""
 
     normalized_input_path = os.path.abspath(input_path)
     normalized_arch = normalize_arch_mode(arch)
@@ -108,10 +96,7 @@ def main(
 
     console.print(f"[green]Processing directory: {normalized_input_path}[/green]")
     console.print(f"[green]Task 4 arch mode: {normalized_arch}[/green]")
-    if allow_host_retarget:
-        console.print("[yellow]Warning: --allow-host-retarget overrides module triples with the host target[/yellow]")
-    console.print(f"[green]Task 4 clang flags: {'-m32/-m64' if allow_host_retarget else '--target=<module triple>'} "
-                  f"{' '.join(TASK4_CLANG_RECOMPILE_FLAGS)}[/green]")
+    console.print(f"[green]Task 4 clang flags: -m32/-m64 {' '.join(TASK4_CLANG_RECOMPILE_FLAGS)}[/green]")
 
     console.print("[bold blue]Preparing recompilation tasks...[/bold blue]")
     recompile_commands = []
@@ -130,17 +115,16 @@ def main(
 
             file_path = os.path.join(root, file)
             resolved_arch = resolve_arch(file_path, normalized_arch)
-            if resolved_arch is None and allow_host_retarget:
+            if resolved_arch is None:
                 unknown_arch_files.append(file_path)
                 continue
 
-            if resolved_arch is not None:
-                arch_counts[resolved_arch] += 1
+            arch_counts[resolved_arch] += 1
             output_file_path = os.path.splitext(file_path)[0] + ".re"
             marker_path = marker_path_for_output(
                 normalized_input_path,
                 output_file_path,
-                resolved_arch if allow_host_retarget else "module_target",
+                resolved_arch,
             )
 
             if resume and file_exists_and_not_empty(output_file_path) and os.path.exists(marker_path):
@@ -150,7 +134,7 @@ def main(
             if resume and file_exists_and_not_empty(output_file_path):
                 rerun_existing += 1
 
-            recompile_commands.append([file_path, output_file_path, resolved_arch, marker_path, allow_host_retarget])
+            recompile_commands.append([file_path, output_file_path, resolved_arch, marker_path])
 
     if unknown_arch_files:
         console.print(

@@ -89,8 +89,6 @@ class InferencePipelineConfig:
     use_graph_cache: bool = False
     resume: bool = True
     task1_start_from_step2: bool = False
-    # ida2llvm 输出目标：必须与训练数据一致（source = 源 triple/layout；host = 旧数据的兼容模式）
-    target_mode: str = "source"
     model_path: Optional[str] = None
     use_cfg: Optional[bool] = None
     use_ddg: Optional[bool] = None
@@ -457,7 +455,6 @@ class ReGraphInferencePipeline:
             command_line.append("--resume")
         if self.config.task1_start_from_step2:
             command_line.append("--task1-start-from-step2")
-        command_line.extend(["--target-mode", self.config.target_mode])
 
         self._run_command(command_line, cwd=self.config.repo_root)
         return os.path.join(lifted_output_dir, os.path.basename(executable_dir.rstrip("/")))
@@ -631,9 +628,6 @@ def main(
     repo_root: str = typer.Option(os.getcwd(), help="Repository root."),
     resume: bool = typer.Option(True, help="Resume lifting pipeline when possible."),
     task1_start_from_step2: bool = typer.Option(False, help="Skip IDA database generation and start task1 from step2."),
-    target_mode: str = typer.Option(
-        "source", "--target-mode",
-        help="ida2llvm output target; must match the model's training data (host for models trained on legacy IR)."),
     cleanup_graph_temp_files: bool = typer.Option(True, help="Clean graph generation temp files."),
     use_graph_cache: bool = typer.Option(False, help="Reuse graph file cache if present."),
 ):
@@ -650,7 +644,6 @@ def main(
             use_graph_cache=use_graph_cache,
             resume=resume,
             task1_start_from_step2=task1_start_from_step2,
-            target_mode=target_mode,
         )
     )
     payload = pipeline.run(executable_dir, lifted_output_dir, output_json_path)

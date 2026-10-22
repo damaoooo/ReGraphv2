@@ -11,7 +11,6 @@ from Tokenizer.ir_tokenizer import load_tokenizer
 from Utils.utils import DEFAULT_DDG_SO_PATH, DEFAULT_PURIFY_SO_PATH, DEFAULT_CFG_SO_PATH, DEFAULT_TOKENIZER_PATH
 
 from .dataset_builder_new import DatasetBuilder
-from .provenance import DEFAULT_POLICY, load_policy, select_inputs, write_selection
 from .dataset_utils import find_llvm_files, cleanup_residual_temp_files
 
 
@@ -35,14 +34,7 @@ def process_directory(
     num_processes: int = typer.Option(None, "--num-processes", "-p", help="Number of processes to use"),
     no_cleanup: bool = typer.Option(False, "--no-cleanup", help="Keep temporary files (dot and instrumented .ll)"),
     use_parallel: bool = typer.Option(False, "--parallel", help="Use parallel chunk processing instead of batched"),
-    cache: bool = typer.Option(True, "--no-cache", help="Disable caching of results"),
-    selection_policy: str = typer.Option(
-        DEFAULT_POLICY, "--selection-policy",
-        help="Versioned JSON policy deciding which verified functions enter this build (default keeps all, "
-             "recording approximation tags)"),
-    allow_legacy_inputs: bool = typer.Option(
-        False, "--allow-legacy-inputs",
-        help="Also use function files/rows without pipeline state (marked legacy-unverified in provenance)"),
+    cache: bool = typer.Option(True, "--no-cache", help="Disable caching of results")
 ):
     """Process LLVM IR files from a directory for dataset creation"""
     
@@ -63,23 +55,6 @@ def process_directory(
         console.print(f"[red]Database file not found: {db_file_origin}")
         raise typer.Exit(1)
 
-    # 完整性检查 + 数据选择策略：只用状态有效、hash 一致的函数；记录来源与选择结果
-    policy = load_policy(selection_policy)
-    file_list, provenance, summary = select_inputs(input_dir, db_file_origin, policy, allow_legacy_inputs)
-    previous = os.path.join(output_file, "selection.json")
-    if os.path.exists(os.path.join(output_file, "progress.txt")) and os.path.exists(previous):
-        import json
-        with open(previous) as handle:
-            old_digest = json.load(handle).get("selection_digest")
-        if old_digest != summary["selection_digest"]:
-            console.print("[red]Output directory was built from a different input selection; "
-                          "resuming would mix stale and current data. Use a new output directory.")
-            raise typer.Exit(1)
-    write_selection(output_file, provenance, summary)
-    console.print(f"[green]Selection {summary['policy']['name']}: {summary['selected']} selected of "
-                  f"{summary['candidates']} verified candidates; integrity rejections: {summary['rejected_for_integrity']}; "
-                  f"policy exclusions: {summary['excluded_by_policy']}")
-
     # Load tokenizer
     console.print("[yellow]Loading tokenizer...")
     tokenizer = load_tokenizer(tokenizer_path)
@@ -96,7 +71,7 @@ def process_directory(
     )
     
     # Process files
-    builder.process_dataset(output_file, batch_size, use_parallel, use_hf=use_hf, file_list=file_list)
+    builder.process_dataset(output_file, batch_size, use_parallel, use_hf=use_hf)
     # cleanup_residual_temp_files(input_dir)
 
 

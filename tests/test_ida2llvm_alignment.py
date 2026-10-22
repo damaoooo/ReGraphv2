@@ -24,6 +24,28 @@ I8P = ir.IntType(8).as_pointer()
 I32 = ir.IntType(32)
 
 
+def test_alignment_walk_has_bounded_work(L, monkeypatch):
+    module, func, blocks, builder = new_function()
+    ptr = builder.alloca(ir.IntType(8))
+    ptr.align = 16
+    chain = []
+    for _ in range(256):
+        ptr = builder.gep(ptr, [I32(16)])
+        chain.append(ptr)
+    visits = 0
+    original = L._gep_constant_offset
+
+    def count_steps(gep):
+        nonlocal visits
+        visits += 1
+        return original(gep)
+
+    monkeypatch.setattr(L, '_gep_constant_offset', count_steps)
+    for ptr in chain:
+        assert L._known_alignment(ptr) in (1, 16)
+    assert visits <= 64 * len(chain)
+
+
 def stores(module, typ="i32"):
     return [line for line in str(module).splitlines() if f"store {typ}" in line]
 

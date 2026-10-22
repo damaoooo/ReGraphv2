@@ -106,6 +106,38 @@ def test_register_first_written_is_not_flagged(fresh):
     assert not L.current_approx
 
 
+def test_lifter_state_helpers_are_self_contained(L, tmp_path):
+    state = L._LiftArtifactState
+    output = tmp_path / 'probe.ll'
+    output.write_text('original')
+    sidecar = str(output) + state.LIFT_SUFFIX
+    record = {'schema': state.SCHEMA, 'status': 'ok',
+              'output': {'size': output.stat().st_size, 'sha256': state.sha256_file(output)}}
+    state.write_json_atomic(sidecar, record)
+    assert state.check_output(state.read_json(sidecar), str(output)) == (True, 'ok')
+    output.write_text('modified')
+    assert not state.check_output(state.read_json(sidecar), str(output))[0]
+    assert not list(tmp_path.glob('*.tmp.*'))
+    assert state.read_json(str(tmp_path / 'missing')) is None
+
+
+def test_register_identity_does_not_depend_on_printed_name(fresh):
+    module, func, (entry, _), builder = new_function()
+    first = types.SimpleNamespace(size=4, r=8, dstr=lambda: 'eax.4')
+    renamed = types.SimpleNamespace(size=4, r=8, dstr=lambda: 'eax.4{2}')
+    assert fresh._get_register_storage(first, entry, builder, False) is fresh._get_register_storage(renamed, entry, builder)
+
+
+@pytest.mark.parametrize('offset', [8, 9])
+def test_overlapping_register_views_are_not_independent_slots(fresh, offset):
+    module, func, (entry, _), builder = new_function()
+    wide = types.SimpleNamespace(size=4, r=8, dstr=lambda: 'eax.4')
+    byte = types.SimpleNamespace(size=1, r=offset, dstr=lambda: 'al.1' if offset == 8 else 'ah.1')
+    fresh._get_register_storage(wide, entry, builder, False)
+    with pytest.raises(fresh.UnsupportedMicrocode, match='register_alias_overlap'):
+        fresh._get_register_storage(byte, entry, builder, False)
+
+
 @needs_opt
 def test_register_livein_survives_oc_as_unknown(fresh):
     L = fresh
@@ -303,11 +335,47 @@ def test_return_abi_conflict_ignored_when_result_unused(stub_operands):
     verify(module)
 
 
+@pytest.mark.parametrize('actual,formal', [(ir.IntType(64), ir.DoubleType()),
+                                         (ir.DoubleType(), ir.IntType(64))])
+def test_call_argument_abi_conflict_rejects(stub_operands, actual, formal):
+    L = stub_operands
+    module, func, (entry, _), builder = new_function()
+    callee = ir.Function(module, ir.FunctionType(ir.VoidType(), [formal]), 'callee')
+    target = mop(L, 'mop_v', value=callee)
+    d = mop(L, 'mop_f', value=([], [ir.Constant(actual, 1)]), size=0,
+            f=callinfo(L, ir.VoidType(), retregs=0))
+    with pytest.raises(L.UnsupportedMicrocode, match='call_argument_abi_conflict'):
+        L.lift_insn(insn(L, 'm_call', l=target, d=d), entry, builder)
+
+
+@pytest.mark.parametrize('triple,name,allowed', [
+    ('arm-unknown-linux-gnueabi', 'callee', True),
+    ('arm-unknown-linux-gnueabihf', 'callee', False),
+    ('arm-unknown-linux-gnueabihf', '__aeabi_dadd', True),
+])
+def test_arm_scalar_abi_distinguishes_pcs(L, monkeypatch, triple, name, allowed):
+    monkeypatch.setattr(L, 'source_family', 'arm')
+    monkeypatch.setattr(L, 'ptrsize', 32)
+    module = ir.Module()
+    module.triple = triple
+    callee = ir.Function(module, ir.FunctionType(ir.IntType(64), []), name)
+    assert L._compatible_scalar_abi(ir.DoubleType(), ir.IntType(64), callee, module) == allowed
+    assert not L._compatible_scalar_abi(ir.DoubleType(), ir.IntType(32), callee, module)
+
+
 def test_demanded_type_does_not_change_call_abi(stub_operands):
     L = stub_operands
     module, entry, builder, call_insn = typed_call(L, ir.IntType(32), ir.IntType(32))
     call = L.lift_insn(call_insn, entry, builder, result_type=ir.DoubleType())
     assert call.type == ir.IntType(32)  # the consumer converts afterwards; the call keeps its ABI
+
+
+def test_void_value_cannot_be_fabricated_as_zero(L):
+    module, func, (entry, _), builder = new_function()
+    callee = ir.Function(module, ir.FunctionType(ir.VoidType(), []), 'side_effect')
+    value = builder.call(callee, [])
+    with pytest.raises(L.UnsupportedMicrocode, match='void_value_cast'):
+        L.typecast(value, ir.IntType(32), builder)
 
 
 def test_direct_call_multi_retregs_rejects(stub_operands):

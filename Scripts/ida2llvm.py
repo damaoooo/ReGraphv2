@@ -16,6 +16,10 @@ import idaapi
 import logging
 import array
 import gc
+import glob
+import json
+import shutil
+import socket
 import re
 import hashlib
 import os
@@ -36,8 +40,122 @@ from llvmlite.ir.values import FormattedConstant
 from contextlib import suppress
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import artifact_state  # noqa: E402
+
+class _LiftArtifactState:
+    """Private lifter publication helpers; no downstream pipeline dependency."""
+    SCHEMA = 1
+    STATUS_OK = 'ok'
+    LIFT_SUFFIX = '.lift.json'
+
+    @staticmethod
+    def sha256_file(path: str, bufsize: int=1 << 20) -> str:
+        digest = hashlib.sha256()
+        with open(path, 'rb') as handle:
+            while (chunk := handle.read(bufsize)):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def fsync_dir(path: str):
+        fd = os.open(path or '.', os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def tmp_path_for(path: str) -> str:
+        """Temporary sibling of `path`, unique per host and process so concurrent writers never collide."""
+        return f'{path}.tmp.{socket.gethostname()}.{os.getpid()}'
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @staticmethod
+    def cleanup_stale_tmp(path: str) -> list:
+        """Remove temporaries of `path` left by dead processes on this host (e.g. after SIGKILL)."""
+        removed = []
+        host = socket.gethostname()
+        for tmp in glob.glob(glob.escape(path) + '.tmp.*'):
+            parts = tmp[len(path) + len('.tmp.'):].rsplit('.', 1)
+            if len(parts) != 2 or not parts[1].isdigit():
+                continue
+            tmp_host, pid = (parts[0], int(parts[1]))
+            if tmp_host == host and (not _LiftArtifactState._pid_alive(pid)):
+                if os.path.isdir(tmp):
+                    shutil.rmtree(tmp, ignore_errors=True)
+                else:
+                    try:
+                        os.remove(tmp)
+                    except FileNotFoundError:
+                        pass
+                removed.append(tmp)
+        return removed
+
+    @staticmethod
+    def write_json_atomic(path: str, data: dict):
+        tmp = _LiftArtifactState.tmp_path_for(path)
+        try:
+            with open(tmp, 'w') as handle:
+                json.dump(data, handle, indent=1)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+            _LiftArtifactState.fsync_dir(os.path.dirname(os.path.abspath(path)))
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    @staticmethod
+    def read_json(path: str):
+        try:
+            with open(path) as handle:
+                return json.load(handle)
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def ida_install_id(ida_dir: str | None) -> str | None:
+        """Fingerprint IDA libraries by size and mtime without opening a database."""
+        if not ida_dir or not os.path.isdir(ida_dir):
+            return None
+        digest = hashlib.sha256()
+        names = ['libida.so'] + sorted((os.path.relpath(p, ida_dir) for p in glob.glob(os.path.join(ida_dir, 'plugins', 'hex*.so'))))
+        found = False
+        for name in names:
+            try:
+                st = os.stat(os.path.join(ida_dir, name))
+            except OSError:
+                continue
+            found = True
+            digest.update(f'{name}:{st.st_size}:{st.st_mtime_ns};'.encode())
+        return digest.hexdigest()[:16] if found else None
+
+    @staticmethod
+    def check_output(state: dict | None, output_path: str) -> tuple[bool, str]:
+        """The artifact on disk is the one the state file describes, and that run succeeded."""
+        if state is None:
+            return (False, 'missing state file')
+        if state.get('schema') != _LiftArtifactState.SCHEMA:
+            return (False, f"state schema {state.get('schema')} != {_LiftArtifactState.SCHEMA}")
+        if state.get('status') != _LiftArtifactState.STATUS_OK:
+            return (False, f"status {state.get('status')}")
+        recorded = state.get('output') or {}
+        if not os.path.isfile(output_path):
+            return (False, 'output missing')
+        if os.path.getsize(output_path) != recorded.get('size'):
+            return (False, 'output size differs from state (stale or partially published)')
+        if _LiftArtifactState.sha256_file(output_path) != recorded.get('sha256'):
+            return (False, 'output hash differs from state (stale or partially published)')
+        return (True, 'ok')
+
 
 log_dir = Path(__file__).resolve().parents[1] / "logs"
 log_dir.mkdir(parents=True, exist_ok=True)
@@ -217,6 +335,81 @@ def source_target_spec(proc: str, bits: int, big_endian: bool, is_elf: bool = Tr
     return {"triple": triple, "datalayout": layout, "family": key[0], "bits": bits, "endian": endian}
 
 
+def _parse_elf_header(raw: bytes) -> dict:
+    """Read the fixed ELF header, without guessing an ABI from a filename."""
+    if len(raw) < 16 or raw[:4] != b"\x7fELF" or raw[4] not in (1, 2) or raw[5] not in (1, 2):
+        raise UnsupportedTarget("missing or invalid ELF header")
+    bits = 32 if raw[4] == 1 else 64
+    endian = "little" if raw[5] == 1 else "big"
+    fmt = ("<" if endian == "little" else ">") + ("HHIIIIIHHHHHH" if bits == 32 else "HHIQQQIHHHHHH")
+    if len(raw) < 16 + struct.calcsize(fmt):
+        raise UnsupportedTarget("truncated ELF header")
+    fields = struct.unpack_from(fmt, raw, 16)
+    if raw[6] != 1 or fields[2] != 1:
+        raise UnsupportedTarget("unsupported ELF version")
+    return {"bits": bits, "endian": endian, "type": fields[0], "machine": fields[1], "flags": fields[6]}
+
+
+def _source_elf_header() -> dict:
+    # Linked ELF headers are usually mapped into the IDB, so moved databases work
+    # without consulting a potentially unrelated file at their old input path.
+    with suppress(Exception):
+        raw = ida_bytes.get_bytes(ida_nalt.get_imagebase(), 64)
+        header = _parse_elf_header(raw or b"")
+        return {**header, "evidence": "idb-image-header"}
+    path = ida_nalt.get_input_file_path()
+    try:
+        # For relocatable objects the header may not be mapped. Verify the source
+        # against the fingerprint stored by IDA before trusting its ABI flags.
+        expected = ida_nalt.retrieve_input_file_sha256()
+        if not expected:
+            raise UnsupportedTarget("no IDB source fingerprint for ELF ABI verification")
+        expected = expected.hex() if isinstance(expected, bytes) else str(expected)
+        if _LiftArtifactState.sha256_file(path) != expected.lower():
+            raise UnsupportedTarget("source ELF fingerprint differs from IDB")
+        with open(path, "rb") as handle:
+            header = _parse_elf_header(handle.read(64))
+        return {**header, "evidence": "verified-source-file"}
+    except OSError as exc:
+        raise UnsupportedTarget(f"source ELF unavailable; cannot determine ABI: {path}") from exc
+
+
+def _apply_source_abi(spec: dict, elf: dict) -> dict:
+    """Restrict ARM/MIPS to ABIs whose pointer and scalar-call model is supported."""
+    spec = dict(spec)
+    family, flags = spec["family"], elf["flags"]
+    machine = {"arm": 40, "mips": 8}[family]
+    if elf["machine"] != machine:
+        raise UnsupportedTarget("ELF machine disagrees with IDA processor")
+    if family == "mips" and flags & 0x20:
+        raise UnsupportedTarget("MIPS n32 ABI is not supported (64-bit registers, 32-bit pointers)")
+    if (elf["bits"], elf["endian"]) != (spec["bits"], spec["endian"]):
+        raise UnsupportedTarget("ELF class/endianness disagrees with IDA pointer layout")
+    if family == "arm":
+        if flags >> 24 != 5:
+            raise UnsupportedTarget("only ARM EABI5 is supported")
+        # AAELF32 defines these flags for linked files. ET_REL requires parsing
+        # Tag_ABI_VFP_args, not treating clear header flags as soft-float.
+        if elf["type"] not in (2, 3):
+            raise UnsupportedTarget("ARM relocatable ABI requires Tag_ABI_VFP_args; use a linked ELF")
+        float_flags = flags & 0x600
+        if float_flags == 0:
+            raise UnsupportedTarget("ARM float ABI unknown: Tag_ABI_VFP_args parsing is required")
+        if float_flags == 0x600:
+            raise UnsupportedTarget("contradictory ARM soft/hard-float ABI flags")
+        hard = float_flags == 0x400
+        spec["abi"] = "aapcs-vfp" if hard else "aapcs-base"
+        if hard:
+            spec["triple"] = "arm-unknown-linux-gnueabihf"
+    else:
+        abi_flags = flags & 0xF000
+        if (spec["bits"] == 32 and abi_flags not in (0, 0x1000)) or (spec["bits"] == 64 and abi_flags != 0):
+            raise UnsupportedTarget(f"unsupported MIPS ABI flags {abi_flags:#x}")
+        spec["abi"] = "o32" if spec["bits"] == 32 else "n64"
+    spec["elf"] = elf
+    return spec
+
+
 def _set_sizing_layout(layout):
     """设置类型大小计算所用的 layout，并清空依赖它的缓存。"""
     global sizing_layout, target_data
@@ -364,24 +557,34 @@ def _get_register_storage(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRB
     """
     为 Hex-Rays 的寄存器操作数分配一个稳定的栈槽。
 
-    这里不试图完整模拟物理寄存器别名关系，只提供一个可读可写的 SSA 外存储。
+    按 microregister 编号与宽度识别视图，不依赖打印名称。不同宽度的重叠视图
+    暂不模拟其架构相关写入规则，明确拒绝，不能分成互不相干的存储槽。
     寄存器的入口值未知：初始化为 freeze undef（未知但固定的值），不能假定为 0。
     第一次访问就是读取时，说明读到了未建模的入口值，记为近似。
     """
     func = blk.parent
     reg_name = f"reg_{_sanitize_symbol_name(mop.dstr())}"
     reg_width = ptrsize if mop.size <= 0 else mop.size * 8
+    key = ('mreg', int(mop.r), reg_width)
 
-    if reg_name not in func.lvars:
+    if key not in func.lvars:
+        owners = getattr(func, 'register_bytes', None)
+        if owners is None:
+            owners = func.register_bytes = {}
+        byte_range = range(int(mop.r), int(mop.r) + reg_width // 8)
+        if any(byte in owners for byte in byte_range):
+            raise UnsupportedMicrocode('register_alias_overlap', mop.dstr())
+        for byte in byte_range:
+            owners[byte] = key
         reg_type = ir.IntType(reg_width)
         with builder.goto_entry_block():
             reg_ptr = builder.alloca(reg_type, name=reg_name)
             builder.store(_freeze_undef(builder, reg_type), reg_ptr)
-        func.lvars[reg_name] = reg_ptr
+        func.lvars[key] = reg_ptr
         if is_read:
             _note_approx("register_livein")
 
-    return func.lvars[reg_name]
+    return func.lvars[key]
 
 def lift_tif(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
     cache_key = _tif_cache_key(tif, width)
@@ -577,7 +780,7 @@ def typecast(src: ir.Value, dst_type: ir.Type, builder: ir.IRBuilder, signed: bo
     if src_type is dst_type:
         return src
     if isinstance(src_type, ir.VoidType):
-        return _zero_initializer_for_type(dst_type)
+        raise UnsupportedMicrocode('void_value_cast', f'void -> {dst_type}')
     if src_type == dst_type:
         return src
 
@@ -1034,6 +1237,8 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
             del res.stack_extent
         with suppress(AttributeError):
             del res.nodefault_switches
+        with suppress(AttributeError):
+            del res.register_bytes
         for blk in res.blocks:
             with suppress(AttributeError):
                 del blk.next_blk
@@ -1417,6 +1622,27 @@ def _lift_semantic_helper(name: str, ret_type: ir.Type, args: list, builder: ir.
                              ir.FunctionType(ty, [ty, ir.IntType(1)]))
         return typecast(builder.call(fn, [_int_arg(args[0], width, builder), ir.IntType(1)(0)]), ret_type, builder)
 
+    if name in ("__CFSUB__", "__OFSUB__") and len(args) == 3 and source_family is not None:
+        x, y, carry = args
+        if (isinstance(x.type, ir.IntType) and x.type == y.type
+                and isinstance(carry.type, ir.IntType)):
+            width = x.type.width
+            wide = ir.IntType(width + 1)
+            incoming = builder.icmp_unsigned('!=', carry, carry.type(0))
+            borrow = builder.not_(incoming) if source_family in ('arm', 'ppc') else incoming
+            if name == '__CFSUB__':
+                rhs = builder.add(builder.zext(y, wide), builder.zext(borrow, wide))
+                flag = builder.icmp_unsigned('<', builder.zext(x, wide), rhs)
+                if source_family in ('arm', 'ppc'):
+                    flag = builder.not_(flag)
+            else:
+                result = builder.sub(builder.sub(builder.sext(x, wide), builder.sext(y, wide)),
+                                     builder.zext(borrow, wide))
+                flag = builder.or_(builder.icmp_signed('<', result, wide(-(1 << (width - 1)))),
+                                   builder.icmp_signed('>', result, wide((1 << (width - 1)) - 1)))
+            return typecast(builder.zext(flag, ir.IntType(8)), ret_type, builder)
+        return None
+
     if name in ("__CFADD__", "__CFSUB__", "__OFADD__", "__OFSUB__") and len(args) == 2:
         widths = {a.type.width for a in args if isinstance(a.type, ir.IntType)}
         if len(widths) == 1 and len(args) == 2 and (name != "__CFSUB__" or source_family is not None):
@@ -1475,6 +1701,15 @@ def _retype_function(func: ir.Function, ftype: ir.FunctionType):
     func.scope = llvm_ir_utils.NameScope()
     func.args = tuple(ir.Argument(func, t) for t in ftype.args)
     func.return_value = ir.ReturnValue(func, ftype.return_type)
+
+
+class _ArmHardFloatAttributes(ir.FunctionAttributes):
+    # Required for scalar VFP PCS codegen, not a recovered CPU feature set.
+    # The bare arm triple is a generic codegen baseline (clang may use armv5e),
+    # not evidence of the original ISA revision. These ABI tokens remain in IR.
+    # llvmlite 0.46 has no public key/value attribute API. Keep the extension
+    # local to these functions, not a process-wide change of allowed attributes.
+    _known = ir.FunctionAttributes._known | frozenset({'"target-features"="+vfp2"'})
 
 
 def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None, tif: ida_typeinf.tinfo_t = None):
@@ -1545,6 +1780,12 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
             logging.debug(f"Unexpected pointer type for function {func_name}: {typ}")
         res = ir.Function(module, typ, func_name)
         res._source_ea = func_ea
+
+    if str(module.triple).endswith("gnueabihf"):
+        # A generic `arm` triple otherwise selects a pre-VFP CPU, and llc can
+        # silently pass float arguments through r0/r1 despite the hf environment.
+        res.attributes = _ArmHardFloatAttributes(res.attributes)
+        res.attributes.add('"target-features"="+vfp2"')
 
     if is_declare:
         return res
@@ -1909,7 +2150,7 @@ def _gep_constant_offset(gep) -> int | None:
 def _known_alignment(ptr: ir.Value) -> int:
     """能证明的 ptr 对齐字节数：沿 bitcast / 常量 GEP 回溯到 alloca 或全局变量；否则为 1。"""
     offset = 0
-    while True:
+    for _ in range(64):
         if isinstance(ptr, ir.CastInstr) and ptr.opname == "bitcast":
             ptr = ptr.operands[0]
         elif isinstance(ptr, ir.GEPInstr):
@@ -1920,6 +2161,10 @@ def _known_alignment(ptr: ir.Value) -> int:
             ptr = ptr.pointer
         else:
             break
+    else:
+        # Bound repeated walks over long address chains: unknown alignment is
+        # conservative, whereas claiming more alignment can introduce UB.
+        return 1
     if isinstance(ptr, ir.AllocaInstr):
         base = ptr.align or _abi_alignment(ptr.allocated_type)
     elif isinstance(ptr, ir.GlobalVariable):
@@ -2139,17 +2384,255 @@ def _overflow_bit(l, r, op_func, builder, ida_insn):
     return builder.extract_value(op_func(l, r), 1)
 
 
-def _shift_carry_bit(l, r, builder, ida_insn, left):
-    """shl/shr 最后移出的那一位（即 x86 CF）。"""
+# ============================================================================
+# 变量移位量的语义（R02）
+# Hex-Rays 在最早的 MMAT_GENERATED 就把各架构的寄存器移位统一成 `shl x, c.1`：x86 的 shl eax, cl
+# （硬件按 31/63 取模）、ARM32 的 lsl r0, r0, r1（取低字节，>= 位宽时结果饱和）、AArch64 的 lslv
+# （按位宽取模）、MIPS 的 sllv/dsllv（按 31/63 取模）在 microcode 中形式相同，Hex-Rays 自己的变换
+# （如把 neg cl; shr 改写成 shr x, 0x20-n）依赖源架构的这种语义。LLVM 中移位量 >= 位宽是 poison，
+# 所以按"源处理器族 × 运算宽度"恢复机器语义；只在该宽度是该架构寄存器移位的原生宽度时成立，
+# 其他组合不编造语义：常量且在范围内照常提升，否则拒绝该函数。
+# ============================================================================
+
+def _shift_count_rule(width: int):
+    """(count mask, saturating) of register-count shifts on the source machine at this width, or None."""
+    if source_family == "x86":
+        if width in (8, 16, 32) or (width == 64 and ptrsize == 64):
+            return (63 if width == 64 else 31), True  # 8/16 位运算取模后仍可能 >= 位宽
+        return None
+    if source_family == "arm":
+        if ptrsize == 32 and width == 32:
+            return 0xFF, True  # 移位量取 Rm 的低字节，>= 32 时 LSL/LSR 为 0、ASR 为符号填充
+        if ptrsize == 64 and width in (32, 64):
+            return width - 1, False  # LSLV/LSRV/ASRV：按位宽取模
+        return None
+    if source_family == "mips":
+        if width == 32 or (width == 64 and ptrsize == 64):
+            return width - 1, False  # sllv/srlv/srav 取低 5 位，dsllv/... 取低 6 位
+        return None
+    return None
+
+
+def _install_arm_carry_fix():
+    """Preserve A32 shifter carry before Hex-Rays folds it into a pure expression."""
+    if source_family != "arm" or ptrsize != 32:
+        return None
+    import ida_allins
+    import ida_ua
+
+    arithmetic = {getattr(ida_allins, 'ARM_' + name) for name in
+                  ('adc', 'sbc', 'rsc', 'add', 'sub', 'rsb', 'cmp', 'cmn')}
+
+    class CarryFix(ida_hexrays.Hexrays_Hooks):
+        error = None
+
+        def microcode(self, mba):
+            try:
+                return self.normalize(mba)
+            except Exception as exc:
+                self.error = str(exc)
+                return ida_hexrays.MERR_INSN
+
+        def normalize(self, mba):
+            # One linear pass per generated function, no cross-function cache.
+            for index in range(mba.qty):
+                block = mba.get_mblock(index)
+                ins = block.head
+                while ins is not None:
+                    following = ins.next
+                    if (ins.opcode in (ida_hexrays.m_cfshl, ida_hexrays.m_cfshr)
+                            and ins.l.size == 4 and ins.r.size == 1
+                            and ins.d.t == ida_hexrays.mop_r and ins.d.size == 1
+                            and following is not None and following.ea == ins.ea
+                            and following.opcode in (ida_hexrays.m_shl, ida_hexrays.m_shr, ida_hexrays.m_sar)
+                            and ins.l.equal_mops(following.l, 0) and ins.r.equal_mops(following.r, 0)):
+                        native = ida_ua.insn_t()
+                        if not ida_ua.decode_insn(native, ins.ea):
+                            raise RuntimeError(f'cannot decode ARM carry source at {ins.ea:#x}')
+                        if native.itype in arithmetic:
+                            # Arithmetic uses incoming C, not the barrel-shifter C.
+                            # IDA 9.4 otherwise overwrites C before ADC/SBC consume it.
+                            block.make_nop(ins)
+                        else:
+                            self.expand(ins, following.opcode == ida_hexrays.m_sar)
+                    ins = following
+            return 0
+
+        @staticmethod
+        def expand(ins, arithmetic_right):
+            def number(n, size):
+                value = ida_hexrays.mop_t()
+                value.make_number(n, size)
+                return value
+
+            def expr(opcode, left, right, size):
+                node = ida_hexrays.minsn_t(ins.ea)
+                node.opcode = opcode
+                node.d.size = size
+                node.l.assign(left)
+                if right is not None:
+                    node.r.assign(right)
+                value = ida_hexrays.mop_t()
+                value.make_insn(node)
+                value.size = size
+                return value
+
+            h = ida_hexrays
+            count = h.mop_t(ins.r)
+            x = h.mop_t(ins.l)
+            zero = expr(h.m_setz, count, number(0, 1), 1)
+            nonzero = expr(h.m_setnz, count, number(0, 1), 1)
+            valid = expr(h.m_and, nonzero, expr(h.m_setbe, count, number(32, 1), 1), 1)
+            amount = (expr(h.m_sub, number(32, 1), count, 1) if ins.opcode == h.m_cfshl
+                      else expr(h.m_sub, count, number(1, 1), 1))
+            amount = expr(h.m_and, amount, number(31, 1), 1)
+            bit = expr(h.m_and, expr(h.m_shr, x, amount, 4), number(1, 4), 4)
+            bit = expr(h.m_low, bit, None, 1)
+            new = expr(h.m_and, bit, valid, 1)
+            if arithmetic_right:
+                sign = expr(h.m_low, expr(h.m_shr, x, number(31, 1), 4), None, 1)
+                large = expr(h.m_seta, count, number(32, 1), 1)
+                new = expr(h.m_or, new, expr(h.m_and, sign, large, 1), 1)
+            old = expr(h.m_and, h.mop_t(ins.d), zero, 1)
+            result = expr(h.m_or, old, new, 1)
+            ins.opcode = h.m_mov
+            ins.l.assign(result)
+            ins.r.erase()
+
+    hook = CarryFix()
+    if not hook.hook():
+        raise RuntimeError("cannot install ARM carry normalization hook")
+    return hook
+
+
+_ARM_DOUBLE_RUNTIME = frozenset(('__aeabi_dadd', '__aeabi_dsub', '__aeabi_drsub', '__aeabi_dmul', '__aeabi_ddiv'))
+
+
+def _apply_arm_runtime_types():
+    """AEABI double arithmetic uses core-register pairs, even in hard-float ELF.
+
+    Express the bit-level PCS with i64 rather than double so LLVM cannot select
+    VFP argument passing. The actual machine-code body is still lifted normally.
+    Database changes are in-memory only (run_lift closes without saving).
+    """
+    if source_family != "arm" or ptrsize != 32:
+        return
+    for name in sorted(_ARM_DOUBLE_RUNTIME):
+        ea = ida_name.get_name_ea(ida_idaapi.BADADDR, name)
+        if ea == ida_idaapi.BADADDR:
+            continue
+        tif = ida_typeinf.tinfo_t()
+        declaration = f'unsigned __int64 {name}(unsigned __int64, unsigned __int64);'
+        if not ida_typeinf.parse_decl(tif, None, declaration, ida_typeinf.PT_SIL):
+            raise RuntimeError(f'cannot parse AEABI prototype for {name}')
+        if not ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE):
+            raise RuntimeError(f'cannot apply AEABI prototype for {name}')
+        ida_hexrays.mark_cfunc_dirty(ea, False)
+
+
+def _shift_saturated(builder, x, op: str, width: int):
+    """移位量 >= 位宽时的机器结果：逻辑移位为 0，算术右移为符号填充（不是 0）。"""
+    ty = ir.IntType(width)
+    return builder.ashr(x, ty(width - 1)) if op == "ashr" else ty(0)
+
+
+def _unsigned_upper_bound(value, depth=4):
+    """Cheap conservative bound; bounded recursion avoids scanning the whole IR DAG."""
+    maximum = (1 << value.type.width) - 1
+    if isinstance(value, ir.Constant) and isinstance(value.constant, int):
+        return value.constant & maximum
+    if depth > 0:
+        opcode = getattr(value, "opname", None)
+        if opcode == "and":
+            return min(_unsigned_upper_bound(v, depth - 1) for v in value.operands)
+        if opcode in ("zext", "trunc"):
+            return min(maximum, _unsigned_upper_bound(value.operands[0], depth - 1))
+    return maximum
+
+
+def _lift_shift(op: str, x: ir.Value, count: ir.Value, width: int, builder: ir.IRBuilder) -> ir.Value:
+    ty = ir.IntType(width)
+    rule = _shift_count_rule(width)
+    shift = getattr(builder, op)
+    if isinstance(count, ir.Constant) and isinstance(count.constant, int):
+        value = count.constant & ((1 << count.type.width) - 1)
+        if rule is not None:
+            value &= rule[0]
+        if value < width:
+            return shift(x, ty(value))
+        if rule is not None:
+            return _shift_saturated(builder, x, op, width)
+        raise UnsupportedMicrocode("shift_count_unspecified", f"{source_family}/{width}: {value}")
+    common = ir.IntType(max(width, count.type.width))
+    c = builder.zext(count, common) if count.type.width < common.width else count
+    upper = _unsigned_upper_bound(count)
+    if upper < width and (rule is None or upper <= rule[0]):
+        return shift(x, builder.trunc(c, ty) if common.width > width else c)
+    if rule is None:
+        raise UnsupportedMicrocode("shift_count_unspecified", f"{source_family}/{width}: variable count")
+    mask, saturating = rule
+    if mask < (1 << common.width) - 1:
+        c = builder.and_(c, common(mask))
+    if mask < width:  # 取模后一定在范围内
+        return shift(x, builder.trunc(c, ty) if common.width > width else c)
+    in_range = builder.icmp_unsigned("<", c, common(width))
+    safe = builder.select(in_range, c, common(0))
+    shifted = shift(x, builder.trunc(safe, ty) if common.width > width else safe)
+    return builder.select(in_range, shifted, _shift_saturated(builder, x, op, width))
+
+
+def _previous_flag(d, builder):
+    """标志寄存器目标槽中的当前值（移位量为 0 时进位标志保持不变）。"""
+    if d is None:
+        raise UnsupportedMicrocode("shift_carry_without_previous_flag")
+    slot = dedereference(d)
+    old = builder.load(slot)
+    if isinstance(old.type, ir.IntType) and old.type.width == 1:
+        return old
+    return builder.icmp_unsigned("!=", _as_int(old, max(1, _type_size(old.type)), builder),
+                                 ir.IntType(max(1, _type_size(old.type)) * 8)(0))
+
+
+def _freeze_value(builder: ir.IRBuilder, value: ir.Value) -> ir.Value:
+    inst = ir.instructions.Instruction(builder.block, value.type, "freeze", [value])
+    builder._insert(inst)
+    return inst
+
+
+def _shift_carry_bit(l, r, builder, ida_insn, left, previous):
+    """
+    Lower non-ARM shift carry. ARM must be resolved by the early source-aware hook.
+    x86 preserves CF at zero; counts at/above operand width have unspecified CF.
+    """
+    if source_family == "arm":
+        # Unmatched carry may originate from ASR or ROR, not logical SHR.
+        raise UnsupportedMicrocode("arm_shift_carry_source_unresolved")
     size = ida_insn.l.size
-    width = ir.IntType(size * 8)
-    l = _as_int(l, size, builder)
-    r = typecast(r, width, builder)
-    if left:
-        amount = builder.sub(width(size * 8), r)
+    width = size * 8
+    ty = ir.IntType(width)
+    x = _as_int(l, size, builder)
+    count = r if isinstance(r.type, ir.IntType) else _as_int(r, ida_insn.r.size, builder)
+    common = ir.IntType(max(width, count.type.width))
+    c = builder.zext(count, common) if count.type.width < common.width else count
+    rule = _shift_count_rule(width)
+    if rule is None:
+        raise UnsupportedMicrocode("shift_count_unspecified", f"carry: {source_family}/{width}")
     else:
-        amount = builder.sub(r, width(1))
-    return builder.trunc(builder.lshr(l, amount), ir.IntType(1))
+        c = builder.and_(c, common(rule[0])) if rule[0] < (1 << common.width) - 1 else c
+    if previous is None:
+        if not isinstance(count, ir.Constant) or (count.constant & rule[0]) == 0:
+            raise UnsupportedMicrocode("shift_carry_without_previous_flag")
+        previous = ir.IntType(1)(0)  # unreachable zero-count branch
+    limit = width - 1 if source_family == "x86" else width  # x86: count >= W 时 CF 未定义
+    in_range = builder.and_(builder.icmp_unsigned("!=", c, common(0)), builder.icmp_unsigned("<=", c, common(limit)))
+    k = builder.trunc(builder.select(in_range, c, common(1)), ty) if common.width > width else builder.select(in_range, c, common(1))
+    amount = builder.sub(ty(width), k) if left else builder.sub(k, ty(1))
+    bit = builder.trunc(builder.lshr(x, amount), ir.IntType(1))
+    unknown = _freeze_value(builder, ir.Constant(ir.IntType(1), ir.Undefined))
+    if not isinstance(count, ir.Constant) or (count.constant & rule[0]) >= width:
+        _note_approx("shift_carry_undefined")
+    is_zero = builder.icmp_unsigned("==", c, common(0))
+    return builder.select(in_range, bit, builder.select(is_zero, previous, unknown))
 
 
 # 只有地址/段选择子语义、值不会被使用的操作数，不需要提升
@@ -2168,6 +2651,83 @@ _INT_BINARY_OPS = {
     ida_hexrays.m_or: "or_",
     ida_hexrays.m_and: "and_",
     ida_hexrays.m_xor: "xor",
+}
+
+
+def _constant_int_bits(value, depth=4):
+    """Recover literal bits through bounded integer casts, never infer ranges."""
+    if not isinstance(value.type, ir.IntType):
+        return None
+    mask = (1 << value.type.width) - 1
+    if isinstance(value, ir.Constant) and isinstance(value.constant, int):
+        return value.constant & mask
+    if depth <= 0 or getattr(value, "opname", None) not in ("zext", "sext", "trunc"):
+        return None
+    operand = value.operands[0]
+    bits = _constant_int_bits(operand, depth - 1)
+    if bits is None:
+        return None
+    if value.opname == "sext" and bits & (1 << (operand.type.width - 1)):
+        bits -= 1 << operand.type.width
+    return bits & mask
+
+
+def _lift_division(op, lhs, rhs, builder, ea):
+    # Hex-Rays reconstructs / and % from multiply/shift sequences. For these
+    # non-exceptional constants, LLVM arithmetic is defined on every input and
+    # does not need a matching native DIV instruction (nor an approximation tag).
+    bits = _constant_int_bits(rhs)
+    if (op in ("udiv", "sdiv", "urem", "srem") and bits is not None and bits != 0
+            and not (op.startswith("s") and bits == (1 << rhs.type.width) - 1)):
+        return getattr(builder, op)(lhs, ir.Constant(rhs.type, bits))
+    # LVARS may already have discarded guards using C undefined-behaviour
+    # assumptions. This tag is a limitation, not a claim to restore those guards.
+    _note_approx("hexrays_division_control_flow_unverified")
+    mnemonic = idc.print_insn_mnem(ea).lower()
+    expected = "sdiv" if op.startswith("s") else "udiv"
+    if (source_family != "arm" or ptrsize != 64 or mnemonic != expected
+            or lhs.type.width not in (32, 64) or op not in ("sdiv", "udiv")):
+        raise UnsupportedMicrocode("division_machine_semantics_unresolved",
+                                   f"{source_family}/{ptrsize}/{mnemonic}/{op}")
+    prefix = 'x' if lhs.type.width == 64 else 'w'
+    if any(re.fullmatch(prefix + r'(?:[0-9]+|zr)', idc.print_operand(ea, i).lower()) is None
+           for i in range(3)):
+        raise UnsupportedMicrocode("division_machine_semantics_unresolved", "native operand width mismatch")
+    ty = lhs.type
+    zero = builder.icmp_unsigned("==", rhs, ty(0))
+    exceptional = zero
+    if op == "sdiv":
+        overflow = builder.and_(builder.icmp_signed("==", lhs, ty(-(1 << (ty.width - 1)))),
+                                builder.icmp_signed("==", rhs, ty(-1)))
+        exceptional = builder.or_(zero, overflow)
+    # Sanitize BEFORE division; select after a poison-producing op is insufficient.
+    safe_rhs = builder.select(exceptional, ty(1), rhs)
+    quotient = getattr(builder, op)(lhs, safe_rhs)
+    return builder.select(zero, ty(0), quotient)
+
+
+def _lift_float_to_int(value, target, signed, builder, ea):
+    mnemonic = idc.print_insn_mnem(ea).lower()
+    expected = "fcvtzs" if signed else "fcvtzu"
+    if (source_family != "arm" or ptrsize != 64 or mnemonic != expected
+            or target.width not in (32, 64) or _fp_bits(value.type) not in (32, 64)):
+        # Includes AEABI calls rewritten to f2i/f2u: names do not prove semantics.
+        raise UnsupportedMicrocode("float_conversion_machine_semantics_unresolved", mnemonic)
+    dest, source, scale = [idc.print_operand(ea, i).lower() for i in range(3)]
+    dest_prefix = 'x' if target.width == 64 else 'w'
+    source_prefix = 'd' if _fp_bits(value.type) == 64 else 's'
+    if (scale or re.fullmatch(dest_prefix + r'(?:[0-9]+|zr)', dest) is None
+            or re.fullmatch(source_prefix + r'[0-9]+', source) is None):
+        raise UnsupportedMicrocode("float_conversion_machine_semantics_unresolved",
+                                   "scaled, vector, or mismatched scalar conversion")
+    _note_approx("fp_exception_status_unmodeled")
+    name = f"llvm.fpto{'si' if signed else 'ui'}.sat.i{target.width}.f{_fp_bits(value.type)}"
+    module = builder.module
+    fn = module.globals.get(name)
+    if fn is None:
+        fn = ir.Function(module, ir.FunctionType(target, [value.type]), name)
+    return builder.call(fn, [value])
+_SHIFT_OPS = {
     ida_hexrays.m_shl: "shl",
     ida_hexrays.m_shr: "lshr",
     ida_hexrays.m_sar: "ashr",
@@ -2249,6 +2809,18 @@ def _abi_class(typ: ir.Type) -> str:
     if isinstance(typ, _AGGREGATE_TYPES):
         return "aggregate"
     return "int"
+
+
+def _compatible_scalar_abi(actual, formal, callee, module):
+    if _abi_class(actual) == _abi_class(formal):
+        return True
+    # Base AAPCS and AEABI arithmetic helpers pass scalar FP bit patterns in
+    # core registers. Equal-size scalar bitcasts preserve that calling ABI.
+    base_aapcs = (source_family == 'arm' and ptrsize == 32
+                  and (str(module.triple).endswith('gnueabi')
+                       or getattr(callee, 'name', None) in _ARM_DOUBLE_RUNTIME))
+    return (base_aapcs and {_abi_class(actual), _abi_class(formal)} == {'fp', 'int'}
+            and _type_size(actual) == _type_size(formal))
 
 
 def _callinfo_signature(ida_insn, args) -> ir.FunctionType:
@@ -2333,7 +2905,7 @@ def _lift_call(ida_insn, l, d, blk, builder, result_type):
                 # 被调函数声明为 void，但本调用点的调用信息给出了返回类型：以调用信息为准（只改调用点）
                 ftype = ir.FunctionType(callinfo_ret, ftype.args, var_arg=ftype.var_arg)
                 l = typecast(l, ftype.as_pointer(), builder)
-            elif _abi_class(callinfo_ret) != _abi_class(ftype.return_type):
+            elif not _compatible_scalar_abi(callinfo_ret, ftype.return_type, l, blk.parent.module):
                 # 声明与调用信息的返回值不在同一类寄存器（整数/浮点/聚合）：无法确定 ABI
                 raise UnsupportedMicrocode("call_return_abi_conflict", f"{ftype.return_type} vs {callinfo_ret}")
         if (
@@ -2351,6 +2923,9 @@ def _lift_call(ida_insn, l, d, blk, builder, result_type):
                 _note_approx("call_missing_args")
                 args.append(ir.Constant(param_type, ir.Undefined))
             elif args[i].type != param_type:
+                if not _compatible_scalar_abi(args[i].type, param_type, l, blk.parent.module):
+                    raise UnsupportedMicrocode('call_argument_abi_conflict',
+                                               f'arg {i}: {args[i].type} vs {param_type}')
                 args[i] = typecast(args[i], param_type, builder)
         if not ftype.var_arg and len(args) > len(params):
             # microcode 给出的实参比声明多（声明来自不准确的 IDA 存储类型）：
@@ -2451,8 +3026,19 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         return _handle_binary_arithmetic(l, r, d, builder.add, blk, builder, ida_insn, allow_ptr=True)
     elif op == ida_hexrays.m_sub:
         return _handle_binary_arithmetic(l, r, d, builder.sub, blk, builder, ida_insn, allow_ptr=True, is_sub=True)
+    elif op in _SHIFT_OPS:
+        size = d_mop.size if d_mop.size > 0 else l_mop.size
+        x = _as_int(l, size, builder)
+        count = _as_int(r, r_mop.size, builder) if r_mop.size > 0 else _as_int(r, size, builder)
+        value = _lift_shift(_SHIFT_OPS[op], x, count, size * 8, builder)
+        d = storecast(x, d, builder)
+        return _store_as(value, d, blk, builder)
     elif op in _INT_BINARY_OPS:
-        return _handle_binary_arithmetic(l, r, d, getattr(builder, _INT_BINARY_OPS[op]), blk, builder, ida_insn)
+        operation = _INT_BINARY_OPS[op]
+        operation_fn = getattr(builder, operation)
+        if operation in ("udiv", "sdiv", "urem", "srem"):
+            operation_fn = lambda x, y: _lift_division(operation, x, y, builder, ida_insn.ea)
+        return _handle_binary_arithmetic(l, r, d, operation_fn, blk, builder, ida_insn)
     elif op in _SET_OPS:
         cmp_op, signed = _SET_OPS[op]
         return _handle_comparison(l, r, d, cmp_op, blk, builder, ida_insn, signed=signed)
@@ -2542,9 +3128,15 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         bit = _overflow_bit(l, r, builder.sadd_with_overflow, builder, ida_insn)
         return _store_as(bit, d, blk, builder)
     elif op == ida_hexrays.m_cfshl:  # cfshl l, r, d=carry      (l<<r) 的进位
-        return _store_as(_shift_carry_bit(l, r, builder, ida_insn, left=True), d, blk, builder)
+        if source_family == "arm":
+            raise UnsupportedMicrocode("arm_shift_carry_source_unresolved")
+        return _store_as(_shift_carry_bit(l, r, builder, ida_insn, True,
+                                        _previous_flag(d, builder) if d is not None else None), d, blk, builder)
     elif op == ida_hexrays.m_cfshr:  # cfshr l, r, d=carry      (l>>r) 的进位
-        return _store_as(_shift_carry_bit(l, r, builder, ida_insn, left=False), d, blk, builder)
+        if source_family == "arm":
+            raise UnsupportedMicrocode("arm_shift_carry_source_unresolved")
+        return _store_as(_shift_carry_bit(l, r, builder, ida_insn, False,
+                                        _previous_flag(d, builder) if d is not None else None), d, blk, builder)
     elif op == ida_hexrays.m_sets:  # sets  l,d=byte  SF=1Sign
         l = _as_int(l, l_mop.size, builder)
         cond = builder.icmp_signed("<", l, l.type(0))
@@ -2597,7 +3189,7 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
     elif op == ida_hexrays.m_f2i or op == ida_hexrays.m_f2u:  # 浮点 -> (无符号)整数
         l = typecast(l, float_type(l_mop.size), builder)
         int_type = ir.IntType(d_mop.size * 8)
-        value = builder.fptosi(l, int_type) if op == ida_hexrays.m_f2i else builder.fptoui(l, int_type)
+        value = _lift_float_to_int(l, int_type, op == ida_hexrays.m_f2i, builder, ida_insn.ea)
         return _store_as(value, d, blk, builder)
     elif op == ida_hexrays.m_i2f or op == ida_hexrays.m_u2f:  # (无符号)整数 -> 浮点
         l = _as_int(l, l_mop.size, builder)
@@ -2675,6 +3267,9 @@ class BIN2LLVMController():
         with suppress(AttributeError):
             is_elf = ida_ida.inf_get_filetype() == ida_ida.f_ELF
         spec = source_target_spec(ida_ida.inf_get_procname(), ptrsize, is_big_endian, is_elf)
+        if spec["family"] == "mips" or (spec["family"] == "arm" and ptrsize == 32):
+            spec = _apply_source_abi(spec, _source_elf_header())
+        self.source_abi = {key: spec[key] for key in ("abi", "elf") if key in spec}
         self.m.triple = spec["triple"]
         self.m.data_layout = spec["datalayout"]
         _set_sizing_layout(spec["datalayout"])
@@ -2708,10 +3303,7 @@ class BIN2LLVMController():
         func = self.m.globals.get(name)
         if not isinstance(func, ir.Function) or getattr(func, "_streamed_definition", False):
             return
-        func.blocks.clear()
-        for attr in ("lvars", "block_by_ea", "stack_size", "stack_extent", "nodefault_switches"):
-            with suppress(AttributeError):
-                delattr(func, attr)
+        _release_function_body(func)
 
     def _trim_ptext(self, keep_ea=None):
         for cached_ea in list(ptext):
@@ -2728,6 +3320,15 @@ class BIN2LLVMController():
         current_approx.clear()
         record = {"ea": hex(ea), "name": self._get_name(ea)}
         try:
+            # Scan original instructions, including ones that disappear before
+            # LVARS. Linear in function size; retain no per-instruction cache.
+            for item in idautils.FuncItems(ea):
+                if idc.print_insn_mnem(item).lower() in ("udiv", "sdiv", "div", "idiv", "divu", "ddiv", "ddivu"):
+                    if source_family != "arm" or ptrsize != 64:
+                        raise UnsupportedMicrocode("division_machine_semantics_unresolved",
+                                                   f"native division at {item:#x}")
+                    _note_approx("hexrays_division_control_flow_unverified")
+                    break
             pfunc = ptext.get(ea)
             if pfunc is None or getattr(pfunc, "type", None) is None:
                 with suppress(KeyError):
@@ -2914,7 +3515,7 @@ class BIN2LLVMController():
         self._stream_file.write(str(func))
         self._stream_file.write("\n")
         self._streamed_functions.add(func.name)
-        func.blocks.clear()
+        _release_function_body(func)
         func._streamed_definition = True
 
     def _stream_new_type_declarations(self):
@@ -2957,6 +3558,19 @@ class BIN2LLVMController():
         """
         with open(filename, 'w') as f:
             _write_module(self.m, f)
+
+
+def _release_function_body(func):
+    """Keep the callable declaration, but release every body-owned root after writing."""
+    func.blocks.clear()
+    for attr in ("lvars", "block_by_ea", "stack_size", "stack_extent", "nodefault_switches", "register_bytes"):
+        with suppress(AttributeError):
+            delattr(func, attr)
+    # llvmlite keeps every instruction name in the function's NameScope.
+    # Only argument names remain relevant to this declaration.
+    func.scope = llvm_ir_utils.NameScope()
+    for arg in func.args:
+        func.scope.register(arg.name)
 
 
 def _write_llvm_text(text: str, output):
@@ -3076,8 +3690,8 @@ def _previous_output(out: str, sidecar: str):
     """本次运行前已存在的输出及其状态；失败重跑时原样保留，只在 sidecar 中记录其身份。"""
     if not os.path.exists(out):
         return None
-    state = artifact_state.read_json(sidecar)
-    valid, reason = artifact_state.check_output(state, out)
+    state = _LiftArtifactState.read_json(sidecar)
+    valid, reason = _LiftArtifactState.check_output(state, out)
     info = {"path": out, "valid": valid, "reason": reason}
     if state:
         info.update(status=state.get("status"), lifter_id=state.get("lifter_id"),
@@ -3098,17 +3712,17 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
     _reset_lift_state()
     started = time.time()
     out = os.path.abspath(output_llvm_ir)
-    sidecar = out + artifact_state.LIFT_SUFFIX
-    artifact_state.cleanup_stale_tmp(out)
-    artifact_state.cleanup_stale_tmp(sidecar)
-    tmp = artifact_state.tmp_path_for(out)
+    sidecar = out + _LiftArtifactState.LIFT_SUFFIX
+    _LiftArtifactState.cleanup_stale_tmp(out)
+    _LiftArtifactState.cleanup_stale_tmp(sidecar)
+    tmp = _LiftArtifactState.tmp_path_for(out)
     result = {
-        "schema": artifact_state.SCHEMA,
+        "schema": _LiftArtifactState.SCHEMA,
         "stage": "lift",
         "status": "error",
         "lifter_id": LIFTER_ID,
         "ida_version": None,
-        "ida_install_id": artifact_state.ida_install_id(os.environ.get("IDADIR")),
+        "ida_install_id": _LiftArtifactState.ida_install_id(os.environ.get("IDADIR")),
         "input": _input_info(input_binary),
         "output_path": out,
         "target_mode": target_mode,
@@ -3116,15 +3730,19 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
     }
     bin2llvm = None
     database_open = False
+    carry_hook = None
     try:
         idapro.open_database(input_binary, True)
         database_open = True
         ida_auto.auto_wait()
         _init_target_state()
+        carry_hook = _install_arm_carry_fix()
+        _apply_arm_runtime_types()
         result["ida_version"] = _ida_version()
         result["source"] = _source_info()
         bin2llvm = BIN2LLVMController(target_mode=target_mode)
         result["target"] = {"triple": str(bin2llvm.m.triple), "datalayout": str(bin2llvm.m.data_layout)}
+        result["target"].update(getattr(bin2llvm, "source_abi", {}))
         result["memory_contract"] = bin2llvm.memory_contract
         bin2llvm.initialize()
         source = result["source"]
@@ -3135,6 +3753,8 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
         ]
         bin2llvm.begin_stream_to_file(tmp, header)
         bin2llvm.insertAllFunctions()
+        if carry_hook is not None and carry_hook.error is not None:
+            raise RuntimeError("ARM carry normalization failed: " + carry_hook.error)
         bin2llvm.finish_stream_to_file(fsync=True)
         # 校验前释放 IDA 数据库和 lifter 的模块/缓存：llvm-as 对大模块的峰值内存与 lifter 相当，
         # 避免两者同时驻留（逐函数记录先保存下来）
@@ -3161,16 +3781,18 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
                 result["error"] = message
             else:
                 result["output"] = {"path": out, "size": os.path.getsize(tmp),
-                                    "sha256": artifact_state.sha256_file(tmp)}
+                                    "sha256": _LiftArtifactState.sha256_file(tmp)}
                 result["status"] = "ok"
                 os.replace(tmp, out)
-                artifact_state.fsync_dir(os.path.dirname(out))
+                _LiftArtifactState.fsync_dir(os.path.dirname(out))
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"[:1000]
         logging.error(f"Failed to lift binary: {e}")
         logging.error(traceback.format_exc())
     finally:
+        if carry_hook is not None:
+            carry_hook.unhook()
         if bin2llvm is not None:
             with suppress(Exception):
                 bin2llvm.close_stream()
@@ -3190,7 +3812,7 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
             functions=list(function_records),
         )
         try:
-            artifact_state.write_json_atomic(sidecar, result)
+            _LiftArtifactState.write_json_atomic(sidecar, result)
         except OSError as e:
             # 新 .ll 已发布但 sidecar 没写成：旧 sidecar（若有）的 sha256 与之不符，下游会拒绝
             logging.error(f"Failed to write {sidecar}: {e}")

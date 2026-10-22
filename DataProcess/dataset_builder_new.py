@@ -96,8 +96,7 @@ class DatasetBuilder:
         )
         self.logger = logging.getLogger(__name__)
 
-    def process_dataset(self, output_path: str, batch_size: int = 1000, use_parallel: bool = False, skip_filtering: bool = False, use_hf: bool = False,
-                        file_list: List[str] = None):
+    def process_dataset(self, output_path: str, batch_size: int = 1000, use_parallel: bool = False, skip_filtering: bool = False, use_hf: bool = False):
         """Main method to process entire dataset"""
         console.print(f"[yellow]Using {self.num_processes} processes, batch size: {batch_size}")
 
@@ -111,11 +110,7 @@ class DatasetBuilder:
         console.print(f"[yellow]loading source file names...")
         
         file_cache = os.path.join(output_path, 'file_list_cache.pkl')
-        if file_list is not None:
-            # 已经过完整性检查和选择策略的文件列表（provenance.select_inputs）；不读旧缓存
-            filtered_files = list(file_list)
-            console.print(f"[green]Using {len(filtered_files)} verified, policy-selected files")
-        elif self.cache and os.path.exists(file_cache):
+        if self.cache and os.path.exists(file_cache):
             console.print(f"[yellow]Loading file cache from {file_cache}")
             with open(file_cache, 'rb') as f:
                 filtered_files = pickle.load(f)

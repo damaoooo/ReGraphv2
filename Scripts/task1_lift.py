@@ -8,20 +8,19 @@ Step 2: Use ida2llvm.py to convert .i64 files to LLVM IR
 Both steps use parallel processing with separate progress bars for efficiency.
 """
 import os
-import hashlib
-import time
 import json
-from collections import Counter
 import typer
+import multiprocessing
 import logging
+import subprocess
+import traceback
 import sys
 from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from utils import console, ensure_directory, file_exists_and_not_empty
-import artifact_state
-from job_runner import default_workers, log_tail, run_bounded, run_logged
 
 # Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -85,49 +84,6 @@ def is_input_binary_file(file_name: str) -> bool:
     return not file_name.endswith(ignored_suffixes)
 
 
-# IDA 运行中解包出的数据库分片；存在说明上一次 IDA 未正常结束
-IDA_UNPACKED_SUFFIXES = (".id0", ".id1", ".id2", ".nam", ".til")
-
-
-# 与 ida2llvm.MEMORY_CONTRACTS 一致
-MEMORY_CONTRACTS = {"source": "source-layout", "host": "host-compat-unconverted"}
-
-
-def ida2llvm_lifter_id() -> str:
-    """与 ida2llvm.LIFTER_ID 相同：lifter 源码 sha256 的前 16 位。"""
-    return artifact_state.lifter_id(os.path.join(SCRIPT_DIR, "ida2llvm.py"))
-
-
-def lift_output_reusable(input_path: str, output_path: str, lifter_id: str, target_mode: str = "source",
-                         ida_id: str | None = None) -> bool:
-    """
-    --resume 只复用由当前 lifter、当前 IDA 安装、同一 target 模式、针对当前输入成功完成，且磁盘上的
-    .ll 正是 sidecar 记录的那个文件（sha256/size 一致）的输出。
-    """
-    state = artifact_state.read_json(output_path + artifact_state.LIFT_SUFFIX)
-    ok, _ = artifact_state.check_output(state, output_path)
-    if not ok:
-        return False
-    try:
-        st = os.stat(input_path)
-    except OSError:
-        return False
-    recorded = state.get("input", {})
-    return (
-        state.get("lifter_id") == lifter_id
-        and state.get("target_mode") == target_mode
-        and state.get("memory_contract") == MEMORY_CONTRACTS.get(target_mode)
-        and (ida_id is None or state.get("ida_install_id") == ida_id)
-        and recorded.get("size") == st.st_size
-        and recorded.get("mtime_ns") == st.st_mtime_ns
-    )
-
-
-def job_log_path(log_dir: str, kind: str, path: str) -> str:
-    digest = hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:12]
-    return os.path.join(log_dir, f"{kind}_{os.path.basename(path)}_{digest}.log")
-
-
 def python_runner(conda_env: str) -> list[str]:
     """Build a Python command without hardcoding a conda environment."""
     if conda_env:
@@ -135,31 +91,49 @@ def python_runner(conda_env: str) -> list[str]:
     return [sys.executable]
 
 
-def generate_i64(binary_path: str, ida_path: str, timeout_s: float = 0, log_dir: str = LOG_DIR) -> tuple:
+def generate_i64(binary_path: str, ida_path: str) -> tuple:
     """
-    Generate the .i64 file for a given binary file using IDA Pro.
-    Output goes to a per-job log; on timeout the whole IDA process group is killed.
-
-    :return: (success, binary_path, message) tuple
+    Generate the .i64 file for a given binary file using IDA Pro
+    
+    :param binary_path: Path to the binary file
+    :return: (success, binary_path) tuple
     """
-    command_line = [os.path.join(ida_path, "idat"), "-A", "-B", binary_path]
-    stale = [binary_path + suffix for suffix in IDA_UNPACKED_SUFFIXES if os.path.exists(binary_path + suffix)]
-    if stale:
-        # 不自动删除：这些文件可能属于正在运行的另一个 IDA，或需要人工检查
-        return (False, binary_path, f"stale unpacked IDA database files {stale}")
-    # -B 会在 binary 旁生成 .asm；只删除本次运行新建的那个
-    asm_path = binary_path + ".asm"
-    asm_existed = os.path.exists(asm_path)
-    result = run_logged(command_line, job_log_path(log_dir, "i64", binary_path), timeout_s)
-    if not asm_existed and os.path.exists(asm_path):
-        os.remove(asm_path)
-    if result.timed_out:
-        return (False, binary_path, f"timed out after {timeout_s}s (log {result.log_path})")
-    if not result.ok:
-        return (False, binary_path, f"rc={result.returncode} {result.error} (log {result.log_path})")
-    if not os.path.exists(binary_path + ".i64"):
-        return (False, binary_path, f"idat succeeded but no .i64 (log {result.log_path})")
-    return (True, binary_path, "")
+    command_line = [
+        os.path.join(ida_path, "idat"),
+        "-A", 
+        "-B",
+        binary_path
+    ]
+    success = False
+    try:
+        result = subprocess.run(command_line, capture_output=True, text=True)
+        if result.returncode == 0:
+            success = True
+            # Check if .i64 file was actually created
+            i64_path = binary_path + ".i64"
+            if not os.path.exists(i64_path):
+                success = False
+        else:
+            # Log error to file
+            with open(LOG_PATH, "a") as log_file:
+                log_file.write("=" * 60 + "\n")
+                log_file.write(f"Error generating .i64 for: {binary_path}\n")
+                log_file.write(f"Return code: {result.returncode}\n")
+                if result.stderr:
+                    log_file.write("--- stderr ---\n")
+                    log_file.write(result.stderr[:500])
+                    log_file.write("\n")
+    except subprocess.TimeoutExpired:
+        with open(LOG_PATH, "a") as log_file:
+            log_file.write("=" * 60 + "\n")
+            log_file.write(f"Timeout generating .i64 for: {binary_path}\n")
+    except Exception as e:
+        with open(LOG_PATH, "a") as log_file:
+            log_file.write("=" * 60 + "\n")
+            log_file.write(f"Exception generating .i64 for: {binary_path}\n")
+            log_file.write(f"Error: {str(e)}\n")
+    
+    return (success, binary_path)
 
 
 def lift_single_file(
@@ -175,19 +149,23 @@ def lift_single_file(
     ghidra_analysis_timeout: int,
     ghidra_no_analysis: bool,
     allow_partial: bool,
-    target_mode: str = "source",
-    timeout_s: float = 0,
-    log_dir: str = LOG_DIR,
 ) -> tuple:
     """
-    Lift a single binary file to LLVM IR in a separate process group with a timeout.
-
-    :return: (success, input_binary, message) tuple
+    Lift a single binary file to LLVM IR.
+    
+    :param input_binary: Path to the binary file
+    :param output_llvm: Path to the output LLVM IR file
+    :return: (success, input_binary) tuple
     """
     if backend == "ida":
         lifter_path = os.path.join(SCRIPT_DIR, "ida2llvm.py")
         cmd = python_runner(conda_env) + [
-            lifter_path, "-f", input_binary, "-o", output_llvm, "--target", target_mode, "-v",
+            lifter_path,
+            "-f",
+            input_binary,
+            "-o",
+            output_llvm,
+            "-v",
         ]
     elif backend == "ghidra":
         lifter_path = os.path.join(SCRIPT_DIR, "pcode2llvm.py")
@@ -216,36 +194,33 @@ def lift_single_file(
         if allow_partial:
             cmd.append("--allow-partial")
     else:
-        return (False, input_binary, f"unknown backend {backend}")
+        return (False, input_binary)
 
-    started = time.time()
-    result = run_logged(cmd, job_log_path(log_dir, "lift", input_binary), timeout_s)
-    if backend == "ida" and not result.ok:
-        # 子进程被杀或崩溃时 lifter 来不及写 sidecar：代写失败状态，下游不会把旧 .ll 当成本次结果
-        status = "timeout" if result.timed_out else "crashed"
-        artifact_state.write_failed_lift_state(output_llvm, input_binary, status,
-                                               log_tail(result.log_path, 2000), started)
-    if result.timed_out:
-        return (False, input_binary, f"timed out after {timeout_s}s (log {result.log_path})")
-    if not result.ok:
-        tail = log_tail(result.log_path, 600).strip().splitlines()
-        return (False, input_binary, f"rc={result.returncode} {result.error} {tail[-1] if tail else ''} (log {result.log_path})")
-    return (True, input_binary, "")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    success = result.returncode == 0
+    if result.stdout or result.stderr:
+        with open(LOG_PATH, "a") as log_file:
+            log_file.write("=" * 60 + "\n")
+            log_file.write(f"Command output for: {input_binary}\n")
+            log_file.write(f"Return code: {result.returncode}\n")
+            if result.stdout:
+                log_file.write("--- stdout ---\n")
+                log_file.write(result.stdout)
+                if not result.stdout.endswith("\n"):
+                    log_file.write("\n")
+            if result.stderr:
+                log_file.write("--- stderr ---\n")
+                log_file.write(result.stderr)
+                if not result.stderr.endswith("\n"):
+                    log_file.write("\n")
+    return (success, input_binary)
 
 @app.command()
 def main(
     input_path: str = typer.Option("", help="Input directory (defaults to DataProcess-1)"),
     output: str = typer.Option(..., help="Output directory"),
-    workers: int = typer.Option(
-        0, help="Concurrent jobs; 0 = min(CPUs/2, MemAvailable / --mem-per-job-mb). Measure before raising it"),
-    resume: bool = typer.Option(False, help="Resume: skip outputs whose .lift.json is ok and matches the current lifter, IDA install, target mode, input and output hash (Ghidra: existing non-empty files)"),
-    target_mode: str = typer.Option(
-        "source", "--target-mode",
-        help="ida2llvm output target: source (source triple/data layout) or host (legacy compatibility, no memory-semantics conversion)"),
-    lift_timeout: int = typer.Option(6 * 3600, "--lift-timeout", help="Per-binary lift timeout in seconds (0 = none)"),
-    i64_timeout: int = typer.Option(3600, "--i64-timeout", help="Per-binary IDA analysis timeout in seconds (0 = none)"),
-    mem_per_job_mb: int = typer.Option(
-        4096, "--mem-per-job-mb", help="Estimated peak memory per job; new jobs wait while MemAvailable is below it"),
+    workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
+    resume: bool = typer.Option(False, help="Resume from previous run, skip existing files"),
     backend: str = typer.Option(
         "ida",
         "--backend",
@@ -375,13 +350,6 @@ def main(
 
     output_path = os.path.join(output, db)
     ensure_directory(output_path)
-    if target_mode not in MEMORY_CONTRACTS:
-        console.print(f"[red]Error: --target-mode must be one of {sorted(MEMORY_CONTRACTS)}[/red]")
-        raise typer.Exit(code=1)
-    if workers <= 0:
-        workers = default_workers(mem_per_job_mb)
-    job_log_dir = os.path.join(LOG_DIR, "task1_jobs", datetime.now().strftime("%Y%m%d-%H%M%S"))
-    ida_id = artifact_state.ida_install_id(ida_path) if backend == "ida" else None
     
     console.print(f"[bold cyan]═══════════════════════════════════════[/bold cyan]")
     console.print(f"[bold cyan]Task 1: Binary to LLVM IR Lifting[/bold cyan]")
@@ -389,10 +357,7 @@ def main(
     console.print(f"[green]Input:  {db_path}[/green]")
     console.print(f"[green]Output: {output_path}[/green]")
     console.print(f"[green]Backend: {backend}[/green]")
-    console.print(f"[green]Workers: {workers} (mem/job {mem_per_job_mb} MB, lift timeout {lift_timeout}s)[/green]")
-    if backend == "ida":
-        console.print(f"[green]Target mode: {target_mode} ({MEMORY_CONTRACTS[target_mode]})[/green]")
-    console.print(f"[green]Per-job logs: {job_log_dir}[/green]")
+    console.print(f"[green]Workers: {workers}[/green]")
     console.print(f"[green]Lifter Python: {conda_env or 'current interpreter'}[/green]")
     console.print(f"[green]Log file: {LOG_PATH}[/green]")
     if resume:
@@ -412,9 +377,19 @@ def main(
     elif not start_from_step2:
         console.print("[bold blue]Step 1: Scanning for binary files to generate .i64...[/bold blue]")
         
-        # 不再递归删除 .idb/.id0/.asm 等文件：可能属于其他运行或其他数据（如 ASM 基线）。
-        # 残留的解包分片由 generate_i64 按 binary 检测并跳过、记录到日志。
-
+        # Clean any failed IDA files first
+        files_to_remove = []
+        for root, dirs, files in os.walk(db_path):
+            for file in files:
+                if file.endswith((".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm")):
+                    files_to_remove.append(os.path.join(root, file))
+        for f in files_to_remove:
+            try:
+                os.remove(f)
+                logger.info(f"Removed failed IDA file: {f}")
+            except Exception as e:
+                logger.warning(f"Could not remove {f}: {str(e)}")
+        
         # Scan for binary files (non-IDA files) that need .i64 generation
         i64_tasks = []
         i64_skipped_count = 0
@@ -465,26 +440,36 @@ def main(
                     total=total_i64_tasks
                 )
                 
-                def i64_done(binary_path, outcome):
-                    if isinstance(outcome, Exception):
-                        outcome = (False, binary_path, f"exception {outcome}")
-                    success, _, message = outcome
-                    if success:
-                        i64_state["ok"] += 1
-                    else:
-                        i64_state["failed"] += 1
-                        i64_failed_files.append(binary_path)
-                        console.print(f"[red]✗ Failed: {os.path.basename(binary_path)} {message[:160]}[/red]")
-                        logger.error(f"Failed to generate .i64: {binary_path}: {message}")
-                    progress.update(i64_task, advance=1)
-
-                i64_state = {"ok": 0, "failed": 0}
-                run_bounded(
-                    i64_tasks,
-                    lambda binary_path: generate_i64(binary_path, ida_path, i64_timeout, job_log_dir),
-                    workers, mem_per_job_mb, i64_done,
-                )
-                i64_success_count, i64_failed_count = i64_state["ok"], i64_state["failed"]
+                with ProcessPoolExecutor(max_workers=workers) as executor:
+                    # Submit all i64 generation tasks
+                    future_to_binary = {
+                        executor.submit(generate_i64, binary_path, ida_path): binary_path
+                        for binary_path in i64_tasks
+                    }
+                
+                    # Process completed tasks as they finish
+                    for future in as_completed(future_to_binary):
+                        binary_path = future_to_binary[future]
+                        try:
+                            success, _ = future.result()
+                            if success:
+                                i64_success_count += 1
+                                logger.debug(f"Successfully generated .i64: {binary_path}")
+                            else:
+                                i64_failed_count += 1
+                                i64_failed_files.append(binary_path)
+                                console.print(f"[red]✗ Failed: {os.path.basename(binary_path)}[/red]")
+                                logger.error(f"Failed to generate .i64: {binary_path}")
+                        except Exception as exc:
+                            i64_failed_count += 1
+                            i64_failed_files.append(binary_path)
+                            error_msg = f"Exception for {binary_path}: {str(exc)}"
+                            console.print(f"[red]✗ Exception: {os.path.basename(binary_path)} - {str(exc)[:100]}[/red]")
+                            logger.error(error_msg)
+                            logger.error(f"Traceback:\n{traceback.format_exc()}")
+                        finally:
+                            progress.update(i64_task, advance=1)
+            
             console.print()
             console.print(f"[bold cyan]Step 1 Summary:[/bold cyan]")
             console.print(f"[bold green]✓ .i64 files generated: {i64_success_count}[/bold green]")
@@ -506,8 +491,6 @@ def main(
         console.print("[bold blue]Step 2: Scanning for binaries to lift to LLVM IR with Ghidra...[/bold blue]")
     lift_tasks = []
     skipped_count = 0
-    lifter_id = ida2llvm_lifter_id() if backend == "ida" else None
-    stale_reasons = Counter()
     
     for root, dirs, files in os.walk(db_path):
         for file in files:
@@ -527,24 +510,14 @@ def main(
             output_file_path = os.path.join(output_dir, output_name)
             
             # Check if file already exists and we're resuming
-            if resume:
-                if backend == "ida":
-                    # 需要 sidecar 证明输出完整、来自当前 lifter 和当前输入
-                    reusable = lift_output_reusable(file_path, output_file_path, lifter_id, target_mode, ida_id)
-                    if not reusable and os.path.exists(output_file_path):
-                        stale_reasons["existing output not reusable"] += 1
-                else:
-                    reusable = file_exists_and_not_empty(output_file_path)
-                if reusable:
-                    skipped_count += 1
-                    continue
+            if resume and file_exists_and_not_empty(output_file_path):
+                skipped_count += 1
+                continue
                 
             lift_tasks.append((file_path, output_file_path))
 
     if resume and skipped_count > 0:
         console.print(f"[yellow]Skipping {skipped_count} already lifted files[/yellow]")
-    for reason, count in stale_reasons.items():
-        console.print(f"[yellow]Re-lifting {count} files: {reason} (state missing/failed, hash or identity mismatch)[/yellow]")
 
     total_tasks = len(lift_tasks)
     if total_tasks == 0:
@@ -577,31 +550,50 @@ def main(
             total=total_tasks
         )
         
-        def lift_done(task, outcome):
-            input_bin, _ = task
-            if isinstance(outcome, Exception):
-                outcome = (False, input_bin, f"exception {outcome}")
-            success, _, message = outcome
-            if success:
-                lift_state["ok"] += 1
-            else:
-                lift_state["failed"] += 1
-                failed_files.append(input_bin)
-                console.print(f"[red]✗ Failed: {os.path.basename(input_bin)} {message[:160]}[/red]")
-                logger.error(f"Failed to lift: {input_bin}: {message}")
-            progress.update(lift_task, advance=1)
-
-        lift_state = {"ok": 0, "failed": 0}
-        run_bounded(
-            lift_tasks,
-            lambda task: lift_single_file(
-                task[0], task[1], backend, conda_env, ghidra_home, analyze_headless, ghidra_target,
-                ghidra_max_cpu, ghidra_decompile_timeout, ghidra_analysis_timeout, ghidra_no_analysis,
-                allow_partial, target_mode, lift_timeout, job_log_dir,
-            ),
-            workers, mem_per_job_mb, lift_done,
-        )
-        success_count, failed_count = lift_state["ok"], lift_state["failed"]
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            # Submit all tasks
+            future_to_task = {
+                executor.submit(
+                    lift_single_file,
+                    input_bin,
+                    output_llvm,
+                    backend,
+                    conda_env,
+                    ghidra_home,
+                    analyze_headless,
+                    ghidra_target,
+                    ghidra_max_cpu,
+                    ghidra_decompile_timeout,
+                    ghidra_analysis_timeout,
+                    ghidra_no_analysis,
+                    allow_partial,
+                ): (input_bin, output_llvm)
+                for input_bin, output_llvm in lift_tasks
+            }
+        
+            # Process completed tasks as they finish
+            for future in as_completed(future_to_task):
+                input_bin, output_llvm = future_to_task[future]
+                try:
+                    success, _ = future.result()
+                    if success:
+                        success_count += 1
+                        logger.debug(f"Successfully lifted: {input_bin}")
+                    else:
+                        failed_count += 1
+                        failed_files.append(input_bin)
+                        console.print(f"[red]✗ Failed: {os.path.basename(input_bin)}[/red]")
+                        logger.error(f"Failed to lift: {input_bin}")
+                except Exception as exc:
+                    failed_count += 1
+                    failed_files.append(input_bin)
+                    error_msg = f"Exception for {input_bin}: {str(exc)}"
+                    console.print(f"[red]✗ Exception: {os.path.basename(input_bin)} - {str(exc)[:100]}[/red]")
+                    # Log detailed traceback to file
+                    logger.error(error_msg)
+                    logger.error(f"Traceback:\n{traceback.format_exc()}")
+                finally:
+                    progress.update(lift_task, advance=1)
 
     console.print()
     console.print(f"[bold cyan]═══════════════════════════════════════[/bold cyan]")

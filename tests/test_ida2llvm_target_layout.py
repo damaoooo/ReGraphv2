@@ -37,6 +37,10 @@ def target(L, monkeypatch):
         monkeypatch.setattr(L, "byteorder", "big" if big_endian else "little")
         monkeypatch.setattr(L.ida_ida, "inf_get_procname", lambda: proc, raising=False)
         monkeypatch.setattr(L.ida_ida, "inf_get_filetype", lambda: L.ida_ida.f_ELF, raising=False)
+        monkeypatch.setattr(L, "_source_elf_header", lambda: {
+            "bits": bits, "endian": "big" if big_endian else "little", "type": 3,
+            "machine": 40 if proc == "ARM" else 8, "flags": 0x05000200 if proc == "ARM" else 0,
+        })
         # pointer initializers that resolve to no symbol stay raw source addresses (inttoptr)
         monkeypatch.setattr(L.ida_funcs, "get_func", lambda ea: None, raising=False)
         monkeypatch.setattr(L.ida_bytes, "get_item_head", lambda ea: ea, raising=False)

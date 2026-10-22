@@ -1,7 +1,0 @@
-{
-  "name": "exclude_opaque_v1",
-  "description": "Example stricter policy: drop functions whose IR contains opaque machine instructions or calls with undef arguments. virtual_fs (stack canary) and libc-equivalent helpers are kept.",
-  "exclude_lift_status": [],
-  "exclude_approx_tags": ["call_missing_args"],
-  "exclude_approx_prefixes": ["opaque_ext:"]
-}

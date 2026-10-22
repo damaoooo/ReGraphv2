@@ -27,8 +27,6 @@ def _build_pipeline_config(model_path: str, use_cfg: Optional[bool], use_ddg: Op
         model_path=normalized_model_path,
         use_cfg=use_cfg,
         use_ddg=use_ddg,
-        # 必须与模型训练数据的 ida2llvm 输出模式一致（旧 IR 训练的模型用 host）
-        target_mode=os.environ.get("REGRAPH_TARGET_MODE", "source"),
     )
 
 
