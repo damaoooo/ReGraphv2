@@ -14,14 +14,17 @@ import ida_hexrays
 import ida_auto
 import idaapi
 import logging
+import array
+import hashlib
+import json
+import os
 import struct
+import time
 from collections import Counter
 import numpy as np
 import traceback
 import sys
 import typer
-import re
-import io
 import zlib
 import llvmlite.binding as llvm
 from llvmlite import ir
@@ -63,9 +66,15 @@ llvm_type_cache = {}
 abi_size_cache = {}
 type_size_cache = {}
 target_data = None
-lift_stats = {"defined": 0, "failed": 0, "no_decompile": 0}
+lift_stats = {"defined": 0, "failed": 0, "no_decompile": 0, "approx": 0, "unresolved_data": 0}
 # 因无法忠实翻译而被拒绝的函数，按原因计数（也计入 lift_stats["failed"]）
 unsupported_reasons = Counter()
+# 当前函数用到的近似表示（函数仍会输出，但在 sidecar 状态文件中逐函数记录）
+current_approx = set()
+# 每个函数的结果：{"ea", "name", "status", "reason"/"approx"}，写入 <output>.lift.json
+function_records = []
+# 内容无法读取（非 .bss 且未加载）的数据项，保留为 external 声明；前 1000 个写入 sidecar
+unresolved_data_items = []
 # 每个 binary 独立的 LLVM 类型上下文，避免同名结构体在同一进程处理多个 binary 时串用
 llvm_context = ir.Context()
 # 全局数据项地址 -> ir.GlobalVariable，用于把指针初始值解析成符号引用
@@ -79,8 +88,6 @@ _CACHE_MISS = object()
 # 线程局部存储段大小（Windows FS段标准大小）
 FS_SEGMENT_SIZE = 0x10000  # 64KB
 
-# 浮点数提取失败时的默认值
-DEFAULT_FLOAT_VALUE = 1.0
 ENABLE_SIGNATURE_REFRESH = False
 ENABLE_DATA_TYPE_GUESS = False
 SIZE_MAP = {
@@ -106,60 +113,8 @@ FLOAT_R_OPS = {
     ida_hexrays.m_fmul,
     ida_hexrays.m_fdiv,
 }
-LIFTED_INTRINSIC_NAMES = {
-    "sadd_overflow",
-    "__OFSUB__",
-    "_mm_cvtsi128_si32",
-    "_BitScanReverse",
-    "__FYL2X__",
-    "__FYL2P__",
-    "fabs",
-    "fabsf",
-    "fabsl",
-    "memcpy",
-    "_byteswap_ulong",
-    "_byteswap_uint64",
-    "memset",
-    "abs64",
-    "__PAIR64__",
-    "__PAIR128__",
-    "__PAIR32__",
-    "__PAIR16__",
-    "_BitScanReverse64",
-    "_BitScanForward64",
-    "__halt",
-    "is_mul_ok",
-    "va_start",
-    "va_arg",
-    "va_end",
-    "_QWORD",
-    "__ROL8__",
-    "__ROL4__",
-    "__ROR4__",
-    "__ROR8__",
-}
-LIFTED_INTRINSIC_PREFIXES = (
-    "__readfs",
-    "__writefs",
-    "sys_",
-    "_InterlockedCompareExchange",
-    "_InterlockedExchange",
-)
-LLVM_TERMINATOR_PREFIXES = (
-    "br ",
-    "ret ",
-    "switch ",
-    "indirectbr ",
-    "invoke ",
-    "resume ",
-    "unreachable",
-    "cleanupret ",
-    "catchret ",
-    "catchswitch ",
-)
-LLVM_DEFINE_RE = re.compile(r"define\s+(.+?)\s+@")
-LLVM_LABEL_RE = re.compile(r"^[A-Za-z$._-][A-Za-z0-9$._-]*:$")
-LLVM_INT_RE = re.compile(r"i\d+$")
+# __PAIR*__ 用于 mop_p（高低两半拼接），保留为不透明声明，宽度与 defs.h 一致
+PAIR_HELPER_TYPES = {16: 8, 32: 16, 64: 32, 128: 64}
 
 
 def _reset_lift_state():
@@ -179,6 +134,9 @@ def _reset_lift_state():
     for key in lift_stats:
         lift_stats[key] = 0
     unsupported_reasons.clear()
+    current_approx.clear()
+    function_records.clear()
+    unresolved_data_items.clear()
     target_data = None
     llvm_context = ir.Context()
     global_by_ea.clear()
@@ -267,6 +225,11 @@ def _get_segtype_cached(ea):
     return segtype
 
 
+def _note_approx(tag: str):
+    """标记当前函数用到了近似（非逐位等价）的表示，例如不透明 helper 或未建模的寄存器入口值。"""
+    current_approx.add(tag)
+
+
 def _is_extern_segment(ea) -> bool:
     """segtype() 返回的是枚举值（SEG_DATA=3、SEG_BSS=9 ...），不能按位与 SEG_XTRN(=1)。"""
     return _get_segtype_cached(ea) == ida_segment.SEG_XTRN
@@ -294,12 +257,13 @@ def _sanitize_symbol_name(name: str) -> str:
     return sanitized or "unnamed"
 
 
-def _get_register_storage(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder):
+def _get_register_storage(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, is_read: bool = True):
     """
     为 Hex-Rays 的寄存器操作数分配一个稳定的栈槽。
 
-    这里不试图完整模拟物理寄存器别名关系，只提供一个可读可写的 SSA 外存储，
-    避免寄存器型操作数直接返回 None 导致后续算术/位运算崩溃。
+    这里不试图完整模拟物理寄存器别名关系，只提供一个可读可写的 SSA 外存储。
+    寄存器的入口值未知：初始化为 freeze undef（未知但固定的值），不能假定为 0。
+    第一次访问就是读取时，说明读到了未建模的入口值，记为近似。
     """
     func = blk.parent
     reg_name = f"reg_{_sanitize_symbol_name(mop.dstr())}"
@@ -309,8 +273,10 @@ def _get_register_storage(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRB
         reg_type = ir.IntType(reg_width)
         with builder.goto_entry_block():
             reg_ptr = builder.alloca(reg_type, name=reg_name)
-            builder.store(ir.Constant(reg_type, 0), reg_ptr)
+            builder.store(_freeze_undef(builder, reg_type), reg_ptr)
         func.lvars[reg_name] = reg_ptr
+        if is_read:
+            _note_approx("register_livein")
 
     return func.lvars[reg_name]
 
@@ -399,10 +365,9 @@ def _lift_tif_uncached(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
         
     else:
         if width != -1:
-            # 防止创建过大的数组（限制为1MB）
-            if width > 1024 * 1024 or width <= 0:
-                # logging.warning(f"Invalid array width {width} bytes, using pointer type instead")
+            if width <= 0:
                 return ir.IntType(ptrsize)
+            # 未知类型的数据项按原始字节数保留存储；初始值用紧凑的字节串，大对象也不收缩成一个指针宽度
             return ir.ArrayType(ir.IntType(8), width)
         else:
             return ir.IntType(ptrsize)
@@ -626,6 +591,13 @@ def _ensure_fallthrough(builder: ir.IRBuilder, blk: ir.Block, next_blk: ir.Block
         blk.terminator = None
     with builder.goto_block(blk):
         builder.branch(next_blk)
+
+def _require_terminated_blocks(func: ir.Function):
+    """不在文本层补 ret/br：缺终止指令说明控制流没有被完整提升，拒绝该函数。"""
+    for blk in func.blocks:
+        if not _block_ends_with_terminator(blk):
+            raise UnsupportedMicrocode("unterminated_block", blk.name)
+
 
 def dedereference(arg: ir.Value) -> ir.Value:
     """
@@ -934,6 +906,7 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
                 else:
                     builder.ret(builder.load(res.lvars["funcresult"]))
         _finalize_nodefault_switches(res, builder)
+        _require_terminated_blocks(res)
         stack_slot = res.lvars.get("stack")
         if stack_slot is not None:
             # .cold 等拆分出的函数片段会访问父函数栈帧，fullsize 不一定覆盖全部访问
@@ -956,17 +929,31 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
                 del blk.next_blk
         return res
 
-    return _constant_from_bytes(module, typ, _read_bytes(ea, _type_size(typ)), 0)
+    data = _read_bytes(ea, _type_size(typ))
+    if data is None:
+        return None  # 内容未知：调用方生成无初始值（external）的全局声明
+    return _constant_from_bytes(module, typ, data, 0)
 
 
-def _read_bytes(ea: int, size: int) -> bytes:
-    """一次性读取一段数据；不可读的部分补 0。"""
+def _read_bytes(ea: int, size: int):
+    """
+    一次性读取一段数据。
+    - 内容完整可读：返回字节；
+    - 位于 .bss（SEG_BSS，加载时清零）：返回全零；
+    - 其他不可读/未加载的数据：返回 None，表示内容未知，不能当作已知的 0。
+    """
     if size <= 0:
         return b""
-    data = ida_bytes.get_bytes(ea, size) or b""
-    if len(data) < size:
-        data += b"\x00" * (size - len(data))
-    return data
+    data = ida_bytes.get_bytes(ea, size)
+    if data is not None and len(data) == size and ida_bytes.is_loaded(ea) and ida_bytes.is_loaded(ea + size - 1):
+        return data
+    if _get_segtype_cached(ea) == ida_segment.SEG_BSS:
+        return b"\x00" * size
+    lift_stats["unresolved_data"] += 1
+    if len(unresolved_data_items) < 1000:
+        seg = ida_segment.getseg(ea)
+        unresolved_data_items.append({"ea": hex(ea), "size": size, "segment": ida_segment.get_segm_name(seg) if seg else None})
+    return None
 
 
 def _resolve_thunk(ea: int) -> int:
@@ -1022,6 +1009,20 @@ def _pointer_constant(module: ir.Module, typ: ir.PointerType, value: int):
     return ir.Constant(ir.IntType(ptrsize), value).inttoptr(typ)
 
 
+_ARRAY_CODES = {2: "H", 4: "I", 8: "Q"}
+
+
+def _int_array_values(data: bytes, off: int, end: int, nbytes: int):
+    """按被分析 binary 的字节序把 data[off:end] 解成无符号整数序列。"""
+    code = _ARRAY_CODES.get(nbytes)
+    if code is not None and array.array(code).itemsize == nbytes:
+        values = array.array(code, data[off:end])
+        if byteorder != sys.byteorder:
+            values.byteswap()
+        return values
+    return [int.from_bytes(data[pos:pos + nbytes], byteorder) for pos in range(off, end, nbytes)]
+
+
 def _constant_from_bytes(module: ir.Module, typ: ir.Type, data: bytes, off: int):
     """按被分析 binary 的字节序，从已读出的字节中构造 LLVM 常量。"""
     if isinstance(typ, ir.IntType):
@@ -1048,12 +1049,10 @@ def _constant_from_bytes(module: ir.Module, typ: ir.Type, data: bytes, off: int)
         if isinstance(element, ir.IntType) and element.width == 8:
             return ir.Constant(typ, bytearray(data[off:end]))
         if isinstance(element, ir.IntType) and element.width % 8 == 0:
-            nbytes = element.width // 8
-            values = [
-                int.from_bytes(data[pos:pos + nbytes], byteorder)
-                for pos in range(off, end, sub_size)
-            ]
-            return ir.Constant(typ, values)
+            # 直接生成与 ir.Constant(typ, [...]) 相同的文本，避免为每个元素构造 Python/LLVM 常量对象
+            values = _int_array_values(data, off, end, element.width // 8)
+            prefix = f"{element} "
+            return FormattedConstant(typ, "[" + ", ".join(prefix + str(v) for v in values) + "]")
         return ir.Constant.literal_array([
             _constant_from_bytes(module, element, data, pos)
             for pos in range(off, end, sub_size)
@@ -1082,8 +1081,24 @@ def str2size(str_size: str) -> int:
     return SIZE_MAP[str_size]
 
 
-def _is_lifted_intrinsic_name(func_name: str) -> bool:
-    return func_name in LIFTED_INTRINSIC_NAMES or func_name.startswith(LIFTED_INTRINSIC_PREFIXES)
+# lifter 自己实现了函数体的 helper：__readfs*/__writefs* 访问 virtual_fs（近似的 TLS），__halt 用 hlt
+_IMPLEMENTED_HELPER_PREFIXES = ("__readfs", "__writefs")
+# 与 libc 同名、语义一致的 helper（Hex-Rays 识别出的内联 memset/strcpy 等），调用它们不算近似
+_LIBC_HELPERS = {
+    "memset", "memcpy", "memmove", "memcmp", "strcpy", "strncpy", "strcmp", "strncmp",
+    "strlen", "strcat", "strncat", "strchr", "strrchr", "abs", "labs", "llabs", "fabs", "fabsf",
+}
+
+
+def _is_implemented_helper(name: str) -> bool:
+    return name == "__halt" or name.startswith(_IMPLEMENTED_HELPER_PREFIXES)
+
+
+def _note_helper(name: str):
+    if name.startswith(_IMPLEMENTED_HELPER_PREFIXES):
+        _note_approx("virtual_fs")
+    elif name not in _LIBC_HELPERS and name != "__halt":
+        _note_approx(f"opaque_helper:{name}")
 
 
 def lift_intrinsic_function(module: ir.Module, func_name: str):
@@ -1109,74 +1124,18 @@ def lift_intrinsic_function(module: ir.Module, func_name: str):
     :rtype: ir.Function
     """
     # 如果已存在，直接返回
-    with suppress(KeyError):
-        existing = module.get_global(func_name)
-        if _is_lifted_intrinsic_name(func_name):
-            return existing
+    existing = module.globals.get(func_name)
+    if isinstance(existing, ir.Function):
+        return existing
 
-    if func_name == "sadd_overflow":
-        typ = ir.LiteralStructType((ir.IntType(64), ir.IntType(1)))
-        return  module.declare_intrinsic('sadd_overflow', fnty=ir.FunctionType(typ.as_pointer(), [ir.IntType(64), ir.IntType(64)]))
+    if func_name.startswith("__PAIR") and func_name.endswith("__"):
+        bits = int(func_name[len("__PAIR"):-2])
+        if bits not in PAIR_HELPER_TYPES:
+            raise UnsupportedMicrocode(f"pair_width_{bits}", func_name)
+        half = ir.IntType(PAIR_HELPER_TYPES[bits])
+        return module.declare_intrinsic(func_name, fnty=ir.FunctionType(ir.IntType(bits), [half, half]))
 
-    elif func_name == "__OFSUB__":
-        return  module.declare_intrinsic('__OFSUB__', fnty=ir.FunctionType(ir.IntType(1), [ir.IntType(64), ir.IntType(64)]))
-
-    elif func_name == "_mm_cvtsi128_si32":
-        return  module.declare_intrinsic('_mm_cvtsi128_si32', fnty=ir.FunctionType(ir.IntType(32), [ir.IntType(128)]))
-
-    elif func_name == "_BitScanReverse":
-        return  module.declare_intrinsic('_BitScanReverse', fnty=ir.FunctionType(i8ptr, [ir.IntType(32), ir.IntType(32)]))
-
-    elif func_name == "__FYL2X__":
-        return  module.declare_intrinsic('__FYL2X__', fnty=ir.FunctionType(ir.DoubleType(), [ir.DoubleType(), ir.DoubleType()]))
-
-    elif func_name == "__FYL2P__":
-        return  module.declare_intrinsic('__FYL2P__', fnty=ir.FunctionType(ir.DoubleType(), [ir.DoubleType(), ir.DoubleType()]))
-       
-    elif func_name == "fabs":
-        return  module.declare_intrinsic('fabs', fnty=ir.FunctionType(ir.DoubleType(), [ir.DoubleType()]))
-
-    elif func_name == "fabsf":
-        return  module.declare_intrinsic('fabsf', fnty=ir.FunctionType(ir.FloatType(), [ir.FloatType()]))
-
-    elif func_name == "fabsl":
-        return  module.declare_intrinsic('fabs', fnty=ir.FunctionType(ir.DoubleType(), [ir.DoubleType()]))
-
-    elif func_name == "memcpy":
-        return  module.declare_intrinsic('memcpy', fnty=ir.FunctionType(i8ptr, [i8ptr, i8ptr, ir.IntType(ptrsize)]))
-
-    elif func_name == "_byteswap_ulong":
-        return  module.declare_intrinsic('_byteswap_ulong', fnty=ir.FunctionType(ir.IntType(32), [ir.IntType(32)]))
-
-    elif func_name == "_byteswap_uint64":
-        return  module.declare_intrinsic('_byteswap_uint64', fnty=ir.FunctionType(ir.IntType(64), [ir.IntType(64)]))
-
-    elif func_name == "memset":
-        return  module.declare_intrinsic('memset', fnty=ir.FunctionType(i8ptr, [i8ptr, ir.IntType(32), ir.IntType(ptrsize)]))
-
-    elif func_name == "abs64":
-        return  module.declare_intrinsic('abs64', fnty=ir.FunctionType(ir.IntType(64), [ir.IntType(64)]))
-
-    elif func_name == "__PAIR64__":
-        return  module.declare_intrinsic('__PAIR64__', fnty=ir.FunctionType(ir.IntType(64), [ir.IntType(32), ir.IntType(32)]))
-
-    elif func_name == "__PAIR128__":
-        return  module.declare_intrinsic('__PAIR128__', fnty=ir.FunctionType(ir.IntType(128), [ir.IntType(64), ir.IntType(64)]))
-
-    elif func_name == "__PAIR32__":
-        return  module.declare_intrinsic('__PAIR32__', fnty=ir.FunctionType(ir.IntType(32), [ir.IntType(16), ir.IntType(16)]))
-
-    elif func_name == "__PAIR16__":
-        return  module.declare_intrinsic('__PAIR16__', fnty=ir.FunctionType(ir.IntType(16), [ir.IntType(8), ir.IntType(8)]))
-
-    elif func_name == "_BitScanReverse64":
-        return  module.declare_intrinsic('_BitScanReverse64', fnty=ir.FunctionType(i8ptr, [ir.IntType(64).as_pointer(), ir.IntType(64)]))
-
-    elif func_name == "_BitScanForward64":
-        return  module.declare_intrinsic('_BitScanForward64', fnty=ir.FunctionType(i8ptr, [ir.IntType(64).as_pointer(), ir.IntType(64)]))
-
-
-    elif func_name == "__halt":
+    if func_name == "__halt":
         fty = ir.FunctionType(ir.VoidType(), [])
         f = ir.Function(module, fty, "__halt")
         f.append_basic_block()
@@ -1185,42 +1144,6 @@ def lift_intrinsic_function(module: ir.Module, func_name: str):
         builder.ret_void()
         return f
 
-    elif func_name == "is_mul_ok":
-        is_mul_ok = module.declare_intrinsic('is_mul_ok', fnty=ir.FunctionType(ir.IntType(8), [ir.IntType(64), ir.IntType(64)]))
-        return is_mul_ok
-
-    elif func_name == "va_start":
-        va_start = module.declare_intrinsic('va_start', fnty=ir.FunctionType(ir.VoidType(), [ir.IntType(8).as_pointer()]))
-        return va_start
-
-    elif func_name == "va_arg":
-        va_arg = module.declare_intrinsic('va_arg', fnty=ir.FunctionType(ir.IntType(64), [ir.IntType(8).as_pointer()]))
-        return va_arg
-
-    elif func_name == "va_end":
-        va_arg = module.declare_intrinsic('va_end', fnty=ir.FunctionType(ir.VoidType(), [ir.IntType(8).as_pointer()]))
-        return va_arg
-
-    elif func_name == "_QWORD":
-        fQWORD = module.declare_intrinsic('IDA_QWORD', fnty=ir.FunctionType(ir.IntType(8).as_pointer(), []))
-        return fQWORD
-
-    elif func_name == "__ROL8__":
-        f = module.declare_intrinsic('__ROL8__', fnty=ir.FunctionType(ir.IntType(64), [ir.IntType(64), ir.IntType(8)]))
-        return f
-
-    elif func_name == "__ROL4__":
-        f = module.declare_intrinsic('__ROL4__', fnty=ir.FunctionType(ir.IntType(64), [ir.IntType(64), ir.IntType(8)]))
-        return f
-        
-    elif func_name == "__ROR4__":
-        f = module.declare_intrinsic('__ROR4__', fnty=ir.FunctionType(ir.IntType(64), [ir.IntType(64), ir.IntType(8)]))
-        return f
-
-    elif func_name == "__ROR8__":
-        f = module.declare_intrinsic('__ROR8__', fnty=ir.FunctionType(ir.IntType(64), [ir.IntType(64), ir.IntType(8)]))
-        return f
-        
     elif func_name.startswith("__readfs"):
         _, size = func_name.split("__readfs")
         size = str2size(size)
@@ -1271,16 +1194,6 @@ def lift_intrinsic_function(module: ir.Module, func_name: str):
 
         return f
 
-    elif func_name.startswith("sys_"):
-        fty = ir.FunctionType(ir.IntType(64), [], var_arg=True)
-        f = ir.Function(module, fty, func_name)
-        return f
-
-    elif func_name.startswith("_InterlockedCompareExchange") or func_name.startswith("_InterlockedExchange"):
-        fty = ir.FunctionType(ir.IntType(64), [], var_arg=True)
-        f = ir.Function(module, fty, func_name)
-        return f
-
     else:
         raise NotImplementedError(f"不支持的内置函数: {func_name}")  
 
@@ -1314,7 +1227,9 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
     """
     if func_name == "":
         func_name = f"data_{hex(ea)[2:]}"
-    with suppress(NotImplementedError):
+    if _is_implemented_helper(func_name):
+        # 只有 lifter 自己实现的 helper 走内置实现；与其他 helper 同名的真实函数（如静态链接的
+        # memcpy）照常提升，不被硬编码声明顶替
         return lift_intrinsic_function(module, func_name)
 
     func_ea = ida_name.get_name_ea(ida_idaapi.BADADDR, func_name)
@@ -1455,8 +1370,9 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
             return None
         size = mop.size
         if isinstance(d.type, ir.VoidType):
-            if knowntyp is not None:
-                d = typecast(d, knowntyp, builder)
+            if knowntyp is not None or is_callarg or size > 0:
+                # 返回 void 的调用结果被当作值使用：不能用 0 顶替
+                raise UnsupportedMicrocode("void_call_result_used", mop.dstr())
         elif size == -1:
             pass
         elif is_callarg:
@@ -1467,7 +1383,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
             d = typecast(d, ir.IntType(size * 8), builder)
         return d
     elif t == ida_hexrays.mop_r: # 寄存器值
-        reg_ptr = _get_register_storage(mop, blk, builder)
+        reg_ptr = _get_register_storage(mop, blk, builder, is_read=not dest)
         reg_ptr = _cast_slot(reg_ptr, mop.size if mop.size > 0 else -1, knowntyp, builder)
         return reg_ptr if dest else builder.load(reg_ptr)
     elif t == ida_hexrays.mop_S: # 栈变量
@@ -1528,8 +1444,9 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
 
             typ = lift_tif(tif)
             g_cmt = lift_from_address(module, ea, typ)
-            g = ir.GlobalVariable(module, g_cmt.type, name = name)
-            g.initializer = g_cmt
+            g = ir.GlobalVariable(module, typ if g_cmt is None else g_cmt.type, name = name)
+            if g_cmt is not None:
+                g.initializer = g_cmt
             global_by_ea[ea] = g
 
         if isinstance(g.type.pointee, (ir.IdentifiedStructType, ir.ArrayType)):
@@ -1549,6 +1466,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
             f_arg = lift_mop(arg, blk, builder, False, typ)
 
             if arg.t == ida_hexrays.mop_h and f_arg == None:
+                _note_helper(arg.helper)
                 f_arg = blk.parent.parent.declare_intrinsic(arg.helper, fnty=ir.FunctionType(typ, []))
 
             if arg.t == ida_hexrays.mop_r and f_arg == None:
@@ -1566,8 +1484,10 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
             val = typecast(val, knowntyp, builder)
         return val
     elif t == ida_hexrays.mop_h: # 辅助函数编号
-        with suppress(NotImplementedError):
+        if _is_implemented_helper(mop.helper):
+            _note_helper(mop.helper)
             return lift_intrinsic_function(blk.parent.parent, mop.helper)
+        # 其他 helper 由调用点根据 mcallinfo 声明（宽度与调用信息一致）
         return None
     elif t == ida_hexrays.mop_str: # 字符串常量
         g = _make_cstr_global(blk.parent.parent, mop.cstr)
@@ -1583,15 +1503,18 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
                 mcases[src] = dst
         return mcases
     elif t == ida_hexrays.mop_fn:
-        # IDA获取浮点数值在某些情况下可能会崩溃
+        typ = float_type(mop.size)
         try:
             fp = mop.fpc.fnum.float
-        except (AttributeError, ValueError, SystemError) as e:
-            logging.debug(f"Failed to extract float value: {e}, using default {DEFAULT_FLOAT_VALUE}")
-            fp = DEFAULT_FLOAT_VALUE
-        typ = float_type(mop.size)
+        except Exception as e:
+            # 读不出的浮点常量不能用一个普通常量顶替
+            raise UnsupportedMicrocode("fp_constant_unreadable", f"{type(e).__name__}: {e}")
         return ir.Constant(typ, fp)
     elif t == ida_hexrays.mop_p:
+        if dest:
+            # 写入寄存器对需要拆分高低两半，调用 __PAIR 的结果不是可写存储
+            raise UnsupportedMicrocode("pair_destination", mop.dstr())
+        _note_helper(f"__PAIR{mop.size*8}__")
         f = lift_intrinsic_function(blk.parent.parent, f"__PAIR{mop.size*8}__")
         l = lift_mop(mop.pair.hop, blk, builder, dest)
         r = lift_mop(mop.pair.lop, blk, builder, dest)
@@ -1676,25 +1599,25 @@ def create_intrinsic_function(module: ir.Module, func_name: str, ftif):
     """
     为IDA辅助函数创建内置函数。
     """
-    argtypes = []
-    for arg in ftif.args:
-        argtypes.append(lift_tif(arg.type))
-
+    argtypes = [lift_tif(arg.type) for arg in ftif.args]
+    var_arg = bool(ftif.is_vararg())
+    if var_arg:
+        argtypes = argtypes[:int(ftif.solid_args)]
     rettype = lift_tif(ftif.return_type)
-    if isinstance(rettype, ir.VoidType):
-        rettype = i8ptr
-    return module.declare_intrinsic(func_name, fnty=ir.FunctionType(rettype, argtypes))
+    # 签名完全来自调用信息（宽度正确，void 就是 void），不再把 void 改成 i8*；
+    # 同名 helper 已按另一组调用信息声明过时，由 _lift_call 在调用点转换类型
+    return module.declare_intrinsic(func_name, fnty=ir.FunctionType(rettype, argtypes, var_arg=var_arg))
 
 def float_type(size: int) -> ir.Type:
     """
-    根据给定的大小返回适当的LLVM浮点类型。
-    
-    注意：llvmlite不支持long double，所以大小 > 8 的默认为double。
-    
-    :param size: 字节大小（4为float，8为double）
-    :return: LLVM FloatType 或 DoubleType
+    按字节宽度返回 LLVM 浮点类型：4 -> float，8 -> double。
+    其他宽度（x87 80 位扩展精度、16 字节、半精度等）不静默收窄成 double，拒绝该函数。
     """
-    return ir.FloatType() if size == 4 else ir.DoubleType()
+    if size == 4:
+        return ir.FloatType()
+    if size == 8:
+        return ir.DoubleType()
+    raise UnsupportedMicrocode(f"fp_width_{size}", "only 32/64-bit floating point is lifted exactly")
 
 # ============================================================================
 # 指令提升辅助函数
@@ -1920,30 +1843,65 @@ _FLOAT_BINARY_OPS = {
 _NO_OP_OPS = {ida_hexrays.m_nop}
 # 需要栈指针 / 跳转目标模型、lifter 无法忠实翻译的指令
 _REJECT_OPS = {ida_hexrays.m_ijmp: "m_ijmp", ida_hexrays.m_push: "m_push", ida_hexrays.m_pop: "m_pop"}
+# ldx/stx 的段选择子被忽略（按平坦内存建模），这只对 cs/ds/ss/es 成立；fs/gs 基址（TLS 等）不能丢
+_NONFLAT_SELECTORS = {"fs", "gs"}
+
+
+def _check_flat_selector(sel_mop, ida_insn):
+    if sel_mop is None or sel_mop.t != ida_hexrays.mop_r:
+        return
+    name = sel_mop.dstr().split(".")[0].split("{")[0].strip().lower()
+    if name in _NONFLAT_SELECTORS:
+        raise UnsupportedMicrocode(f"segment_selector_{name}", ida_insn.dstr())
 
 
 _AGGREGATE_TYPES = (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)
 
 
-def _callinfo_signature(ida_insn, args, result_type) -> ir.FunctionType:
+def _callinfo(ida_insn):
+    d_mop = ida_insn.d
+    return d_mop.f if d_mop is not None and d_mop.t == ida_hexrays.mop_f else None
+
+
+def _callinfo_return_type(ida_insn):
+    callinfo = _callinfo(ida_insn)
+    if callinfo is None:
+        return None
+    tif = callinfo.return_type
+    if tif is None or tif.empty():
+        return None
+    return lift_tif(tif)
+
+
+def _check_single_retreg(ida_insn):
+    callinfo = _callinfo(ida_insn)
+    if callinfo is not None and callinfo.retregs.size() > 1:
+        # 多寄存器返回（如 rax:rdx）没有可靠的拆分规则，直接、间接、helper 调用统一拒绝
+        raise UnsupportedMicrocode("call_multi_retregs", ida_insn.dstr())
+
+
+def _abi_class(typ: ir.Type) -> str:
+    if _is_fp_type(typ):
+        return "fp"
+    if isinstance(typ, _AGGREGATE_TYPES):
+        return "aggregate"
+    return "int"
+
+
+def _callinfo_signature(ida_insn, args) -> ir.FunctionType:
     """
     间接调用 / 无类型被调目标的调用签名，取自 microcode 的 mcallinfo：
-    返回类型（外层指令要求的值类型优先）、固定参数个数（solid_args）和是否变参。
+    返回类型、固定参数个数（solid_args）和是否变参。签名只由调用信息决定，
+    外层指令需要的类型只在调用之后做转换（lift_mop），不能改变调用的 ABI。
     聚合返回值、多返回寄存器、缺少调用信息时明确拒绝，不猜一个通用类型。
     """
-    d_mop = ida_insn.d
-    if d_mop is None or d_mop.t != ida_hexrays.mop_f:
+    callinfo = _callinfo(ida_insn)
+    if callinfo is None:
         raise UnsupportedMicrocode("call_without_callinfo", ida_insn.dstr())
-    callinfo = d_mop.f
-    if callinfo.retregs.size() > 1:
-        raise UnsupportedMicrocode("call_multi_retregs", ida_insn.dstr())
-    if result_type is not None:
-        ret_type = result_type
-    else:
-        tif = callinfo.return_type
-        if tif is None or tif.empty():
-            raise UnsupportedMicrocode("call_unknown_return_type", ida_insn.dstr())
-        ret_type = lift_tif(tif)
+    _check_single_retreg(ida_insn)
+    ret_type = _callinfo_return_type(ida_insn)
+    if ret_type is None:
+        raise UnsupportedMicrocode("call_unknown_return_type", ida_insn.dstr())
     if isinstance(ret_type, _AGGREGATE_TYPES):
         # 聚合返回值的 ABI（sret / 多寄存器）无法从按值返回的 LLVM 类型推出
         raise UnsupportedMicrocode("call_aggregate_return", ida_insn.dstr())
@@ -1953,10 +1911,19 @@ def _callinfo_signature(ida_insn, args, result_type) -> ir.FunctionType:
 
 
 def _store_call_result(ret, rets, ftype, blk, builder):
-    if isinstance(ftype.return_type, ir.VoidType):
+    if isinstance(ftype.return_type, ir.VoidType) or not rets:
         return
-    for dst in rets:
-        _store_as(ret, dst, blk, builder)
+    if len(rets) > 1:
+        raise UnsupportedMicrocode("call_multi_retregs", f"{len(rets)} return registers")
+    slot = dedereference(rets[0])
+    if (
+        isinstance(ret.type, _AGGREGATE_TYPES)
+        and isinstance(slot.type, ir.PointerType)
+        and _type_size(slot.type.pointee) < _type_size(ret.type)
+    ):
+        # 聚合返回值整体写进更小的返回寄存器槽会越界
+        raise UnsupportedMicrocode("call_aggregate_into_smaller_slot", str(ret.type))
+    _store_as(ret, rets[0], blk, builder)
 
 
 def _lift_ext(ida_insn, l, r, d, blk, builder):
@@ -1969,6 +1936,7 @@ def _lift_ext(ida_insn, l, r, d, blk, builder):
     with suppress(Exception):
         mnemonic = idc.print_insn_mnem(ida_insn.ea) or ""
     name = "__ida_ext_" + _sanitize_symbol_name(mnemonic or "unknown")
+    _note_approx(f"opaque_ext:{mnemonic or 'unknown'}")
     args = [v for v in (l, r) if v is not None and not isinstance(v, ir.Block)]
     has_result = d is not None and ida_insn.d.size > 0
     ret_type = ir.IntType(ida_insn.d.size * 8) if has_result else ir.VoidType()
@@ -1987,25 +1955,37 @@ def _lift_ext(ida_insn, l, r, d, blk, builder):
 
 def _lift_call(ida_insn, l, d, blk, builder, result_type):
     rets, args = d
+    _check_single_retreg(ida_insn)
     if not isinstance(l.type, ir.PointerType) or not isinstance(l.type.pointee, ir.FunctionType):
         # 被调目标没有函数类型：签名来自 mcallinfo，不再统一假定返回 i8*
-        ftype = _callinfo_signature(ida_insn, args, result_type)
+        ftype = _callinfo_signature(ida_insn, args)
         l = typecast(l, ftype.as_pointer(), builder)
     else:
         ftype = l.type.pointee
+        callinfo_ret = _callinfo_return_type(ida_insn)
+        # 调用信息里结果宽度为 0（如 "=> int .0"）表示本调用点不使用返回值，此时返回类型不影响语义
+        result_used = ida_insn.d.size > 0
+        if result_used and callinfo_ret is not None and not isinstance(callinfo_ret, ir.VoidType):
+            if isinstance(ftype.return_type, ir.VoidType):
+                # 被调函数声明为 void，但本调用点的调用信息给出了返回类型：以调用信息为准（只改调用点）
+                ftype = ir.FunctionType(callinfo_ret, ftype.args, var_arg=ftype.var_arg)
+                l = typecast(l, ftype.as_pointer(), builder)
+            elif _abi_class(callinfo_ret) != _abi_class(ftype.return_type):
+                # 声明与调用信息的返回值不在同一类寄存器（整数/浮点/聚合）：无法确定 ABI
+                raise UnsupportedMicrocode("call_return_abi_conflict", f"{ftype.return_type} vs {callinfo_ret}")
         if (
-            result_type is not None
-            and not isinstance(result_type, ir.VoidType)
-            and isinstance(ftype.return_type, ir.VoidType)
+            result_used
+            and isinstance(ftype.return_type, _AGGREGATE_TYPES)
+            and ida_insn.l.t != ida_hexrays.mop_h
         ):
-            # 被调函数声明为 void 但调用点使用了返回值：只在调用点转换类型，不改函数定义
-            ftype = ir.FunctionType(result_type, ftype.args, var_arg=ftype.var_arg)
-            l = typecast(l, ftype.as_pointer(), builder)
+            # 按值返回聚合：LLVM 调用不体现源 ABI（sret / 寄存器拆分），记为近似
+            _note_approx("aggregate_return_call")
 
         params = ftype.args
         for i, param_type in enumerate(params):
             if i >= len(args):
-                # 调用点缺少的实参
+                # 调用点缺少的实参（声明比 microcode 实参多）：undef，并记为近似
+                _note_approx("call_missing_args")
                 args.append(ir.Constant(param_type, ir.Undefined))
             elif args[i].type != param_type:
                 args[i] = typecast(args[i], param_type, builder)
@@ -2045,6 +2025,14 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
     r_mop = ida_insn.r
     d_mop = ida_insn.d
 
+    if op in _REJECT_OPS:
+        # 先于操作数提升检查，保证记录的是指令本身的拒绝原因
+        raise UnsupportedMicrocode(_REJECT_OPS[op], ida_insn.dstr())
+    if op == ida_hexrays.m_ldx:
+        _check_flat_selector(l_mop, ida_insn)
+    elif op == ida_hexrays.m_stx:
+        _check_flat_selector(r_mop, ida_insn)
+
     l_known_type = None
     r_known_type = None
     if op in FLOAT_L_OPS and l_mop.t == ida_hexrays.mop_d and l_mop.size > 0:
@@ -2059,6 +2047,7 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
 
     # 为未知的内置函数创建声明
     if l is None and op == ida_hexrays.m_call and l_mop.t == ida_hexrays.mop_h:
+        _note_helper(l_mop.helper)
         l = create_intrinsic_function(blk.parent.parent, l_mop.helper, d_mop.f)
 
     if next_blk is None:
@@ -2073,7 +2062,11 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         d = storecast(l, d, builder)
         return _store_as(l, d, blk, builder)
     elif op == ida_hexrays.m_ldx:  # ldx  {l=sel,r=off}, d  从内存加载值
-        typ = float_type(d_mop.size) if ida_insn.is_fpinsn() else ir.IntType(d_mop.size * 8)
+        # ldx 只搬运数据：非 32/64 位的浮点寄存器加载（如 AArch64 q 寄存器整体拷贝）按同宽整数搬运
+        if ida_insn.is_fpinsn() and d_mop.size in (4, 8):
+            typ = float_type(d_mop.size)
+        else:
+            typ = ir.IntType(d_mop.size * 8)
         r = typecast(r, typ.as_pointer(), builder)
         r = builder.load(r)
         d = storecast(r, d, builder)
@@ -2129,8 +2122,6 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         return
     elif op in _NO_OP_OPS:
         return
-    elif op in _REJECT_OPS:
-        raise UnsupportedMicrocode(_REJECT_OPS[op], ida_insn.dstr())
     elif op == ida_hexrays.m_und:  # und d：d 的值变为未定义
         if d is not None:
             slot = dedereference(d)
@@ -2195,6 +2186,7 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
             cond = builder.fcmp_unordered("uno", typecast(l, typ, builder), typecast(r, typ, builder))
             return _store_as(cond, d, blk, builder)
         func_name = f"setp_{l_mop.size}_{d_mop.size}"
+        _note_approx("opaque_setp")
         module = blk.parent.parent
         if func_name in module.globals:
             f_setp = module.get_global(func_name)
@@ -2210,7 +2202,9 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         if "default" in r:
             switch = builder.switch(l, blocks[r["default"]])
         else:
-            # 没有 default：先占位，函数提升完后由 _finalize_nodefault_switches 指向 unreachable 块
+            # 没有 default：先占位，函数提升完后由 _finalize_nodefault_switches 指向 unreachable 块。
+            # “case 覆盖了所有可能值”是 Hex-Rays 的结论而非已证明的事实，记为近似
+            _note_approx("jtbl_assumed_exhaustive")
             switch = builder.switch(l, blocks[r[next(iter(r))]])
             if not hasattr(func, "nodefault_switches"):
                 func.nodefault_switches = []
@@ -2221,7 +2215,7 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         return switch
     elif op == ida_hexrays.m_icall:  # icall  {l=sel, r=off} d    间接调用
         rets, args = d
-        ftype = _callinfo_signature(ida_insn, args, result_type)
+        ftype = _callinfo_signature(ida_insn, args)
         f = typecast(r, ftype.as_pointer(), builder)
         ret = builder.call(f, args)
         _store_call_result(ret, rets, ftype, blk, builder)
@@ -2393,6 +2387,8 @@ class BIN2LLVMController():
         
         :param ea: 要提升的函数的有效地址
         """
+        current_approx.clear()
+        record = {"ea": hex(ea), "name": self._get_name(ea)}
         try:
             pfunc = ptext.get(ea)
             if pfunc is None or getattr(pfunc, "type", None) is None:
@@ -2401,22 +2397,35 @@ class BIN2LLVMController():
                 pfunc = self._decompile_function(ea)
             if pfunc is None or getattr(pfunc, "type", None) is None:
                 lift_stats["no_decompile"] += 1
+                record["status"] = "no_decompile"
                 return
 
             typ = pfunc.type
             function_signature_cache[ea] = typ
             func_name = self._get_name(ea)
             lifted = lift_function(self.m, func_name, False, ea, typ)
-            if isinstance(lifted, ir.Function) and not lifted.is_declaration:
-                lift_stats["defined"] += 1
+            defined = isinstance(lifted, ir.Function) and not lifted.is_declaration
             self._stream_function_if_enabled(lifted)
+            if defined:
+                # 写出之后才计为成功
+                lift_stats["defined"] += 1
+                record["status"] = "lifted"
+                if current_approx:
+                    lift_stats["approx"] += 1
+                    record["approx"] = sorted(current_approx)
+            else:
+                record["status"] = "not_defined"
         except Exception as e:
             lift_stats["failed"] += 1
             if isinstance(e, UnsupportedMicrocode):
                 unsupported_reasons[e.reason] += 1
+                record.update(status="rejected", reason=e.reason, detail=str(e)[:200])
+            else:
+                record.update(status="error", reason=f"{type(e).__name__}: {e}"[:300])
             logging.debug(f"在 {hex(ea)} 处提升函数失败: {e}")
             self._drop_partial_definition(ea)
         finally:
+            function_records.append(record)
             with suppress(KeyError):
                 del ptext[ea]
             self._trim_ptext()
@@ -2541,10 +2550,15 @@ class BIN2LLVMController():
                     continue
                 self.create_global(head, end - head, str_dict, pending)
         for g, ea, typ in pending:
-            g.initializer = lift_from_address(self.m, ea, typ)
+            init = lift_from_address(self.m, ea, typ)
+            if init is not None:
+                g.initializer = init
+            # init 为 None：内容未知，保留为 external 声明
 
-    def begin_stream_to_file(self, filename):
+    def begin_stream_to_file(self, filename, header_lines=()):
         self._stream_file = open(filename, 'w')
+        for line in header_lines:
+            self._stream_file.write(f"; {line}\n")
         _write_module_header(self.m, self._stream_file)
 
     def _stream_function_if_enabled(self, func):
@@ -2556,11 +2570,7 @@ class BIN2LLVMController():
             return
 
         self._stream_new_type_declarations()
-        if all(_block_ends_with_terminator(blk) for blk in func.blocks):
-            # 每个块都已正确终止时，文本 sanitizer 不会做任何修改，直接写出
-            self._stream_file.write(str(func))
-        else:
-            _write_sanitized_llvm_ir(str(func), self._stream_file)
+        self._stream_file.write(str(func))
         self._stream_file.write("\n")
         self._streamed_functions.add(func.name)
         func.blocks.clear()
@@ -2573,16 +2583,23 @@ class BIN2LLVMController():
         for typ in pending_type_decls:
             if typ.name in self._streamed_types:
                 continue
-            _write_sanitized_llvm_ir(typ.get_declaration(), self._stream_file)
+            _write_llvm_text(typ.get_declaration(), self._stream_file)
             self._streamed_types.add(typ.name)
         pending_type_decls.clear()
 
-    def finish_stream_to_file(self):
+    def finish_stream_to_file(self, fsync=False):
         if self._stream_file is None:
             return
         try:
             _write_module_remainder(self.m, self._stream_file, self._streamed_types)
+            if fsync:
+                self._stream_file.flush()
+                os.fsync(self._stream_file.fileno())
         finally:
+            self.close_stream()
+
+    def close_stream(self):
+        if self._stream_file is not None:
             self._stream_file.close()
             self._stream_file = None
 
@@ -2598,42 +2615,14 @@ class BIN2LLVMController():
         :param filename: 输出.ll文件的路径
         """
         with open(filename, 'w') as f:
-            _write_module_sanitized(self.m, f)
+            _write_module(self.m, f)
 
 
-def _is_llvm_terminator(line: str) -> bool:
-    return line.strip().startswith(LLVM_TERMINATOR_PREFIXES)
-
-
-def _is_llvm_label(line: str) -> bool:
-    stripped = line.strip()
-    if not stripped.endswith(":"):
-        return False
-    return stripped.startswith('"') or LLVM_LABEL_RE.match(stripped) is not None
-
-
-def _llvm_label_ref(label_line: str) -> str:
-    label = label_line.strip()[:-1]
-    return f"%{label}"
-
-
-def _default_ret_for_type(ret_type: str) -> str:
-    ret_type = ret_type.strip()
-    if ret_type == "void":
-        return "  ret void"
-    if ret_type in ("float", "double"):
-        return f"  ret {ret_type} 0.000000e+00"
-    if ret_type.endswith("*"):
-        return f"  ret {ret_type} null"
-    if LLVM_INT_RE.match(ret_type):
-        return f"  ret {ret_type} 0"
-    return f"  ret {ret_type} zeroinitializer"
-
-
-def _sanitize_llvm_ir(text: str) -> str:
-    out = io.StringIO()
-    _write_sanitized_llvm_ir(text, out)
-    return out.getvalue()
+def _write_llvm_text(text: str, output):
+    # 原样写出：缺终止指令的函数在提升阶段已被拒绝，这里不做任何“语法修复”
+    output.write(text)
+    if not text.endswith("\n"):
+        output.write("\n")
 
 
 def _write_module_header(module: ir.Module, output):
@@ -2647,71 +2636,149 @@ def _write_module_remainder(module: ir.Module, output, skip_type_names=None):
     for type_name, typ in module.get_identified_types().items():
         if type_name in skip_type_names:
             continue
-        _write_sanitized_llvm_ir(typ.get_declaration(), output)
+        _write_llvm_text(typ.get_declaration(), output)
 
     for global_value in module.globals.values():
         if isinstance(global_value, ir.Function) and getattr(global_value, "_streamed_definition", False):
             continue
-        _write_sanitized_llvm_ir(str(global_value), output)
+        _write_llvm_text(str(global_value), output)
 
     for metadata_line in module._get_metadata_lines():
-        _write_sanitized_llvm_ir(metadata_line, output)
+        _write_llvm_text(metadata_line, output)
 
 
-def _write_module_sanitized(module: ir.Module, output):
+def _write_module(module: ir.Module, output):
     _write_module_header(module, output)
     _write_module_remainder(module, output)
-
-
-def _write_sanitized_llvm_ir(text: str, output):
-    in_func = False
-    ret_type = None
-    prev_nonempty = None
-
-    for raw_line in io.StringIO(text):
-        line = raw_line.rstrip("\n")
-        stripped = line.strip()
-        define_match = LLVM_DEFINE_RE.match(stripped)
-        if define_match is not None:
-            in_func = True
-            ret_type = define_match.group(1)
-            prev_nonempty = stripped
-            output.write(line)
-            output.write("\n")
-            continue
-
-        if in_func and _is_llvm_label(line):
-            if (
-                prev_nonempty
-                and not prev_nonempty.endswith("{")
-                and not _is_llvm_terminator(prev_nonempty)
-            ):
-                output.write(f"  br label {_llvm_label_ref(line)}\n")
-            output.write(line)
-            output.write("\n")
-            prev_nonempty = stripped
-            continue
-
-        if in_func and stripped == "}":
-            if prev_nonempty and not _is_llvm_terminator(prev_nonempty):
-                output.write(_default_ret_for_type(ret_type or "void"))
-                output.write("\n")
-            output.write(line)
-            output.write("\n")
-            in_func = False
-            ret_type = None
-            prev_nonempty = None
-            continue
-
-        output.write(line)
-        output.write("\n")
-        if in_func and stripped:
-            prev_nonempty = stripped
 
 
 # ============================================================================
 # 公开接口：供其他 Python 文件调用的函数
 # ============================================================================
+
+# 同一份 lifter 源码的标识：输出文件头和 sidecar 都记录它，task1 --resume 据此判断旧输出是否可复用
+LIFTER_ID = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+# 退出码：0 成功；3 没有任何函数被成功提升（不用 2，2 是 click 的参数错误）；1 异常
+EXIT_OK, EXIT_ERROR, EXIT_NO_FUNCTIONS = 0, 1, 3
+
+
+def _source_info() -> dict:
+    info = {"bits": ptrsize, "endian": byteorder}
+    with suppress(Exception):
+        info["proc"] = str(ida_ida.inf_get_procname())
+    return info
+
+
+def _ida_version():
+    with suppress(Exception):
+        return str(ida_kernwin.get_kernel_version())
+    return None
+
+
+def _input_info(path: str) -> dict:
+    info = {"path": os.path.abspath(path)}
+    with suppress(OSError):
+        st = os.stat(path)
+        info.update(size=st.st_size, mtime_ns=st.st_mtime_ns)
+    return info
+
+
+def _write_json_atomic(path: Path, data: dict):
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        with suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "host") -> dict:
+    """
+    提升一个 binary：先写 <output>.tmp.<pid>，只有至少一个函数成功时才原子替换成 <output>；
+    无论成败都写 <output>.lift.json（版本、输入、目标、计数、拒绝/近似原因、逐函数状态）。
+    返回 sidecar 内容；"status" 为 ok / no_functions_lifted / error。
+    """
+    _reset_lift_state()
+    started = time.time()
+    out = Path(output_llvm_ir)
+    tmp = out.with_name(f"{out.name}.tmp.{os.getpid()}")
+    sidecar = out.with_name(out.name + ".lift.json")
+    # 先删除旧 sidecar：本次中途崩溃时不能留下一个与旧输出对应的 "ok"
+    with suppress(FileNotFoundError):
+        sidecar.unlink()
+    result = {
+        "schema": 1,
+        "status": "error",
+        "lifter_id": LIFTER_ID,
+        "ida_version": None,
+        "input": _input_info(input_binary),
+        "output": str(out),
+        "target_mode": target_mode,
+    }
+    bin2llvm = None
+    try:
+        idapro.open_database(input_binary, True)
+        ida_auto.auto_wait()
+        _init_target_state()
+        result["ida_version"] = _ida_version()
+        result["source"] = _source_info()
+        bin2llvm = BIN2LLVMController(target_mode=target_mode)
+        bin2llvm.initialize()
+        result["target"] = {"triple": str(bin2llvm.m.triple), "datalayout": str(bin2llvm.m.data_layout)}
+        source = result["source"]
+        header = [
+            f"ida2llvm lifter={LIFTER_ID} ida={result['ida_version']} target_mode={target_mode}",
+            f"source proc={source.get('proc')} bits={source['bits']} endian={source['endian']}",
+        ]
+        bin2llvm.begin_stream_to_file(str(tmp), header)
+        bin2llvm.insertAllFunctions()
+        bin2llvm.finish_stream_to_file(fsync=True)
+        if lift_stats["defined"] > 0:
+            os.replace(tmp, out)
+            result["status"] = "ok"
+        else:
+            result["status"] = "no_functions_lifted"
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"[:1000]
+        logging.error(f"Failed to lift binary: {e}")
+        logging.error(traceback.format_exc())
+    finally:
+        if result["status"] != "ok":
+            # 本次没有成功：删除同名旧输出，避免下游读到与 sidecar 不一致的陈旧 IR
+            with suppress(FileNotFoundError):
+                out.unlink()
+        if bin2llvm is not None:
+            with suppress(Exception):
+                bin2llvm.close_stream()
+        with suppress(FileNotFoundError):
+            tmp.unlink()
+        with suppress(Exception):
+            # 不保存：lift 不应修改输入数据库，且保证同一 .i64 重复运行结果一致
+            idapro.close_database(False)
+        approx_reasons = Counter(tag for rec in function_records for tag in rec.get("approx", ()))
+        result.update(
+            elapsed_s=round(time.time() - started, 3),
+            counts=dict(lift_stats),
+            unsupported_reasons=dict(sorted(unsupported_reasons.items())),
+            approx_reasons=dict(sorted(approx_reasons.items())),
+            unresolved_data=list(unresolved_data_items),
+            functions=list(function_records),
+        )
+        try:
+            _write_json_atomic(sidecar, result)
+        except OSError as e:
+            logging.error(f"Failed to write {sidecar}: {e}")
+            result["status"] = "error"
+    return result
+
+
+def _exit_code(result: dict) -> int:
+    return {"ok": EXIT_OK, "no_functions_lifted": EXIT_NO_FUNCTIONS}.get(result["status"], EXIT_ERROR)
+
 
 def lift_binary_to_llvm(
     input_binary: str,
@@ -2720,77 +2787,30 @@ def lift_binary_to_llvm(
     verbose: bool = False
 ) -> bool:
     """
-    将二进制文件转换为 LLVM IR。
-    
-    这是一个简洁的函数接口，允许其他 Python 文件像调用普通函数一样
-    调用 IDA Lift 功能。
-    
+    将二进制文件转换为 LLVM IR（供其他 Python 文件调用）。
+
     参数:
-        input_binary (str): 输入的二进制文件路径
-        output_llvm_ir (str): 输出的 LLVM IR 文件路径 (.ll)
-        target_mode (str): 目标架构设置方式，可选值：
-            - "host": 使用当前主机的目标三元组（默认）
-            - "ida": 使用 IDA Pro 检测到的架构
+        input_binary (str): 输入的二进制 / IDA 数据库路径
+        output_llvm_ir (str): 输出的 LLVM IR 文件路径 (.ll)；同目录写 <output>.lift.json 状态文件
+        target_mode (str): "host"（默认，当前主机目标三元组）或 "ida"（IDA 检测到的架构）
         verbose (bool): 是否打印详细日志（默认 False）
-    
+
     返回值:
-        bool: 成功返回 True，失败返回 False
-    
-    异常处理:
-        所有异常都被捕获，函数不会抛出异常，而是返回 False
-    
-    使用示例:
-        >>> from Scripts.ida2llvm import lift_binary_to_llvm
-        >>> success = lift_binary_to_llvm(
-        ...     input_binary="/path/to/binary",
-        ...     output_llvm_ir="/path/to/output.ll"
-        ... )
-        >>> if success:
-        ...     print("转换成功！")
-        ... else:
-        ...     print("转换失败！")
+        bool: 至少一个函数成功提升且输出已原子发布时返回 True；否则 False（不抛异常）
     """
     if target_mode not in ("host", "ida"):
         logging.error(f"Invalid target_mode '{target_mode}'. Must be 'host' or 'ida'")
         return False
-    
+
     if verbose:
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.INFO)
-    
-    try:
-        # Clear global caches to avoid stale entries across multiple binaries.
-        _reset_lift_state()
 
-        # 打开 IDA 数据库
-        idapro.open_database(input_binary, True)
-        ida_auto.auto_wait()
-        _init_target_state()
-        
-        # 创建控制器并执行提升
-        bin2llvm = BIN2LLVMController(target_mode=target_mode)
-        bin2llvm.initialize()
-        bin2llvm.begin_stream_to_file(output_llvm_ir)
-        bin2llvm.insertAllFunctions()
-        bin2llvm.finish_stream_to_file()
-        
+    result = run_lift(input_binary, output_llvm_ir, target_mode)
+    if result["status"] == "ok":
         logging.info(f"Successfully lifted binary to LLVM IR: {output_llvm_ir}")
-        return True
-        
-    except Exception as e:
-
-        logging.error(f"Failed to lift binary: {e}", exc_info=verbose)
-        logging.error("".join(traceback.format_exc()))
-        return False
-        
-    finally:
-        # 关闭 IDA 数据库
-        try:
-            # 不保存：lift 不应修改输入数据库，且保证同一 .i64 重复运行结果一致
-            idapro.close_database(False)
-        except:
-            pass
+    return result["status"] == "ok"
 
 
 app = typer.Typer(
@@ -2825,32 +2845,17 @@ def main(
     else:
         logging.basicConfig(level=logging.INFO)
 
-    try:
-        _reset_lift_state()
-
-        idapro.open_database(file, True)
-        ida_auto.auto_wait()
-        _init_target_state()
-        bin2llvm = BIN2LLVMController(target_mode=target)
-        bin2llvm.initialize()
-        bin2llvm.begin_stream_to_file(output)
-        bin2llvm.insertAllFunctions()
-        bin2llvm.finish_stream_to_file()
-        print(
-            f"lift stats: defined={lift_stats['defined']} failed={lift_stats['failed']} "
-            f"unsupported={','.join(f'{k}:{v}' for k, v in sorted(unsupported_reasons.items())) or 'none'} "
-            f"no_decompile={lift_stats['no_decompile']}",
-            file=sys.stderr,
-        )
-
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
-    finally:
-        idapro.close_database(False)
+    result = run_lift(file, output, target)
+    print(
+        f"lift stats: status={result['status']} defined={lift_stats['defined']} failed={lift_stats['failed']} "
+        f"approx={lift_stats['approx']} unresolved_data={lift_stats['unresolved_data']} "
+        f"unsupported={','.join(f'{k}:{v}' for k, v in sorted(unsupported_reasons.items())) or 'none'} "
+        f"no_decompile={lift_stats['no_decompile']}",
+        file=sys.stderr,
+    )
+    if "error" in result:
+        print(f"Error: {result['error']}", file=sys.stderr)
+    raise typer.Exit(_exit_code(result))
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ Step 2: Use ida2llvm.py to convert .i64 files to LLVM IR
 Both steps use parallel processing with separate progress bars for efficiency.
 """
 import os
+import hashlib
 import json
 import typer
 import multiprocessing
@@ -84,6 +85,38 @@ def is_input_binary_file(file_name: str) -> bool:
     return not file_name.endswith(ignored_suffixes)
 
 
+# IDA 运行中解包出的数据库分片；存在说明上一次 IDA 未正常结束
+IDA_UNPACKED_SUFFIXES = (".id0", ".id1", ".id2", ".nam", ".til")
+
+
+def ida2llvm_lifter_id() -> str:
+    """与 ida2llvm.LIFTER_ID 相同：lifter 源码 sha256 的前 16 位。"""
+    with open(os.path.join(SCRIPT_DIR, "ida2llvm.py"), "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()[:16]
+
+
+def lift_output_reusable(input_path: str, output_path: str, lifter_id: str) -> bool:
+    """
+    --resume 只复用由当前 lifter、针对当前输入、成功完成的输出：
+    <output>.lift.json 必须是 status=ok，lifter_id 一致，输入大小和 mtime 一致。
+    """
+    if not file_exists_and_not_empty(output_path):
+        return False
+    try:
+        with open(output_path + ".lift.json") as handle:
+            status = json.load(handle)
+        st = os.stat(input_path)
+    except (OSError, ValueError):
+        return False
+    recorded = status.get("input", {})
+    return (
+        status.get("status") == "ok"
+        and status.get("lifter_id") == lifter_id
+        and recorded.get("size") == st.st_size
+        and recorded.get("mtime_ns") == st.st_mtime_ns
+    )
+
+
 def python_runner(conda_env: str) -> list[str]:
     """Build a Python command without hardcoding a conda environment."""
     if conda_env:
@@ -104,9 +137,21 @@ def generate_i64(binary_path: str, ida_path: str) -> tuple:
         "-B",
         binary_path
     ]
+    stale = [binary_path + suffix for suffix in IDA_UNPACKED_SUFFIXES if os.path.exists(binary_path + suffix)]
+    if stale:
+        # 不自动删除：这些文件可能属于正在运行的另一个 IDA，或需要人工检查
+        with open(LOG_PATH, "a") as log_file:
+            log_file.write("=" * 60 + "\n")
+            log_file.write(f"Skipped {binary_path}: stale unpacked IDA database files {stale}\n")
+        return (False, binary_path)
+    # -B 会在 binary 旁生成 .asm；只删除本次运行新建的那个
+    asm_path = binary_path + ".asm"
+    asm_existed = os.path.exists(asm_path)
     success = False
     try:
         result = subprocess.run(command_line, capture_output=True, text=True)
+        if not asm_existed and os.path.exists(asm_path):
+            os.remove(asm_path)
         if result.returncode == 0:
             success = True
             # Check if .i64 file was actually created
@@ -220,7 +265,7 @@ def main(
     input_path: str = typer.Option("", help="Input directory (defaults to DataProcess-1)"),
     output: str = typer.Option(..., help="Output directory"),
     workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
-    resume: bool = typer.Option(False, help="Resume from previous run, skip existing files"),
+    resume: bool = typer.Option(False, help="Resume: skip outputs whose .lift.json is ok for the current lifter and input (Ghidra: existing non-empty files)"),
     backend: str = typer.Option(
         "ida",
         "--backend",
@@ -377,19 +422,9 @@ def main(
     elif not start_from_step2:
         console.print("[bold blue]Step 1: Scanning for binary files to generate .i64...[/bold blue]")
         
-        # Clean any failed IDA files first
-        files_to_remove = []
-        for root, dirs, files in os.walk(db_path):
-            for file in files:
-                if file.endswith((".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm")):
-                    files_to_remove.append(os.path.join(root, file))
-        for f in files_to_remove:
-            try:
-                os.remove(f)
-                logger.info(f"Removed failed IDA file: {f}")
-            except Exception as e:
-                logger.warning(f"Could not remove {f}: {str(e)}")
-        
+        # 不再递归删除 .idb/.id0/.asm 等文件：可能属于其他运行或其他数据（如 ASM 基线）。
+        # 残留的解包分片由 generate_i64 按 binary 检测并跳过、记录到日志。
+
         # Scan for binary files (non-IDA files) that need .i64 generation
         i64_tasks = []
         i64_skipped_count = 0
@@ -491,6 +526,7 @@ def main(
         console.print("[bold blue]Step 2: Scanning for binaries to lift to LLVM IR with Ghidra...[/bold blue]")
     lift_tasks = []
     skipped_count = 0
+    lifter_id = ida2llvm_lifter_id() if backend == "ida" else None
     
     for root, dirs, files in os.walk(db_path):
         for file in files:
@@ -510,9 +546,15 @@ def main(
             output_file_path = os.path.join(output_dir, output_name)
             
             # Check if file already exists and we're resuming
-            if resume and file_exists_and_not_empty(output_file_path):
-                skipped_count += 1
-                continue
+            if resume:
+                if backend == "ida":
+                    # 需要 sidecar 证明输出完整、来自当前 lifter 和当前输入
+                    reusable = lift_output_reusable(file_path, output_file_path, lifter_id)
+                else:
+                    reusable = file_exists_and_not_empty(output_file_path)
+                if reusable:
+                    skipped_count += 1
+                    continue
                 
             lift_tasks.append((file_path, output_file_path))
 

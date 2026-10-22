@@ -146,35 +146,44 @@ def canonicalize_passes_for_opt_level(opt_level: str) -> tuple[str, ...] | None:
 
 
 def sanitize_illegal_function_bitcasts(file_path: str, output_path: str) -> tuple[str | None, int]:
-    """Drop invalid lifted stores that bitcast integers into function values."""
+    """Drop invalid lifted stores that bitcast integers into function values.
+
+    SSA names are function-local, so the set of invalid values is reset at every
+    ``define``; a store in another function that reuses the same name is kept.
+    Lines are streamed to a temporary file instead of being held in memory.
+    """
     invalid_values = set()
-    output_lines = []
     removed = 0
+    sanitized_path = os.path.splitext(output_path)[0] + ".sanitized.ll"
+    ensure_directory(os.path.dirname(sanitized_path))
+    tmp_path = f"{sanitized_path}.tmp.{os.getpid()}"
 
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
-        for line in handle:
-            match = ILLEGAL_FUNCTION_BITCAST_RE.match(line)
-            if match:
-                invalid_values.add(match.group("name"))
-                removed += 1
-                continue
-
-            stripped = line.lstrip()
-            if invalid_values and stripped.startswith("store "):
-                if any(f" {name}," in line or f"\t{name}," in line for name in invalid_values):
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as handle, \
+                open(tmp_path, "w", encoding="utf-8") as out:
+            for line in handle:
+                stripped = line.lstrip()
+                if stripped.startswith("define "):
+                    invalid_values.clear()
+                match = ILLEGAL_FUNCTION_BITCAST_RE.match(line)
+                if match:
+                    invalid_values.add(match.group("name"))
                     removed += 1
                     continue
 
-            output_lines.append(line)
+                if invalid_values and stripped.startswith("store "):
+                    if any(f" {name}," in line or f"\t{name}," in line for name in invalid_values):
+                        removed += 1
+                        continue
 
-    if removed == 0:
-        return None, 0
-
-    sanitized_path = os.path.splitext(output_path)[0] + ".sanitized.ll"
-    ensure_directory(os.path.dirname(sanitized_path))
-    with open(sanitized_path, "w", encoding="utf-8") as handle:
-        handle.write("".join(output_lines))
-    return sanitized_path, removed
+                out.write(line)
+        if removed == 0:
+            return None, 0
+        os.replace(tmp_path, sanitized_path)
+        return sanitized_path, removed
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def marker_path_for_output(input_root: str, output_path: str, opt_level: str, arch: str) -> str:
