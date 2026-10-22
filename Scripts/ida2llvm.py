@@ -15,6 +15,7 @@ import ida_auto
 import idaapi
 import logging
 import struct
+from collections import Counter
 import numpy as np
 import traceback
 import sys
@@ -63,6 +64,8 @@ abi_size_cache = {}
 type_size_cache = {}
 target_data = None
 lift_stats = {"defined": 0, "failed": 0, "no_decompile": 0}
+# 因无法忠实翻译而被拒绝的函数，按原因计数（也计入 lift_stats["failed"]）
+unsupported_reasons = Counter()
 # 每个 binary 独立的 LLVM 类型上下文，避免同名结构体在同一进程处理多个 binary 时串用
 llvm_context = ir.Context()
 # 全局数据项地址 -> ir.GlobalVariable，用于把指针初始值解析成符号引用
@@ -175,6 +178,7 @@ def _reset_lift_state():
     type_size_cache.clear()
     for key in lift_stats:
         lift_stats[key] = 0
+    unsupported_reasons.clear()
     target_data = None
     llvm_context = ir.Context()
     global_by_ea.clear()
@@ -929,6 +933,7 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
                     builder.ret_void()
                 else:
                     builder.ret(builder.load(res.lvars["funcresult"]))
+        _finalize_nodefault_switches(res, builder)
         stack_slot = res.lvars.get("stack")
         if stack_slot is not None:
             # .cold 等拆分出的函数片段会访问父函数栈帧，fullsize 不一定覆盖全部访问
@@ -944,6 +949,8 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
             del res.stack_size
         with suppress(AttributeError):
             del res.stack_extent
+        with suppress(AttributeError):
+            del res.nodefault_switches
         for blk in res.blocks:
             with suppress(AttributeError):
                 del blk.next_blk
@@ -1770,13 +1777,44 @@ def _handle_comparison(l, r, d, cmp_op, blk, builder, ida_insn, signed=False):
     return _store_as(result, d, blk, builder)
 
 
+class UnsupportedMicrocode(RuntimeError):
+    """无法忠实翻译的 microcode：拒绝整个函数（走失败路径并按 reason 计数），不编造语义。"""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+
+
 def _branch_target(builder, ida_insn, d, next_blk):
     target_blk = _resolve_block_target(builder.block.parent, ida_insn.d)
     if target_blk is not None:
         return target_blk
-    if not isinstance(d, ir.Block) and next_blk is not None:
-        return next_blk
-    return d
+    if isinstance(d, ir.Block):
+        return d
+    # 不能把无法解析的跳转目标替换成下一个块，那会编造一条 CFG 边
+    raise UnsupportedMicrocode("jcc_unresolved_target", ida_insn.dstr())
+
+
+def _freeze_undef(builder: ir.IRBuilder, typ: ir.Type) -> ir.Value:
+    """freeze undef：一个未知但在各次使用间保持一致的值（llvmlite 没有 freeze 构造器）。"""
+    inst = ir.instructions.Instruction(builder.block, typ, "freeze", [ir.Constant(typ, ir.Undefined)])
+    builder._insert(inst)
+    return inst
+
+
+def _finalize_nodefault_switches(func: ir.Function, builder: ir.IRBuilder):
+    """
+    Hex-Rays 只在 case 覆盖所有可达索引值时省略 jtbl 的 default（前驱已做范围检查或索引被掩码），
+    此时 default 不可达。函数体提升完再追加 unreachable 块，避免打乱 mba 块号与出口块。
+    """
+    switches = getattr(func, "nodefault_switches", None)
+    if not switches:
+        return
+    unreachable_blk = func.append_basic_block(name="jtbl.nodefault")
+    with builder.goto_block(unreachable_blk):
+        builder.unreachable()
+    for switch in switches:
+        switch.default = unreachable_blk
 
 
 def _handle_conditional_jump(l, r, d, next_blk, cmp_op, builder, ida_insn, signed=False):
@@ -1829,11 +1867,11 @@ def _shift_carry_bit(l, r, builder, ida_insn, left):
 
 
 # 只有地址/段选择子语义、值不会被使用的操作数，不需要提升
-_SKIP_L_OPS = {ida_hexrays.m_ldx, ida_hexrays.m_icall, ida_hexrays.m_nop, ida_hexrays.m_und, ida_hexrays.m_ext}
-_SKIP_R_OPS = {ida_hexrays.m_stx, ida_hexrays.m_ijmp, ida_hexrays.m_nop, ida_hexrays.m_und, ida_hexrays.m_ext}
+_SKIP_L_OPS = {ida_hexrays.m_ldx, ida_hexrays.m_icall, ida_hexrays.m_nop, ida_hexrays.m_und}
+_SKIP_R_OPS = {ida_hexrays.m_stx, ida_hexrays.m_ijmp, ida_hexrays.m_nop, ida_hexrays.m_und}
 # 这些指令的 d 操作数是值（地址/调用信息），而不是写入目标
 _D_AS_VALUE_OPS = {ida_hexrays.m_call, ida_hexrays.m_icall, ida_hexrays.m_stx}
-_SKIP_D_OPS = {ida_hexrays.m_nop, ida_hexrays.m_und, ida_hexrays.m_ext}
+_SKIP_D_OPS = {ida_hexrays.m_nop}
 
 _INT_BINARY_OPS = {
     ida_hexrays.m_mul: "mul",
@@ -1878,15 +1916,81 @@ _FLOAT_BINARY_OPS = {
     ida_hexrays.m_fmul: "fmul",
     ida_hexrays.m_fdiv: "fdiv",
 }
-_NO_OP_OPS = {ida_hexrays.m_nop, ida_hexrays.m_ijmp, ida_hexrays.m_push, ida_hexrays.m_pop, ida_hexrays.m_und, ida_hexrays.m_ext}
+# 真正的空操作。m_ijmp / m_push / m_pop / m_und / m_ext 需要建模或拒绝，不能当作空操作
+_NO_OP_OPS = {ida_hexrays.m_nop}
+# 需要栈指针 / 跳转目标模型、lifter 无法忠实翻译的指令
+_REJECT_OPS = {ida_hexrays.m_ijmp: "m_ijmp", ida_hexrays.m_push: "m_push", ida_hexrays.m_pop: "m_pop"}
+
+
+_AGGREGATE_TYPES = (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)
+
+
+def _callinfo_signature(ida_insn, args, result_type) -> ir.FunctionType:
+    """
+    间接调用 / 无类型被调目标的调用签名，取自 microcode 的 mcallinfo：
+    返回类型（外层指令要求的值类型优先）、固定参数个数（solid_args）和是否变参。
+    聚合返回值、多返回寄存器、缺少调用信息时明确拒绝，不猜一个通用类型。
+    """
+    d_mop = ida_insn.d
+    if d_mop is None or d_mop.t != ida_hexrays.mop_f:
+        raise UnsupportedMicrocode("call_without_callinfo", ida_insn.dstr())
+    callinfo = d_mop.f
+    if callinfo.retregs.size() > 1:
+        raise UnsupportedMicrocode("call_multi_retregs", ida_insn.dstr())
+    if result_type is not None:
+        ret_type = result_type
+    else:
+        tif = callinfo.return_type
+        if tif is None or tif.empty():
+            raise UnsupportedMicrocode("call_unknown_return_type", ida_insn.dstr())
+        ret_type = lift_tif(tif)
+    if isinstance(ret_type, _AGGREGATE_TYPES):
+        # 聚合返回值的 ABI（sret / 多寄存器）无法从按值返回的 LLVM 类型推出
+        raise UnsupportedMicrocode("call_aggregate_return", ida_insn.dstr())
+    var_arg = bool(callinfo.is_vararg())
+    fixed = min(int(callinfo.solid_args), len(args)) if var_arg else len(args)
+    return ir.FunctionType(ret_type, [arg.type for arg in args[:fixed]], var_arg=var_arg)
+
+
+def _store_call_result(ret, rets, ftype, blk, builder):
+    if isinstance(ftype.return_type, ir.VoidType):
+        return
+    for dst in rets:
+        _store_as(ret, dst, blk, builder)
+
+
+def _lift_ext(ida_insn, l, r, d, blk, builder):
+    """
+    m_ext（未转成 microcode 的机器指令，如 tzcnt、VIA PadLock）：建模为调用一个未知外部函数。
+    LLVM 视未知外部调用为可读写任意内存、有任意副作用，是保守而非丢弃副作用的模型。
+    """
+    module = blk.parent.parent
+    mnemonic = ""
+    with suppress(Exception):
+        mnemonic = idc.print_insn_mnem(ida_insn.ea) or ""
+    name = "__ida_ext_" + _sanitize_symbol_name(mnemonic or "unknown")
+    args = [v for v in (l, r) if v is not None and not isinstance(v, ir.Block)]
+    has_result = d is not None and ida_insn.d.size > 0
+    ret_type = ir.IntType(ida_insn.d.size * 8) if has_result else ir.VoidType()
+    fnty = ir.FunctionType(ret_type, [arg.type for arg in args])
+    callee = module.globals.get(name)
+    if not isinstance(callee, ir.Function):
+        if callee is not None:
+            name = module.get_unique_name(name)
+        callee = ir.Function(module, fnty, name)
+    target = callee if callee.function_type == fnty else typecast(callee, fnty.as_pointer(), builder)
+    ret = builder.call(target, args)
+    if has_result:
+        _store_as(ret, d, blk, builder)
+    return ret
 
 
 def _lift_call(ida_insn, l, d, blk, builder, result_type):
     rets, args = d
     if not isinstance(l.type, ir.PointerType) or not isinstance(l.type.pointee, ir.FunctionType):
-        call_ret_type = result_type if result_type is not None else i8ptr
-        new_func_type = ir.FunctionType(call_ret_type, [arg.type for arg in args], var_arg=False).as_pointer()
-        l = typecast(l, new_func_type, builder)
+        # 被调目标没有函数类型：签名来自 mcallinfo，不再统一假定返回 i8*
+        ftype = _callinfo_signature(ida_insn, args, result_type)
+        l = typecast(l, ftype.as_pointer(), builder)
     else:
         ftype = l.type.pointee
         if (
@@ -1913,8 +2017,7 @@ def _lift_call(ida_insn, l, d, blk, builder, result_type):
         # 可变参数函数：多出来的实参原样传入
 
     ret = builder.call(l, args)
-    for dst in rets:
-        _store_as(ret, dst, blk, builder)
+    _store_call_result(ret, rets, l.type.pointee, blk, builder)
     return ret
 
 
@@ -1997,9 +2100,7 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
             return builder.branch(target_blk)
         if isinstance(l, ir.Block):
             return builder.branch(l)
-        if next_blk is not None:
-            return builder.branch(next_blk)
-        return
+        raise UnsupportedMicrocode("goto_unresolved_target", ida_insn.dstr())
     elif op == ida_hexrays.m_jcnd:  # jcnd   l,    d   d is mop_v or mop_b
         if _is_fp_type(l.type):
             l = builder.bitcast(l, ir.IntType(_fp_bits(l.type)))
@@ -2028,6 +2129,15 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         return
     elif op in _NO_OP_OPS:
         return
+    elif op in _REJECT_OPS:
+        raise UnsupportedMicrocode(_REJECT_OPS[op], ida_insn.dstr())
+    elif op == ida_hexrays.m_und:  # und d：d 的值变为未定义
+        if d is not None:
+            slot = dedereference(d)
+            _store_as(_freeze_undef(builder, slot.type.pointee), slot, blk, builder)
+        return
+    elif op == ida_hexrays.m_ext:  # ext in1, in2, out1：外部机器指令
+        return _lift_ext(ida_insn, l, r, d, blk, builder)
     elif op == ida_hexrays.m_ldc:  # ldc  l=const,d   加载常量
         value = ir.Constant(ir.IntType(l_mop.size * 8), l_mop.nnn.value)
         return _store_as(value, d, blk, builder)
@@ -2095,21 +2205,26 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         return _store_as(l, d, blk, builder)
     elif op == ida_hexrays.m_jtbl:  # jtbl   l, r=mcases    Table jump
         l = _as_int(l, l_mop.size, builder)
-        blocks = blk.parent.basic_blocks
-        default = r["default"] if "default" in r else r[next(iter(r))]
-        switch = builder.switch(l, blocks[default])
+        func = blk.parent
+        blocks = func.basic_blocks
+        if "default" in r:
+            switch = builder.switch(l, blocks[r["default"]])
+        else:
+            # 没有 default：先占位，函数提升完后由 _finalize_nodefault_switches 指向 unreachable 块
+            switch = builder.switch(l, blocks[r[next(iter(r))]])
+            if not hasattr(func, "nodefault_switches"):
+                func.nodefault_switches = []
+            func.nodefault_switches.append(switch)
         for value, target in r.items():
             if isinstance(value, int):
                 switch.add_case(value, blocks[target])
         return switch
     elif op == ida_hexrays.m_icall:  # icall  {l=sel, r=off} d    间接调用
         rets, args = d
-        ret_type = result_type if result_type is not None else i8ptr
-        ftype = ir.FunctionType(ret_type, [arg.type for arg in args])
+        ftype = _callinfo_signature(ida_insn, args, result_type)
         f = typecast(r, ftype.as_pointer(), builder)
         ret = builder.call(f, args)
-        for dst in rets:
-            _store_as(ret, dst, blk, builder)
+        _store_call_result(ret, rets, ftype, blk, builder)
         return ret
     elif op == ida_hexrays.m_f2i or op == ida_hexrays.m_f2u:  # 浮点 -> (无符号)整数
         l = typecast(l, float_type(l_mop.size), builder)
@@ -2262,7 +2377,7 @@ class BIN2LLVMController():
         if not isinstance(func, ir.Function) or getattr(func, "_streamed_definition", False):
             return
         func.blocks.clear()
-        for attr in ("lvars", "block_by_ea", "stack_size", "stack_extent"):
+        for attr in ("lvars", "block_by_ea", "stack_size", "stack_extent", "nodefault_switches"):
             with suppress(AttributeError):
                 delattr(func, attr)
 
@@ -2297,6 +2412,8 @@ class BIN2LLVMController():
             self._stream_function_if_enabled(lifted)
         except Exception as e:
             lift_stats["failed"] += 1
+            if isinstance(e, UnsupportedMicrocode):
+                unsupported_reasons[e.reason] += 1
             logging.debug(f"在 {hex(ea)} 处提升函数失败: {e}")
             self._drop_partial_definition(ea)
         finally:
@@ -2721,6 +2838,7 @@ def main(
         bin2llvm.finish_stream_to_file()
         print(
             f"lift stats: defined={lift_stats['defined']} failed={lift_stats['failed']} "
+            f"unsupported={','.join(f'{k}:{v}' for k, v in sorted(unsupported_reasons.items())) or 'none'} "
             f"no_decompile={lift_stats['no_decompile']}",
             file=sys.stderr,
         )
