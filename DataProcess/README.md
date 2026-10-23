@@ -3,7 +3,7 @@
 生产流程只保留一条：读取 GraphBuilder 的 `results.db`，生成 token/CFG/DDG，再保存 Hugging Face dataset。
 
 ```bash
-uv run --locked --extra pipeline python -m DataProcess.cli \
+uv run --locked --extra pipeline python -m DataProcess \
   IR/Dataset-2-IR IR/Dataset-2/db2_raw_dataset \
   --num-processes 32 \
   --tokenizer-path Tokenizer/output_tokenizer/llvm_ir_bpe.json
@@ -22,14 +22,14 @@ uv run --locked --extra pipeline python -m DataProcess.cli \
 
 ## 实现
 
-- `cli.py`：命令行入口。
-- `dataset_builder_new.py`：临时工作目录、完整保存和最终发布。
-- `parallel_processor.py`：按路径排序流式读取数据库，worker 初始化 tokenizer，最多保留 worker 数两倍的待处理任务。
+- `__main__.py`：包入口，直接运行 `python -m DataProcess`。
+- `cli.py`：命令行参数定义。
+- `builder.py`：HF schema、按路径排序读取数据库、worker 初始化与有界调度、完整保存和最终发布。
 - `file_processor.py`：单函数 token 与图生成，合法空图不等于失败。
-- `dataset_features.py` / `processing_result.py`：数据格式与单样本结果。
+- `processing_result.py`：供单文件处理器与构建器交换数据的结果类型。
 - `dataset_utils.py`：仍供 GraphBuilder 使用，不属于已删除的输出模式。
-- `dataset_wash.py`：独立的下游清洗与截断步骤，本次未改。
-- `hf_dataset_player.py`：只读检查工具，不是另一条数据生成路径。
+- `wash.py`：独立的下游清洗与截断入口，运行 `python -m DataProcess.wash`；本次只改名，不改算法。
+- 已删除无调用方的 `hf_dataset_player.py`；交互式查看直接使用 `datasets.load_from_disk()`。
 
 新数据按输入路径确定行序，不再随 worker 完成顺序变化。重新生成后应重新生成 final_set、positive map 和 embedding，不能复用依赖旧行号的缓存。
 

@@ -4,7 +4,7 @@ from pathlib import Path
 import typer
 
 from Utils.utils import DEFAULT_TOKENIZER_PATH
-from .dataset_builder_new import DatasetBuilder
+from .builder import DatasetBuilder
 
 app = typer.Typer(help="Build a Hugging Face dataset from generated IR graphs.", add_completion=False)
 

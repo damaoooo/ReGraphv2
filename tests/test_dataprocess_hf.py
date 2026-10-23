@@ -2,6 +2,7 @@
 from pathlib import Path
 import sqlite3
 import sys
+import subprocess
 
 import datasets
 import pytest
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from DataProcess.cli import app
-from DataProcess.dataset_builder_new import DatasetBuilder
+from DataProcess.builder import DatasetBuilder
 from GraphBuilder.graph_generator import init_database, process_one_file
 from Utils.utils import DEFAULT_TOKENIZER_PATH, DEFAULT_CFG_SO_PATH, DEFAULT_DDG_SO_PATH, DEFAULT_PURIFY_SO_PATH
 
@@ -36,7 +37,7 @@ def graph_database(tmp_path):
 
 
 def test_same_hf_data_for_one_and_two_workers(graph_database, tmp_path):
-    from DataProcess import parallel_processor
+    from DataProcess import builder as parallel_processor
     # Multiple chunks exercise ordered multiprocessing, not just a single task.
     original = parallel_processor.CHUNK_SIZE
     parallel_processor.CHUNK_SIZE = 1
@@ -65,7 +66,7 @@ def test_existing_dataset_is_not_overwritten(graph_database, tmp_path):
 
 
 def test_save_failure_propagates_and_does_not_publish(graph_database, tmp_path, monkeypatch):
-    import DataProcess.dataset_builder_new as builder_module
+    import DataProcess.builder as builder_module
     class BrokenDataset:
         def save_to_disk(self, path):
             raise OSError('disk full')
@@ -84,6 +85,15 @@ def test_cli_only_exposes_single_output_mode():
         assert removed_option not in result.stdout
 
 
+def test_package_entrypoint():
+    result = subprocess.run(
+        [sys.executable, '-m', 'DataProcess', '--help'],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert 'INPUT_DIR OUTPUT_DIR' in result.stdout
+
+
 def test_empty_database_fails_without_publishing(tmp_path):
     db = tmp_path/'results.db'
     init_database(str(db))
@@ -94,7 +104,7 @@ def test_empty_database_fails_without_publishing(tmp_path):
 
 
 def test_single_worker_initializes_once_for_multiple_chunks(monkeypatch):
-    from DataProcess import parallel_processor as processor
+    from DataProcess import builder as processor
     initializations = []
     monkeypatch.setattr(processor, 'initialize_worker', initializations.append)
     monkeypatch.setattr(processor, 'iter_database_chunks', lambda path: iter([[1], [2], [3]]))
@@ -104,7 +114,7 @@ def test_single_worker_initializes_once_for_multiple_chunks(monkeypatch):
 
 
 def test_parallel_submissions_are_bounded_and_ordered(monkeypatch):
-    from DataProcess import parallel_processor as processor
+    from DataProcess import builder as processor
     outstanding = 0
     peak = 0
 

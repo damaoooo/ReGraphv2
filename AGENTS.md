@@ -37,7 +37,7 @@ lsp_start_server(server_id="bash", workspace_root="/home/damaoooo/Downloads/regr
 - `Scripts/task2_reoptimize.py`: `.ll -> .bc`，支持 `O0/O1/O2/O3/Os/Og/Oz/Oc`，其中 `Oc` 是论文使用的保守 canonicalization pass 组合。
 - `Scripts/task3_extract.py`: 对 `.bc` 调 `Scripts/split_llvm_ir.sh` 提取函数级 IR。
 - `Scripts/task4_recompile.py`: `.bc -> .re`，用于把优化后的 bitcode 重新编译成可执行/对象侧产物。
-- `DataProcess/`: 从函数级 LLVM IR 构建 HuggingFace dataset，仅保留 HF 输出路径。`cli.py` 是 Typer CLI，`dataset_builder_new.py` 管理完整数据集发布，`parallel_processor.py` 流式读取 results.db、初始化 worker 并有界提交任务，`file_processor.py` 生成 token、CFG、DDG。
+- `DataProcess/`: 从函数级 LLVM IR 构建 HuggingFace dataset，仅保留 HF 输出路径。`cli.py` 是 Typer CLI，`builder.py` 集中数据格式、worker 调度与完整数据集发布，`file_processor.py` 生成 token、CFG、DDG；`wash.py` 是独立清洗入口。
 - `GraphBuilder/`: Python 图生成与解析。`cfg_graph_builder.py` 输出 `(src_start, src_end, dst_start, dst_end, probability)`，`ddg_graph_builder.py` 输出 `(src_start, src_end, dst_start, dst_end)`。
 - `LLVMTools/`: CFG/DDG、MetaRemover 和 split_funcs 的 C++ 源码与统一 CMake 入口。执行 `cmake -S LLVMTools -B LLVMTools/build -DCMAKE_BUILD_TYPE=Release` 和 `cmake --build LLVMTools/build -j 4`；插件在 `build/lib/`，可执行文件在 `build/bin/`。提取驱动为 `Scripts/split_functions.py`。
 - `Tokenizer/`: LLVM IR tokenizer、normalizer 和 tokenizer 文件。
@@ -159,7 +159,7 @@ Scripts/task2_reoptimize.py
 Scripts/task3_extract.py
 Scripts/task4_recompile.py
 DataProcess/cli.py
-DataProcess/dataset_builder_new.py
+DataProcess/builder.py
 DataProcess/file_processor.py
 GraphBuilder/cfg_graph_builder.py
 GraphBuilder/ddg_graph_builder.py
