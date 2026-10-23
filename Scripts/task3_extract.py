@@ -21,15 +21,48 @@ from pipeline_cache import (
     get_tool_identity,
     iter_completed_tasks,
 )
-from split_functions import configured_extractor_path, CHUNK_SIZE, MODULE_ID
+from split_functions import (configured_extractor_path, lift_state_path, verify_lift_state,
+                             CHUNK_SIZE, EXCLUDED_SEGMENTS, MODULE_ID)
 
 # Configuration
 EXTRACT_SCRIPT = str(Path(__file__).with_name('split_llvm_ir.sh'))
 
 app = typer.Typer()
 
-def build_extraction_signature(file_path: str) -> dict:
-    """Bind extracted functions to the input module and extraction tools."""
+def task1_backend(file_path: str) -> str | None:
+    """Backend in Task 1's completion record, if that record describes the current source `X.ll`."""
+    source = Path(file_path).with_suffix('.ll')
+    try:
+        record = json.loads(Path(str(source) + '.task1.done.json').read_text())
+        if record['output_sha256'] != compute_file_sha256(source):
+            return None
+        return record['signature']['config']['backend']
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def resolve_segment_filter(file_path: str) -> tuple[list[str], dict]:
+    """How EXCLUDED_SEGMENTS are left out of one module: (extractor arguments, audit record).
+
+    Fresh extraction and resume both decide here, so a source that no longer matches its records fails
+    both. IDA lifts publish a lift state with segments; the Ghidra backend publishes none, so its modules
+    are extracted unfiltered and the record says so. Anything unverifiable is an error.
+    """
+    lift_state = lift_state_path(Path(file_path))
+    if lift_state.exists():
+        verify_lift_state(lift_state, Path(file_path))
+        return (['--lift-state', str(lift_state)],
+                {'applied': True, 'lift_state_sha256': compute_file_sha256(lift_state)})
+    if task1_backend(file_path) == 'ghidra':
+        return ['--no-segment-filter'], {'applied': False, 'reason': 'ghidra backend records no segments'}
+    raise ValueError(f'{lift_state} is missing and no Task 1 record of the current source names the '
+                     'ghidra backend; re-run Task 1')
+
+
+def build_extraction_signature(file_path: str, segment_filter: dict | None = None) -> dict:
+    """Bind extracted functions to the input module, its segment filter, and the tools."""
+    if segment_filter is None:
+        segment_filter = resolve_segment_filter(file_path)[1]
     compiled_extractor = configured_extractor_path()
     extractor_stat = compiled_extractor.stat() if compiled_extractor.exists() else None
     extraction_config = {
@@ -40,6 +73,8 @@ def build_extraction_signature(file_path: str) -> dict:
         ),
         'chunk_size': CHUNK_SIZE,
         'module_id': MODULE_ID,
+        'segment_filter': segment_filter,
+        'excluded_segments': sorted(EXCLUDED_SEGMENTS),
     }
     return build_input_signature(file_path, extraction_config)
 
@@ -67,13 +102,17 @@ def is_extraction_complete(file_path: str, output_path: str) -> bool:
 
 def extract_functions(file_path: str, output_path: str) -> tuple[bool, str, str]:
     """Extract into a staging directory, then publish the complete function set."""
-    expected_signature = build_extraction_signature(file_path)
+    try:
+        segment_filter_arguments, segment_filter = resolve_segment_filter(file_path)
+        expected_signature = build_extraction_signature(file_path, segment_filter)
+    except ValueError as error:
+        return False, '', str(error)
     output_directory = Path(output_path)
     staging_directory = Path(tempfile.mkdtemp(prefix='.extract-', dir=output_directory.parent))
     backup_directory = output_directory.with_name(f'.{output_directory.name}.previous')
     try:
         command = ['env', f'REGRAPH_PYTHON={sys.executable}', 'bash', EXTRACT_SCRIPT,
-                   file_path, str(staging_directory)]
+                   file_path, str(staging_directory), *segment_filter_arguments]
         success, stdout, stderr = run_command(command, f"Extracting functions from {file_path}")
         if not success:
             return success, stdout, stderr
@@ -82,7 +121,8 @@ def extract_functions(file_path: str, output_path: str) -> tuple[bool, str, str]
             path.name: compute_file_sha256(path)
             for path in staging_directory.iterdir() if path.is_file()
         }
-        completion_record = {'signature': expected_signature, 'files': file_checksums}
+        completion_record = {'signature': expected_signature, 'files': file_checksums,
+                             'segment_filter': segment_filter}
         (staging_directory / '.complete.json').write_text(json.dumps(completion_record))
 
         # Move the previous set aside before publishing; only complete sets are visible.

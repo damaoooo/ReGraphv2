@@ -532,6 +532,12 @@ def _is_extern_segment(ea) -> bool:
     return _get_segtype_cached(ea) == ida_segment.SEG_XTRN
 
 
+def _segment_name(ea) -> str | None:
+    """ea 所在段的名字（如 .text、.plt），写入状态文件供下游按段筛选。"""
+    seg = ida_segment.getseg(ea)
+    return ida_segment.get_segm_name(seg) if seg else None
+
+
 def _tif_cache_key(tif: ida_typeinf.tinfo_t, width: int = -1):
     """为 IDA tinfo 生成保守缓存键；失败时禁用该次缓存。"""
     try:
@@ -1459,8 +1465,7 @@ def _read_bytes(ea: int, size: int):
         return b"\x00" * size
     lift_stats["unresolved_data"] += 1
     if len(unresolved_data_items) < 1000:
-        seg = ida_segment.getseg(ea)
-        unresolved_data_items.append({"ea": hex(ea), "size": size, "segment": ida_segment.get_segm_name(seg) if seg else None})
+        unresolved_data_items.append({"ea": hex(ea), "size": size, "segment": _segment_name(ea)})
     return None
 
 
@@ -3604,7 +3609,8 @@ class BIN2LLVMController():
         :param ea: 要提升的函数的有效地址
         """
         current_approx.clear()
-        record = {"ea": hex(ea), "name": self._get_name(ea)}
+        # segment 让 Task 3 按段排除非样本函数（PLT 跳板、.init/.fini）；IR 里照常定义，其他函数仍调用它们
+        record = {"ea": hex(ea), "name": self._get_name(ea), "segment": _segment_name(ea)}
         try:
             # Scan original instructions, including ones that disappear before
             # LVARS. Linear in function size; retain no per-instruction cache.

@@ -1,5 +1,8 @@
 """Small real-LLVM regressions for orchestration and restart safety."""
+import hashlib
+import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -27,7 +30,17 @@ def source(tmp_path):
 
 
 def write_ir(path, value):
-    path.write_text(f'target triple = "x86_64-unknown-linux-gnu"\ndefine i32 @probe() {{ ret i32 {value} }}\n')
+    write_module(path, f'target triple = "x86_64-unknown-linux-gnu"\ndefine i32 @probe() {{ ret i32 {value} }}\n')
+
+
+def write_module(path, text):
+    """Write a hand-made module with the lift state an IDA lift would publish (every function in .text)."""
+    path.write_text(text)
+    functions = [{'name': name, 'llvm_name': name, 'status': 'lifted', 'segment': '.text'}
+                 for name in re.findall(r'^define [^@]*@(\w+)\(', text, re.M)]
+    state = {'schema': 1, 'status': 'ok', 'functions': functions,
+             'output': {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}}
+    Path(str(path) + '.lift.json').write_text(json.dumps(state))
 
 
 def reopt(source, *args):
@@ -101,16 +114,16 @@ def test_extraction_refresh_partial_resume_and_removed_functions(source):
 
 
 def test_empty_module_extraction(source):
-    source.write_text('target triple = "x86_64-unknown-linux-gnu"\n')
+    write_module(source, 'target triple = "x86_64-unknown-linux-gnu"\n')
     reopt(source)
     result = run('task3_extract.py', '--input-path', source.parent, '--workers', 1)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_internal_and_weak_functions_are_extracted(source):
-    source.write_text('target triple = "x86_64-unknown-linux-gnu"\n'
-                      'define internal i32 @hidden() { ret i32 1 }\n'
-                      'define weak i32 @weak_func() { ret i32 2 }\n')
+    write_module(source, 'target triple = "x86_64-unknown-linux-gnu"\n'
+                         'define internal i32 @hidden() { ret i32 1 }\n'
+                         'define weak i32 @weak_func() { ret i32 2 }\n')
     reopt(source)
     result = run('task3_extract.py', '--input-path', source.parent, '--workers', 1)
     assert result.returncode == 0, result.stdout + result.stderr

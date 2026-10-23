@@ -51,7 +51,7 @@ python Scripts/pipeline.py task3 --input-path IR/xxx --resume
 - task1 在 `--output` 下镜像输入目录结构；失败记录写到 `logs/lift_task1_log.txt`，`ida2llvm.py` 的详细日志写到 `logs/ida2llvm.log`。
 - **论文（SEC'27）用的是 `Oc`**（保守 canonicalization），生成训练/评估数据一律用 `--opt-level Oc`。
 - task2 在原目录把 `x.ll` 写成 `x.bc`；`--opt-level` 支持 `O0/O1/O2/O3/Os/Og/Oz/Oc`，`--arch auto` 按文件名推断 `-m32/-m64`。
-- task3 为每个 `x.bc` 生成 `x_functions/`。
+- task3 为每个 `x.bc` 生成 `x_functions/`，不提取 IDA 段名在 `EXCLUDED_SEGMENTS`（`Scripts/split_functions.py`）里的函数：PLT 跳板段（`.plt`、`.plt.got`、`.plt.sec`、`.iplt`、`.MIPS.stubs`）和编译器生成的 `.init`/`.fini`。这是显式名单，不是通用 thunk 识别。段名来自 lifter 写在 `x.ll.lift.json` 里的 `segment`；task3 校验该状态文件描述的是旁边的 `x.ll`（lift 成功、记录的输出校验值等于 `x.ll` 的内容，`x.ll` 必须存在），且所记函数都在 `x.bc` 里有定义、每个函数都有段名，否则报错；`x.bc` 是否由该 `x.ll` 优化而来由 task2 自己的完成记录和 resume 负责，task3 不另行证明。resume 与新提取使用同一套校验，`x.ll` 改动后两者都会拒绝旧结果。这些函数只在样本里去掉，`x.ll`/`x.bc` 保持 lift 出来的完整模块，其他函数仍调用它们。task1 完成记录（且其输出校验值等于当前 `x.ll`）标明 Ghidra 后端时，没有段信息，按不过滤提取；其他情况缺少状态文件时报错（需用当前 lifter 重跑 task1）。每个 `x_functions/.complete.json` 的 `segment_filter` 记录实际采用的策略。单独运行 `split_llvm_ir.sh x.bc out/ --lift-state x.ll.lift.json`（或显式 `--no-segment-filter`），输出目录须为空。
 - 所有任务都支持 `--resume` 和 `--workers`。
 
 ### 重跑与完整性
