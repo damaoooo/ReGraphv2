@@ -14,4 +14,4 @@ cd "${REPO_ROOT}"
 
 "${PYTHON[@]}" -m DataProcess.wash --dataset-path "${OUTPUT_PATH}/db2_raw_dataset" --output-path "${OUTPUT_PATH}/db2_wash_dataset" --tokenizer-path "Tokenizer/output_tokenizer/llvm_ir_bpe.json"
 
-"${PYTHON[@]}" -m Pretrain.split_train_validation "${OUTPUT_PATH}/db2_wash_dataset" --base-path "${DATASET_PATH}" --train-ratio 1.0 --output-dir "${OUTPUT_PATH}/db2_final_set"
+"${PYTHON[@]}" -m Pretrain.split_train_validation "${OUTPUT_PATH}/db2_wash_dataset" --base-path "${DATASET_PATH}" --train-ratio 1.0 --naming dataset2 --output-dir "${OUTPUT_PATH}/db2_final_set"

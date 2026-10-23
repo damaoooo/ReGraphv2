@@ -1,5 +1,7 @@
 import json
 import random
+import re
+from enum import Enum
 import networkx as nx
 from datasets import load_dataset
 import datasets
@@ -13,6 +15,30 @@ import os
 from typing import Dict, List, Any, Tuple
 import pickle
 import typer
+
+
+OPT_LEVEL = r'O0|O1|O2|O3|Os|Og|Oz|Ofast'
+# Per dataset: how a binary's directory name (without `_functions`) splits into its build variant and its
+# origin, the name with that variant removed. Functions that share (origin, function name) are positives;
+# a binary whose name does not follow its dataset's convention is left out.
+NAMING_CONVENTIONS = {
+    # <arch>-<compiler>-<version>-<opt>_<binary>, e.g. arm32-gcc-4.8-O0_clambc
+    'dataset1': (re.compile(rf'^(?P<config>[A-Za-z0-9_]+-[A-Za-z]+-[0-9.]+)-(?P<variant>{OPT_LEVEL})_(?P<binary>.+)$'),
+                 '{config}_{binary}'),
+    # <arch>-<bits>_<project>-<version>-<opt or obfuscation>_<binary>, e.g. x86-64_coreutils-8.32-subobf_join
+    'dataset2': (re.compile(r'^(?P<config>[A-Za-z0-9]+-(?:32|64)_.+?-[0-9][0-9.]*)-(?P<variant>[A-Za-z0-9]+)_(?P<binary>.+)$'),
+                 '{config}_{binary}'),
+    # BinaryCorp: <binary>-<opt>-<md5>, e.g. agensgraph-git-bloom.so-Os-3ad76dc09f4f95595f6989901b7f4dd7
+    'binarycorp': (re.compile(rf'^(?P<binary>.+)-(?P<variant>{OPT_LEVEL})-[0-9a-f]{{32}}$'), '{binary}'),
+}
+Naming = Enum('Naming', {name: name for name in NAMING_CONVENTIONS}, type=str)
+
+
+def parse_binary_directory(name: str, naming: str) -> Tuple[str, str] | None:
+    """(origin, build variant) of a binary directory name, or None if it does not follow the convention."""
+    pattern, origin = NAMING_CONVENTIONS[naming]
+    match = pattern.match(name)
+    return (origin.format(**match.groupdict()), match['variant']) if match else None
 
 
 def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, List[int]], function_info_df: pd.DataFrame, ratio: float = 0.9) -> None:
@@ -206,38 +232,31 @@ def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, Li
     final_validation_dataset.save_to_disk('validation_dataset_pool')
         
 
-def build_positive_indices(dataset: datasets.Dataset, base_path: str) -> Tuple[dict, pd.DataFrame]:
+def build_positive_indices(dataset: datasets.Dataset, base_path: str, naming: str) -> Tuple[dict, pd.DataFrame]:
     """
     构建正样本索引映射
     :param datasets: 包含函数的datasets.Dataset对象
     :param base_path: 数据集的基础路径
+    :param naming: NAMING_CONVENTIONS 中该数据集的命名规则
     :return: 正样本索引映射字典和包含function name的DataFrame
     """
     example_file = dataset[0]['file_path']
     df: pd.DataFrame = dataset.select_columns(['file_path']).to_pandas()
     df['original_idx'] = range(len(df))
 
-    def extract_binary_info_vectorized(file_paths: pd.Series) -> pd.DataFrame:
-        """向量化版本的信息提取"""
-        # 使用字符串方法进行批量操作
-        ll_names = file_paths.str.split('/').str[-1]
-        dir_names = file_paths.str.split('/').str[-3] + "/" + file_paths.str.split('/').str[-2]
-        origin_dir_names = dir_names.str.replace('_functions', '')
-        
-        # 批量分割和提取
-        split_parts = origin_dir_names.str.split('-')
-        binary_hashes = split_parts.str[-1]
-        opt_levels = split_parts.str[-2]
-        origin_binary_names = split_parts.apply(lambda x: '-'.join(x[:-2]) if len(x) > 2 else '')
-        
-        return pd.DataFrame({
-            'll_name': ll_names,
-            'opt_level': opt_levels,
-            'dir_name': dir_names,
-            'origin_binary_name': origin_binary_names
-        })
-
-    df[['ll_name', 'opt_level', 'dir_name', 'origin_binary_name']] = extract_binary_info_vectorized(df['file_path'])
+    path_parts = df['file_path'].str.split('/')
+    binary_directories = path_parts.str[-2].str.removesuffix('_functions')
+    parsed = {name: parse_binary_directory(name, naming) for name in binary_directories.unique()}
+    unmatched = sorted(name for name, result in parsed.items() if result is None)
+    if unmatched:
+        dropped = binary_directories.isin(unmatched).sum()
+        print(f"Dropping {dropped} functions of {len(unmatched)} binaries not named per '{naming}', "
+              f"e.g. {unmatched[:3]}")
+    df['ll_name'] = path_parts.str[-1]
+    df['dir_name'] = path_parts.str[-3] + "/" + path_parts.str[-2]
+    df['opt_level'] = binary_directories.map(lambda name: parsed[name] and parsed[name][1])
+    origins = binary_directories.map(lambda name: parsed[name] and parsed[name][0])
+    df['origin_binary_name'] = (path_parts.str[-3] + "/" + origins).where(origins.notna())
 
     grouped_by_dir_name = df.groupby('dir_name')
     processed_groups = []
@@ -283,7 +302,8 @@ def main(
     base_path: str = typer.Option("/home/damaoooo/Datasets/IR/small_test/small_test", help="Base path for function mapping CSV files"),
     train_ratio: float = typer.Option(0.9, help="Training set ratio (0.0-1.0)"),
     random_seed: int = typer.Option(42, help="Random seed for reproducibility"),
-    output_dir: str = typer.Option(".", help="Output directory for generated files")
+    output_dir: str = typer.Option(".", help="Output directory for generated files"),
+    naming: Naming = typer.Option(..., help="Binary naming convention of the dataset (see NAMING_CONVENTIONS)"),
 ):
     """
     Split dataset into train and validation sets while preserving function similarity relationships.
@@ -304,7 +324,7 @@ def main(
         
         # Build positive indices
         typer.echo("Building positive indices...")
-        positive_map, function_info_df = build_positive_indices(dataset, base_path)
+        positive_map, function_info_df = build_positive_indices(dataset, base_path, naming.value)
         
         # Split dataset
         typer.echo(f"Splitting dataset with train ratio: {train_ratio}")
