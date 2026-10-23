@@ -2,14 +2,14 @@
 
 ## Source
 
-- `Motivation/simple_add.c`
+- `paper/Motivation/simple_add.c`
 - Focus function: `example(int a, int b)`
 
 ## Setup
 
 - chosen binaries:
-  - `x86_64 -O1`: `Motivation/out/obj/simple_add_x86_O1.o`
-  - `aarch64 -O0`: `Motivation/out/obj/simple_add_arm64_O0.o`
+  - `x86_64 -O1`: `paper/Motivation/out/obj/simple_add_x86_O1.o`
+  - `aarch64 -O0`: `paper/Motivation/out/obj/simple_add_arm64_O0.o`
 - inline disabled during compilation with:
   - `-fno-inline -fno-inline-functions`
 - lifted with:
@@ -79,11 +79,11 @@ long example(int a, int b) {
 ## Artifact paths
 
 - asm:
-  - `Motivation/out/asm/simple_add_x86_O1.objdump.txt`
-  - `Motivation/out/asm/simple_add_arm64_O0.objdump.txt`
+  - `paper/Motivation/out/asm/simple_add_x86_O1.objdump.txt`
+  - `paper/Motivation/out/asm/simple_add_arm64_O0.objdump.txt`
 - lifted IR:
-  - `Motivation/out/ir/simple_add_x86_O1.ll`
-  - `Motivation/out/ir/simple_add_arm64_O0.ll`
+  - `paper/Motivation/out/ir/simple_add_x86_O1.ll`
+  - `paper/Motivation/out/ir/simple_add_arm64_O0.ll`
 - optimized IR:
-  - `Motivation/out/ir_o3/simple_add_x86_O1.O3.noinline.ll`
-  - `Motivation/out/ir_o3/simple_add_arm64_O0.O3.noinline.ll`
+  - `paper/Motivation/out/ir_o3/simple_add_x86_O1.O3.noinline.ll`
+  - `paper/Motivation/out/ir_o3/simple_add_arm64_O0.O3.noinline.ll`
