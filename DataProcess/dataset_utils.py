@@ -3,6 +3,7 @@ Utility functions for dataset building
 """
 import os
 import glob
+import multiprocessing
 from typing import List
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from rich.console import Console
@@ -94,7 +95,9 @@ class FileFilter:
             
             valid_files = []
             
-            with ProcessPoolExecutor(max_workers=self.num_processes) as executor:
+            # spawn, not fork: the progress bar's refresh thread is already running here
+            with ProcessPoolExecutor(max_workers=self.num_processes,
+                                     mp_context=multiprocessing.get_context('spawn')) as executor:
                 # 提交分块任务
                 future_to_chunk = {}
                 for i in range(0, len(file_paths), chunk_size):

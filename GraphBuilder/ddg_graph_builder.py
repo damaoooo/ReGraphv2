@@ -107,14 +107,14 @@ class DataDependencyGraphBuilder:
 
         return token_idx_start, token_idx_end
     
-    def _build_id_range_map(self, origin_ir: str):
+    def _build_id_range_map(self, origin_ir: str, normalized_origin=None, origin_encoding=None):
         """Pair the k-th instrumented instruction with the k-th instruction of the origin IR.
 
         The DDG pass only attaches metadata, so both files list the same instructions in the same order;
         locating an instruction by its text would pick the first of several identical instructions.
         Any disagreement between the two listings fails the function instead of producing wrong edges.
         """
-        original_normalized = normalize_file(origin_ir)
+        original_normalized = normalize_file(origin_ir) if normalized_origin is None else normalized_origin
         if not original_normalized:
             raise ValueError(f"empty normalized IR: {origin_ir}")
         origin_instructions = split_instructions(original_normalized)
@@ -123,7 +123,8 @@ class DataDependencyGraphBuilder:
                              f"origin IR has {len(origin_instructions)}")
 
         # Tokenize once and reuse for all mappings
-        offsets = self._get_tokenization_result(original_normalized)['offset_mapping']
+        encoding = origin_encoding or self._get_tokenization_result(original_normalized)
+        offsets = encoding['offset_mapping']
 
         for (instruct_number, instrumented_text), (start, end, text) in zip(self.instrumented_instructions,
                                                                           origin_instructions):
@@ -157,8 +158,8 @@ class DataDependencyGraphBuilder:
                 self.node_id_inst_id_map[node_id] = instruction_number
     
     def _extract_edges(self, graph: pgv.AGraph):
-        # Use set for automatic deduplication during construction
-        edges_set = set()
+        # Deduplicate in DOT order: iterating a set would order edges by string hashes, which differ per process
+        edges = {}
         
         for edge in graph.edges():
             src, dst = edge
@@ -166,10 +167,10 @@ class DataDependencyGraphBuilder:
             dst_inst_id = self.node_id_inst_id_map.get(dst)
 
             if src_inst_id is not None and dst_inst_id is not None:
-                edges_set.add((src_inst_id, dst_inst_id))
+                edges[(src_inst_id, dst_inst_id)] = None
 
         # Build matrix edges more efficiently
-        for src_inst_id, dst_inst_id in edges_set:
+        for src_inst_id, dst_inst_id in edges:
             src_range = self.id_range_map.get(src_inst_id)
             dst_range = self.id_range_map.get(dst_inst_id)
             
@@ -182,7 +183,13 @@ class DataDependencyGraphBuilder:
         """Clear tokenization cache to free memory"""
         self._tokenization_cache.clear()
     
-    def generate_ddg_matrix(self, dot_file: str, instrumented_file: str, origin_ir: str):
+    def generate_ddg_matrix(self, dot_file: str, instrumented_file: str, origin_ir: str,
+                            normalized_origin: str = None, origin_encoding=None):
+        """DDG edges as token spans of `origin_ir`.
+
+        `normalized_origin` / `origin_encoding` (tokenizer output with offsets) may be passed when the caller
+        already normalized and tokenized `origin_ir`, so the same text is not processed again.
+        """
         # Fresh state per function; the returned list must not be cleared by a later call
         self.matrix_edges = []
         self.normalized_instrumented_dict = {}
@@ -194,7 +201,7 @@ class DataDependencyGraphBuilder:
         
         # Build all necessary mappings
         self._build_instrumented_dict(instrumented_file)
-        self._build_id_range_map(origin_ir)
+        self._build_id_range_map(origin_ir, normalized_origin, origin_encoding)
         self._build_node_mapping(graph)
         
         # Extract edges and build matrix

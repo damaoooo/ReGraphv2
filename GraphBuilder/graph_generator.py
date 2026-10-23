@@ -26,6 +26,9 @@ FUNCTIONS_SUFFIX = '_functions'
 ARTIFACTS_SUFFIX = '_graphs'
 ARTIFACT_ENDINGS = ('_purified.ll', '_instrumented.ll', '.dot')
 CACHE_FORMAT = 2
+# Workers start with spawn: the parent already runs rich's progress-refresh thread when the pool starts, and
+# forking a multi-threaded process can leave a lock held forever in the child.
+MP_CONTEXT = multiprocessing.get_context('spawn')
 
 
 def artifact_dir_for(llvm_ir_path: str) -> str:
@@ -368,8 +371,8 @@ def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs:
     completed = _completed_inputs(db_path, valid_files)
     valid_files = [f for f in valid_files if f not in completed]
     console.print(f"[green]Filtered {len(valid_files)} files to process ({len(completed)} up to date).[/green]")
-    queue = multiprocessing.Manager().Queue()
-    writer_process = multiprocessing.Process(target=file_writer, args=(queue, db_path))
+    queue = MP_CONTEXT.Manager().Queue()
+    writer_process = MP_CONTEXT.Process(target=file_writer, args=(queue, db_path))
     writer_process.start()
 
     # Use multiprocessing to process files in parallel
@@ -388,7 +391,7 @@ def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs:
         TimeRemainingColumn()
     ) as progress:
 
-        pool = multiprocessing.Pool(processes=jobs)
+        pool = MP_CONTEXT.Pool(processes=jobs)
 
         task = progress.add_task("[cyan]Processing files...", total=len(valid_files))
         chunk_size = 100

@@ -24,36 +24,37 @@ class FileProcessor:
         self.logger = logging.getLogger(__name__)
         
             
-    def _generate_ddg(self, input_file, purified_file, instrumented_file: str, dot_file: str) -> Union[None, List[Tuple[int, int, int, int]]]:
+    def _generate_ddg(self, input_file, purified_file, instrumented_file: str, dot_file: str,
+                      normalized_ir: str, encoding) -> Union[None, List[Tuple[int, int, int, int]]]:
         """Generate DDG graph structure using purified IR"""
         try:
             builder = DataDependencyGraphBuilder(self.tokenizer)
-            ddg_graph = builder.generate_ddg_matrix(dot_file, instrumented_file, purified_file)
+            ddg_graph = builder.generate_ddg_matrix(dot_file, instrumented_file, purified_file, normalized_ir, encoding)
             return ddg_graph
         except Exception as e:
             self.logger.error(f"Error in DDG building for {input_file}: {e}")
             return None
             
-    def _generate_cfg(self, input_file: str, purified_file: str, dot_file: str) -> Union[None, List[Tuple[int, int, int, int, float]]]:
+    def _generate_cfg(self, input_file: str, purified_file: str, dot_file: str,
+                      normalized_ir: str, encoding) -> Union[None, List[Tuple[int, int, int, int, float]]]:
         """Generate CFG graph structure using purified IR"""
         try:
-            builder = CFGGraphBuilder(self.tokenizer, purified_file, dot_file)
+            builder = CFGGraphBuilder(self.tokenizer, purified_file, dot_file, normalized_ir, encoding)
             cfg_graph = builder.build_cfg_edges()
             return cfg_graph
         except Exception as e:
             self.logger.error(f"Error in CFG building for {input_file}: {e}")
             return None
 
-    def _generate_token_ids(self, input_file: str, purified_file: str) -> Optional[Tuple[List[int], List[int]]]:
-        """Generate token IDs and attention mask using purified IR"""
+    def _encode(self, input_file: str, purified_file: str) -> Optional[Tuple[str, object]]:
+        """Normalize and tokenize the purified IR once; tokens and both graphs index the same encoding."""
         try:
             normalized_ir = normalize_file(purified_file)
             # normalize_file returns "" when the file cannot be read; that is a failure, not an empty function
             if not normalized_ir.strip():
                 self.logger.error(f"Empty normalized IR for {input_file} ({purified_file})")
                 return None
-            tokens = self.tokenizer(normalized_ir)
-            return tokens['input_ids'], tokens['attention_mask']
+            return normalized_ir, self.tokenizer(normalized_ir, return_offsets_mapping=True)
         except Exception as e:
             self.logger.error(f"Error in tokenization for {input_file}: {e}")
             return None
@@ -76,18 +77,18 @@ class FileProcessor:
         temp_files = []
         
         try:
-            # Generate DDG using purified IR
-            ddg_graph = self._generate_ddg(input_file=input_file, purified_file=purified_file, instrumented_file=instrumented_file, dot_file=ddg_dot)
+            encoded = self._encode(input_file, purified_file)
+            if encoded is None:
+                return ProcessingResult(file_path=input_file, success=False)
+            normalized_ir, encoding = encoded
+            input_ids, attention_mask = encoding['input_ids'], encoding['attention_mask']
             
-            # Generate CFG using purified IR
-            cfg_graph = self._generate_cfg(input_file=input_file, purified_file=purified_file, dot_file=cfg_dot)
-            
-            # Generate tokens using purified IR
-            token_result = self._generate_token_ids(input_file=input_file, purified_file=purified_file)
-            input_ids, attention_mask = token_result if token_result else (None, None)
+            # Generate DDG and CFG as token spans of the same encoding
+            ddg_graph = self._generate_ddg(input_file, purified_file, instrumented_file, ddg_dot, normalized_ir, encoding)
+            cfg_graph = self._generate_cfg(input_file, purified_file, cfg_dot, normalized_ir, encoding)
             
             # A sample needs its tokens and both graphs; an empty edge list is a valid graph, None is a failure
-            success = ddg_graph is not None and cfg_graph is not None and input_ids is not None
+            success = ddg_graph is not None and cfg_graph is not None
             
             return ProcessingResult(
                 file_path=input_file,

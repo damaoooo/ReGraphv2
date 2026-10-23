@@ -186,10 +186,77 @@ def test_failed_function_leaves_no_row_and_no_artifacts(tools, tmp_path):
 
 
 def test_chunk_error_fails_the_run(tools, tmp_path, monkeypatch):
+    """A worker exception (here: the function file vanishes after it was listed) fails the whole run."""
     import GraphBuilder.graph_generator as generator
-    write_function(tmp_path / 'bin_functions', 'a', TWO_STORES)
+    function = write_function(tmp_path / 'bin_functions', 'a', TWO_STORES)
+    completed = generator._completed_inputs
 
-    def broken(path):
-        raise RuntimeError('worker crashed')
-    monkeypatch.setattr(generator, 'process_one_file', broken)
+    def remove_after_listing(db_path, valid_files):
+        function.unlink()
+        return completed(db_path, valid_files)
+    # Patched in the parent, which lists and schedules; spawned workers do not inherit patches
+    monkeypatch.setattr(generator, '_completed_inputs', remove_after_listing)
     assert generator.pipeline(str(tmp_path), cleanup=True, use_cache=False, jobs=1) is False
+
+
+MANY_EDGES = 'define i32 @many(ptr %p, i32 %x) {\nentry:\n' + ''.join(
+    f'  %a{i} = add i32 %x, {i}\n  store i32 %a{i}, ptr %p\n' for i in range(40)) + '  %v = load i32, ptr %p\n  ret i32 %v\n}\n'
+
+
+def test_ddg_edge_order_does_not_depend_on_the_hash_seed(tools, tmp_path):
+    """Edges used to come out of a set, so their order changed with PYTHONHASHSEED from process to process."""
+    import json
+    import os
+    import subprocess
+    from GraphBuilder.graph_generator import process_one_file
+    outputs = process_one_file(str(write_function(tmp_path / 'b_functions', 'many', MANY_EDGES)))
+    script = ('import json, sys; sys.path.insert(0, sys.argv[1])\n'
+              'from GraphBuilder.ddg_graph_builder import DataDependencyGraphBuilder\n'
+              'from Tokenizer.ir_tokenizer import load_tokenizer\n'
+              'from Utils.utils import DEFAULT_TOKENIZER_PATH\n'
+              'b = DataDependencyGraphBuilder(load_tokenizer(DEFAULT_TOKENIZER_PATH))\n'
+              'print(json.dumps(b.generate_ddg_matrix(*sys.argv[2:5])))\n')
+    runs = []
+    for seed in ('1', '2', '3'):
+        result = subprocess.run([sys.executable, '-c', script, str(ROOT), outputs[4], outputs[2], outputs[1]],
+                                env=dict(os.environ, PYTHONHASHSEED=seed), capture_output=True, text=True, check=True)
+        runs.append(json.loads(result.stdout.strip().splitlines()[-1]))
+    assert len(runs[0]) > 40 and runs[0] == runs[1] == runs[2]
+
+
+def test_cfg_binary_search_matches_a_linear_scan(tools):
+    from GraphBuilder.cfg_graph_builder import CFGGraphBuilder
+    text = 'define i32 @f() {\n"@0":\n  %a = add i32 1, 2\n  br label %"@1"\n"@1":\n  ret i32 %a\n}\n'
+    offsets = tools(text, return_offsets_mapping=True)['offset_mapping']
+
+    def linear(start_idx, end_idx):  # the previous implementation
+        token_start = token_end = None
+        for token_idx, (start, end) in enumerate(offsets):
+            if start == end:
+                continue
+            if token_start is None and end > start_idx:
+                token_start = token_idx
+            if start < end_idx:
+                token_end = token_idx
+            elif token_end is not None:
+                break
+        return None if token_start is None or token_end is None else (token_start, token_end)
+
+    index = CFGGraphBuilder._index_tokens(offsets)
+    for start in range(len(text) + 1):
+        for end in range(start, len(text) + 2):
+            assert CFGGraphBuilder._char_range_to_token_range(None, index, start, end) == linear(start, end), (start, end)
+
+
+def test_file_processor_shares_one_encoding_with_both_graphs(tools, tmp_path):
+    from DataProcess.file_processor import FileProcessor
+    from GraphBuilder.cfg_graph_builder import CFGGraphBuilder
+    from GraphBuilder.graph_generator import process_one_file
+    from Tokenizer.normalizer import normalize_file
+    source, purified, instrumented, cfg_dot, ddg_dot = process_one_file(
+        str(write_function(tmp_path / 'b_functions', 'pick', SWITCH)))
+    result = FileProcessor(tools).process_single_file(source, purified, instrumented, cfg_dot, ddg_dot)
+    assert result.success
+    assert result.input_ids == tools(normalize_file(purified))['input_ids']
+    assert result.cfg_graph == CFGGraphBuilder(tools, purified, cfg_dot).build_cfg_edges()
+    assert result.ddg_graph == DataDependencyGraphBuilder(tools).generate_ddg_matrix(ddg_dot, instrumented, purified)

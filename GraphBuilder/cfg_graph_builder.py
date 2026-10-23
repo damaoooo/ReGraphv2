@@ -1,3 +1,4 @@
+import bisect
 import re
 import pygraphviz as pgv
 from transformers import PreTrainedTokenizerFast
@@ -7,7 +8,8 @@ from Tokenizer.normalizer import normalize_file
 
 
 class CFGGraphBuilder:
-    def __init__(self, tokenizer: PreTrainedTokenizerFast, llvm_ir_path, dot_file_path):
+    def __init__(self, tokenizer: PreTrainedTokenizerFast, llvm_ir_path, dot_file_path,
+                 normalized_ir: str = None, encoding=None):
         """
         Initialize the CFG Graph Builder.
         
@@ -15,12 +17,14 @@ class CFGGraphBuilder:
             tokenizer: PreTrainedTokenizerFast instance for tokenization
             llvm_ir_path: Path to the LLVM IR file
             dot_file_path: Path to the dot graph file
+            normalized_ir / encoding: the caller's normalization of `llvm_ir_path` and its tokenizer output
+                with offsets, to avoid processing the same text again
         """
         self.llvm_ir_path = llvm_ir_path
         self.dot_file_path = dot_file_path
         
         self.tokenizer = tokenizer
-        self.normalized_ir = normalize_file(llvm_ir_path)
+        self.normalized_ir = normalize_file(llvm_ir_path) if normalized_ir is None else normalized_ir
         self.graph = self._read_dot_file()
         
         self.node_id_to_label = {}
@@ -33,7 +37,7 @@ class CFGGraphBuilder:
         self._probability_pattern = re.compile(r'(\d+(?:\.\d+)?)%')
         
         # Cache tokenization results
-        self._tokenized_cache = None
+        self._tokenized_cache = encoding
         
     def _read_dot_file(self):
         """Read and return the dot file as a graph."""
@@ -92,27 +96,25 @@ class CFGGraphBuilder:
             end_idx = block_positions[index + 1][1] if index + 1 < len(block_positions) else function_end
             self.label_to_char_range[label] = (start_idx, end_idx)
 
-    def _char_range_to_token_range(self, offset_mapping, start_idx: int, end_idx: int):
-        """Convert a character span to its token span."""
-        token_start = None
-        token_end = None
-
-        for token_idx, (start, end) in enumerate(offset_mapping):
-            if start == end:
-                continue
-
-            if token_start is None and end > start_idx:
-                token_start = token_idx
-
-            if start < end_idx:
-                token_end = token_idx
-            elif start >= end_idx and token_end is not None:
-                break
-
-        if token_start is None or token_end is None:
+    def _char_range_to_token_range(self, token_index, start_idx: int, end_idx: int):
+        """Convert a character span to its token span: first token ending after `start_idx`, last token
+        starting before `end_idx` (special tokens, which have empty offsets, are skipped)."""
+        indices, starts, ends = token_index
+        first = bisect.bisect_right(ends, start_idx)
+        last = bisect.bisect_left(starts, end_idx) - 1
+        if first == len(indices) or last < 0:
             return None
 
-        return token_start, token_end
+        return indices[first], indices[last]
+
+    @staticmethod
+    def _index_tokens(offset_mapping):
+        """Positions, starts and ends of the non-empty tokens, for binary search over a text's offsets."""
+        tokens = [(index, start, end) for index, (start, end) in enumerate(offset_mapping) if start != end]
+        indices, starts, ends = (list(column) for column in zip(*tokens)) if tokens else ([], [], [])
+        if starts != sorted(starts) or ends != sorted(ends):
+            raise ValueError("token offsets are not monotonic")
+        return indices, starts, ends
 
     def _map_labels_to_tokens(self):
         """Map CFG node labels to full basic block token spans."""
@@ -124,6 +126,7 @@ class CFGGraphBuilder:
         assert len(input_ids) == len(offset_mapping), "Input IDs and offset mapping lengths do not match."
 
         self._build_block_char_ranges()
+        token_index = self._index_tokens(offset_mapping)
 
         for label in set(self.node_id_to_label.values()):
             char_range = self.label_to_char_range.get(label)
@@ -131,7 +134,7 @@ class CFGGraphBuilder:
                 print(f"Basic block label '{label}' not found in normalized IR.")
                 continue
 
-            token_range = self._char_range_to_token_range(offset_mapping, char_range[0], char_range[1])
+            token_range = self._char_range_to_token_range(token_index, char_range[0], char_range[1])
             if token_range is None:
                 print(f"Unable to map basic block label '{label}' to tokens.")
                 continue
