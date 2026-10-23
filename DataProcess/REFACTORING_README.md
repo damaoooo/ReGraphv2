@@ -1,104 +1,40 @@
-# Dataset Builder Code Refactoring
+# DataProcess
 
-这个文件夹包含了重构后的 LLVM IR 数据集构建器代码。原来的单体数据集构建器超过1000行，现在被拆分成了更易管理的模块。
-
-## 文件结构
-
-### 核心模块
-
-1. **`dataset_features.py`** - 数据集特征定义
-   - 定义 HuggingFace 数据集的特征结构
-   - 包含 `get_dataset_features()` 函数
-
-2. **`processing_result.py`** - 处理结果数据类
-   - 定义 `ProcessingResult` 数据类
-   - 包含处理单个文件的结果信息
-
-3. **`file_processor.py`** - 单文件处理逻辑
-   - `FileProcessor` 类：处理单个 LLVM IR 文件
-   - 包含 DDG、CFG 生成和标记化逻辑
-   - 处理 opt 工具调用和临时文件清理
-
-4. **`parallel_processor.py`** - 并行处理逻辑
-   - `ParallelProcessor` 类：管理多进程处理
-   - 包含顺序、批量和并行处理方法
-   - HuggingFace 数据集创建的独立函数
-
-5. **`dataset_utils.py`** - 工具函数
-   - 文件搜索：`find_llvm_files()`
-   - 临时文件清理：`cleanup_residual_temp_files()`
-   - `FileFilter` 类：并行文件过滤
-
-6. **`dataset_builder_new.py`** - 主数据集构建器
-   - 重构后的 `DatasetBuilder` 类
-   - 整合所有组件的主要接口
-   - 向后兼容函数
-
-7. **`cli.py`** - 命令行界面
-   - Typer 基础的 CLI 实现
-   - 所有命令行参数和选项
-
-## 使用方式
-
-### 使用新的模块化代码
-
-```python
-from dataset_builder_new import DatasetBuilder
-from dataset_features import get_dataset_features
-from file_processor import FileProcessor
-
-# 创建数据集构建器
-builder = DatasetBuilder(
-    tokenizer=tokenizer,
-    tokenizer_path=tokenizer_path,
-    file_list=file_paths,
-    # ... 其他参数
-)
-
-# 处理数据集
-results = builder.process_dataset(output_path)
-```
-
-### 使用单个组件
-
-```python
-from file_processor import FileProcessor
-
-# 只处理单个文件
-processor = FileProcessor(
-    tokenizer=tokenizer,
-    ddg_so_path=ddg_so_path,
-    purify_so_path=purify_so_path,
-    cfg_so_path=cfg_so_path
-)
-result = processor.process_single_file(file_path)
-```
-
-### 命令行使用
+生产流程只保留一条：读取 GraphBuilder 的 `results.db`，生成 token/CFG/DDG，再保存 Hugging Face dataset。
 
 ```bash
-# 使用 CLI
-python cli.py directory /path/to/input /path/to/output.json
+uv run --locked --extra pipeline python -m DataProcess.cli \
+  IR/Dataset-2-IR IR/Dataset-2/db2_raw_dataset \
+  --num-processes 32 \
+  --tokenizer-path Tokenizer/output_tokenizer/llvm_ir_bpe.json
 ```
 
-## 重构的好处
+## 参数与输出
 
-1. **模块化**：每个文件都有明确的职责
-2. **可维护性**：更小的文件更容易理解和修改
-3. **可重用性**：组件可以独立使用
-4. **可测试性**：更容易对单个组件进行单元测试
-5. **可扩展性**：后续功能继续集中在模块化实现中
+- 输入目录必须包含 `results.db`，其中记录的图与 IR 文件必须可读取。
+- 输出目录必须不存在或为空，输出使用 `datasets.load_from_disk()` 读取。
+- `--num-processes/-p` 控制 worker 数，默认 CPU 核数；`-p 1` 使用相同处理函数，可用于定位失败样本。
+- `--tokenizer-path/-t` 指定 tokenizer。
+- 已删除 `--use-hf`、`--parallel`、`--batch-size`、`--no-cache`、`--no-cleanup`。不再支持 JSON 摘要输出、线程批处理或 PDWriter。
+- 不删除 GraphBuilder 的图与 IR 产物，不再使用 `progress.txt` 或文件列表缓存。
+- 当前不支持数据构建断点续跑；失败时不发布最终目录。修复问题后重跑，已有成功数据集需另选输出目录。
+- 单样本处理返回失败时会跳过并报告数量；数据库、worker、保存异常向上传递，全部样本无效也会失败。
 
-## 迁移指南
+## 实现
 
-如果要使用新的模块化代码：
+- `cli.py`：命令行入口。
+- `dataset_builder_new.py`：临时工作目录、完整保存和最终发布。
+- `parallel_processor.py`：按路径排序流式读取数据库，worker 初始化 tokenizer，最多保留 worker 数两倍的待处理任务。
+- `file_processor.py`：单函数 token 与图生成，合法空图不等于失败。
+- `dataset_features.py` / `processing_result.py`：数据格式与单样本结果。
+- `dataset_utils.py`：仍供 GraphBuilder 使用，不属于已删除的输出模式。
+- `dataset_wash.py`：独立的下游清洗与截断步骤，本次未改。
+- `hf_dataset_player.py`：只读检查工具，不是另一条数据生成路径。
 
-1. 直接从相应模块导入需要的类
-2. 使用 `dataset_builder_new.py` 中的 `DatasetBuilder` 类
-3. 使用 `cli.py` 进行命令行操作
+新数据按输入路径确定行序，不再随 worker 完成顺序变化。重新生成后应重新生成 final_set、positive map 和 embedding，不能复用依赖旧行号的缓存。
 
-## 开发建议
+## 回归
 
-- 新功能应该添加到相应的模块中
-- 保持每个模块的单一职责
-- 添加新功能时优先放在模块化实现中
+```bash
+uv run --locked --extra pipeline python -m pytest tests/test_dataprocess_hf.py -q
+```
