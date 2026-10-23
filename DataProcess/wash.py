@@ -1,5 +1,11 @@
-import datasets
 import os
+
+if __name__ == '__main__':
+    # Workers only use the tokenizer's ids; without this, transformers loads torch in every worker
+    os.environ.setdefault('USE_TORCH', '0')
+
+import datasets
+import multiprocess
 import sys
 import glob
 import typer
@@ -49,6 +55,8 @@ def main(
     max_seq_length: Annotated[int, typer.Option(help="Maximum sequence length.",rich_help_panel="Custom Arguments")] = 2048,
 ):
     
+    # datasets' worker pool (multiprocess) forks by default; this process already runs threads
+    multiprocess.set_start_method('spawn', force=True)
     dataset = datasets.load_from_disk(dataset_path)
     tokenizer = load_tokenizer(tokenizer_path)
 

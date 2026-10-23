@@ -66,3 +66,43 @@ def test_positives_pair_one_function_across_variants_of_one_binary(tmp_path):
     assert len(by_key(('coreutils/x86-64_coreutils-8.32_pinky', 'main'))) == 3
     assert not any('aes.o' in path for path in info['file_path'])
     assert len(info) == len(paths) - 1
+
+
+def write_dataset2(root, programs=12):
+    """`programs` binaries, each built at O0 and O3, each defining main and usage."""
+    paths = []
+    for index in range(programs):
+        for variant in ('O0', 'O3'):
+            directory = root / 'coreutils' / f'x86-64_coreutils-8.32-{variant}_prog{index}_functions'
+            directory.mkdir(parents=True)
+            rows = ['OriginalFunctionName,HashedFileName']
+            for function in ('main', 'usage'):
+                hashed = hashlib.sha1(f'{directory.name}/{function}'.encode()).hexdigest() + '.ll'
+                rows.append(f'"{function}","{hashed}"')
+                paths.append(str(directory / hashed))
+            (directory / 'function_map.csv').write_text('\n'.join(rows) + '\n')
+    datasets.Dataset.from_dict({'file_path': paths, 'input_ids': [[2, 3]] * len(paths)}).save_to_disk(str(root / 'raw'))
+
+
+def run_split(root, seed):
+    import json
+    from typer.testing import CliRunner
+    from Pretrain.split_train_validation import main
+    import typer
+    app = typer.Typer()
+    app.command()(main)
+    output = f'out_{seed}'
+    # relative paths on purpose: the command changes into the output directory
+    result = CliRunner().invoke(app, ['raw', '--base-path', '.', '--naming', 'dataset2', '--train-ratio', '0.5',
+                                      '--random-seed', str(seed), '--output-dir', output])
+    assert result.exit_code == 0, result.output
+    return json.loads((root / output / 'split_indices.json').read_text())
+
+
+def test_relative_paths_and_the_seed_decide_the_split(tmp_path, monkeypatch):
+    write_dataset2(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    first, again, other = run_split(tmp_path, 1), run_split(tmp_path, 1), run_split(tmp_path, 2)
+    assert first == again
+    assert first != other
+    assert len(first['train']) + len(first['validation']) == 48

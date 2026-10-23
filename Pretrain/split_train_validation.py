@@ -2,7 +2,6 @@ import json
 import random
 import re
 from enum import Enum
-import networkx as nx
 from datasets import load_dataset
 import datasets
 from tqdm import tqdm
@@ -41,7 +40,7 @@ def parse_binary_directory(name: str, naming: str) -> Tuple[str, str] | None:
     return (origin.format(**match.groupdict()), match['variant']) if match else None
 
 
-def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, List[int]], function_info_df: pd.DataFrame, ratio: float = 0.9) -> None:
+def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, List[int]], function_info_df: pd.DataFrame, ratio: float = 0.9, seed: int = 42) -> None:
 
     print("原始数据集总大小:", len(original_dataset))
     
@@ -69,33 +68,16 @@ def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, Li
     original_dataset = original_dataset.add_column("original_idx", new_indices_column)
     
     # 创建新的索引到原始索引的映射
-    new_to_old_idx_map = {new_idx: old_idx for new_idx, old_idx in enumerate(valid_indices_list)}
     old_to_new_idx_map = {old_idx: new_idx for new_idx, old_idx in enumerate(valid_indices_list)}
     
     # 添加 function name 信息到数据集
     print("添加 function name 信息到数据集...")
     
-    # 创建一个映射：old_original_idx -> function_name
-    idx_to_function_name = {}
-    idx_to_opt_level = {}
-    idx_to_origin_binary_name = {}
-    
-    for _, row in function_info_df.iterrows():
-        original_idx = row['original_idx']
-        idx_to_function_name[original_idx] = row['function_name']
-        idx_to_opt_level[original_idx] = row['opt_level']
-        idx_to_origin_binary_name[original_idx] = row['origin_binary_name']
-    
-    # 为过滤后的数据集创建 function name 列表
-    function_names = []
-    opt_levels = []
-    origin_binary_names = []
-    
-    for new_idx in range(len(original_dataset)):
-        old_idx = new_to_old_idx_map[new_idx]
-        function_names.append(idx_to_function_name[old_idx])
-        opt_levels.append(idx_to_opt_level[old_idx])
-        origin_binary_names.append(idx_to_origin_binary_name[old_idx])
+    # 按新索引顺序（即 valid_indices_list 的顺序）取出每个样本的信息
+    info_by_old_idx = function_info_df.set_index('original_idx').loc[valid_indices_list]
+    function_names = info_by_old_idx['function_name'].tolist()
+    opt_levels = info_by_old_idx['opt_level'].tolist()
+    origin_binary_names = info_by_old_idx['origin_binary_name'].tolist()
     
     # 将这些信息添加到数据集
     original_dataset = original_dataset.add_column("function_name", function_names)
@@ -114,27 +96,20 @@ def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, Li
     
     positive_map = updated_positive_map
 
-    # === 2. 构建完整的相似关系图 ===
-    print("构建关系图中...")
-    G = nx.Graph()
-    # 将所有函数作为节点添加到图中
-    G.add_nodes_from(range(len(original_dataset)))
-
-    # 根据positive_map添加边
-    for anchor_idx_str, positive_indices in tqdm(positive_map.items()):
-        anchor_idx = int(anchor_idx_str)
-        for positive_idx in positive_indices:
-            G.add_edge(anchor_idx, positive_idx)
-
-    # === 3. 找出所有的“朋友圈”（图的连通分量） ===
-    print("寻找连通分量（朋友圈）...")
-    connected_components = list(nx.connected_components(G))
+    # === 2. 找出所有的“朋友圈” ===
+    # positive_map pairs every two functions of one (origin, function name) group and nothing across groups,
+    # so the groups are exactly the connected components of the positive graph; split whole groups.
+    print("按 (origin_binary_name, function_name) 分组（朋友圈）...")
+    connected_components = sorted(
+        pd.Series(np.arange(len(original_dataset)))
+        .groupby([pd.Series(origin_binary_names), pd.Series(function_names)], sort=False)
+        .agg(list),
+        key=lambda group: group[0])
     print(f"找到了 {len(connected_components)} 个独立的“朋友圈”")
 
-    # === 4. 在“朋友圈”的层面上进行划分 ===
+    # === 3. 在“朋友圈”的层面上进行划分 ===
     print("在“朋友圈”层面上进行随机划分...")
-    random.seed(42)
-    random.shuffle(connected_components)
+    random.Random(seed).shuffle(connected_components)
 
     # 假设我们按 90% 训练集, 10% 验证集
     num_groups = len(connected_components)
@@ -312,6 +287,10 @@ def main(
     random.seed(random_seed)
     np.random.seed(random_seed)
     
+    # Resolve inputs before changing into the output directory, so relative paths keep their meaning
+    dataset_path = os.path.abspath(dataset_path)
+    base_path = os.path.abspath(base_path)
+
     # Change to output directory
     original_cwd = os.getcwd()
     os.makedirs(output_dir, exist_ok=True)
@@ -328,7 +307,7 @@ def main(
         
         # Split dataset
         typer.echo(f"Splitting dataset with train ratio: {train_ratio}")
-        split_dataset(dataset, positive_map, function_info_df, train_ratio)
+        split_dataset(dataset, positive_map, function_info_df, train_ratio, random_seed)
         
         typer.echo("Dataset splitting completed successfully!")
         
