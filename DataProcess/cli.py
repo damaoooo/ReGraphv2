@@ -1,5 +1,9 @@
 """Build a Hugging Face dataset from the graph generator's results.db."""
+import os
 from pathlib import Path
+
+if __name__ == '__main__':
+    os.environ.setdefault('USE_TORCH', '0')
 
 import typer
 

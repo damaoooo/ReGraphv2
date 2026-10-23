@@ -1,6 +1,7 @@
 """Build HF datasets from graph records: schema, workers, and publication."""
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import closing
 import multiprocessing
 import os
 from pathlib import Path
@@ -40,13 +41,17 @@ def initialize_worker(tokenizer_path: str) -> None:
 
 def process_chunk(rows: list[tuple]) -> tuple[list[dict], list[str]]:
     """Return valid samples and failed paths without treating empty graphs as errors."""
+    from GraphBuilder.graph_generator import result_signature
+
     if _worker_processor is None:
         raise RuntimeError("Worker has not been initialized")
     samples, failed_paths = [], []
     for row in rows:
-        if len(row) != 5 or not all(row):
+        if len(row) != 6 or not all(row[:5]):
             raise ValueError(f"Incomplete graph artifact record: {row!r}")
-        result = _worker_processor.process_single_file(*row)
+        if not row[5] or row[5] != result_signature(row[0]):
+            raise ValueError(f"Stale or unsigned graph record for {row[0]}; re-run GraphBuilder.graph_generator")
+        result = _worker_processor.process_single_file(*row[:5])
         if result.success:
             samples.append(result.to_dict())
         else:
@@ -57,9 +62,12 @@ def process_chunk(rows: list[tuple]) -> tuple[list[dict], list[str]]:
 def iter_database_chunks(db_path: str):
     """Stream a stable database order instead of caching file lists or using large IN queries."""
     database_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
-    with sqlite3.connect(database_uri, uri=True) as connection:
+    with closing(sqlite3.connect(database_uri, uri=True)) as connection:
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(results)')}
+        if 'signature' not in columns:
+            raise ValueError('Graph database has no signatures; re-run GraphBuilder.graph_generator')
         cursor = connection.execute(
-            "SELECT input_path, purify_path, instrumented_path, cfg_dot, ddg_dot "
+            "SELECT input_path, purify_path, instrumented_path, cfg_dot, ddg_dot, signature "
             "FROM results ORDER BY input_path"
         )
         while rows := cursor.fetchmany(CHUNK_SIZE):
