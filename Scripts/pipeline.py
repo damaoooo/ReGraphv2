@@ -9,11 +9,10 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import typer
 import subprocess
-import multiprocessing
-from utils import console, normalize_clang_opt_level
+from utils import available_cpu_count, console, normalize_clang_opt_level
 
 # Configuration
-BINARY_PATH = "/home/damaoooo/Downloads/regraphv2/Binaries"
+BINARY_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Binaries")
 
 app = typer.Typer()
 
@@ -30,7 +29,7 @@ def run_task(script_name: str, args: list):
 def task1(
     input_path: str = typer.Option("", help="Input directory (defaults to DataProcess-1)"),
     output: str = typer.Option(..., help="Output directory"),
-    workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
+    workers: int = typer.Option(available_cpu_count(), min=1, help="Number of worker processes (default: CPUs allocated to this process)"),
     resume: bool = typer.Option(False, help="Resume from previous run"),
     backend: str = typer.Option(
         "ida",
@@ -116,7 +115,7 @@ def task1(
 @app.command()
 def task2(
     input_path: str = typer.Option(..., help="Input directory containing .ll files"),
-    workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
+    workers: int = typer.Option(available_cpu_count(), min=1, help="Number of worker processes (default: CPUs allocated to this process)"),
     resume: bool = typer.Option(False, help="Resume from previous run"),
     opt_level: str = typer.Option(
         "O3",
@@ -147,7 +146,7 @@ def task2(
 @app.command()
 def task3(
     input_path: str = typer.Option(..., help="Input directory containing .bc files"),
-    workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
+    workers: int = typer.Option(available_cpu_count(), min=1, help="Number of worker processes (default: CPUs allocated to this process)"),
     resume: bool = typer.Option(False, help="Resume from previous run"),
 ):
     """Run Task 3: Extract individual functions"""
@@ -165,7 +164,7 @@ def task3(
 @app.command()
 def task4(
     input_path: str = typer.Option(..., help="Input directory containing .bc files"),
-    workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
+    workers: int = typer.Option(available_cpu_count(), min=1, help="Number of worker processes (default: CPUs allocated to this process)"),
     resume: bool = typer.Option(False, help="Resume from previous run"),
     arch: str = typer.Option(
         "auto",
@@ -230,7 +229,7 @@ def pipeline(
         help="Allow partial Ghidra lifts in Task 1. Off by default for reproducibility",
     ),
     output: str = typer.Option(..., help="Output directory"),
-    workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
+    workers: int = typer.Option(available_cpu_count(), min=1, help="Number of worker processes (default: CPUs allocated to this process)"),
     resume: bool = typer.Option(False, help="Resume from previous run"),
     start_from: int = typer.Option(1, help="Start from task number (1, 2, 3, or 4)"),
     task1_start_from_step2: bool = typer.Option(

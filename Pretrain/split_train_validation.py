@@ -11,7 +11,7 @@ import numpy as np
 from collections import defaultdict
 from itertools import combinations
 import os
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Optional, Tuple
 import pickle
 import typer
 
@@ -207,11 +207,11 @@ def split_dataset(original_dataset: datasets.Dataset, positive_map: Dict[str, Li
     final_validation_dataset.save_to_disk('validation_dataset_pool')
         
 
-def build_positive_indices(dataset: datasets.Dataset, base_path: str, naming: str) -> Tuple[dict, pd.DataFrame]:
+def build_positive_indices(dataset: datasets.Dataset, base_path: Optional[str], naming: str) -> Tuple[dict, pd.DataFrame]:
     """
     构建正样本索引映射
     :param datasets: 包含函数的datasets.Dataset对象
-    :param base_path: 数据集的基础路径
+    :param base_path: function_map.csv 的根目录；None 表示用每个函数文件所在目录
     :param naming: NAMING_CONVENTIONS 中该数据集的命名规则
     :return: 正样本索引映射字典和包含function name的DataFrame
     """
@@ -233,25 +233,37 @@ def build_positive_indices(dataset: datasets.Dataset, base_path: str, naming: st
     origins = binary_directories.map(lambda name: parsed[name] and parsed[name][0])
     df['origin_binary_name'] = (path_parts.str[-3] + "/" + origins).where(origins.notna())
 
-    grouped_by_dir_name = df.groupby('dir_name')
-    processed_groups = []
-    if "Dataset-2-IR" in base_path:
+    # Binaries named per the convention take part and must be fully mapped; the others were dropped above
+    participating = df[df['origin_binary_name'].notna()]
+    if participating.empty:
+        raise ValueError(f"No binary in the dataset is named per '{naming}'; check --naming")
+    if base_path is not None and "Dataset-2-IR" in base_path:
         # Base path add /../
         base_path = os.path.abspath(os.path.join(base_path, ".."))
-    for dir_name, group_content in tqdm(grouped_by_dir_name, desc="Mapping functions to original names"):
-        csv_path = os.path.join(base_path, dir_name, 'function_map.csv')
-        # print(f"Processing directory: {dir_name} with base path: {base_path}, csv_path is: {csv_path}")
-        try:
-            hash_map_df = pd.read_csv(csv_path)
-            hash_to_name_map = pd.Series(hash_map_df['OriginalFunctionName'].values, index=hash_map_df['HashedFileName']).to_dict()
-        except FileNotFoundError:
-            print(f"File {csv_path} not found, skipping.")
+    processed_groups, missing_maps, unmapped = [], [], []
+    for dir_name, group_content in tqdm(participating.groupby('dir_name'), desc="Mapping functions to original names"):
+        if base_path is None:
+            # Task 3 writes function_map.csv next to the function files it extracts
+            csv_path = os.path.join(os.path.dirname(group_content['file_path'].iloc[0]), 'function_map.csv')
+        else:
+            csv_path = os.path.join(base_path, dir_name, 'function_map.csv')
+        if not os.path.isfile(csv_path):
+            missing_maps.append(csv_path)
             continue
+        # Read names verbatim: by default pandas turns a function named NA or nan into a missing value
+        hash_map_df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+        hash_to_name_map = pd.Series(hash_map_df['OriginalFunctionName'].values, index=hash_map_df['HashedFileName']).to_dict()
 
         temp_df = group_content.copy()
         temp_df['function_name'] = temp_df['ll_name'].map(hash_to_name_map)
+        unmapped += temp_df.loc[temp_df['function_name'].isna(), 'file_path'].tolist()
         processed_groups.append(temp_df)
 
+    if missing_maps or unmapped:
+        raise ValueError(
+            f"Incomplete function maps: {len(missing_maps)} binaries have no function_map.csv (e.g. {missing_maps[:3]}), "
+            f"{len(unmapped)} functions are missing from theirs (e.g. {unmapped[:3]}). Check --base-path, "
+            "or rerun Task 3 for those binaries; samples are not dropped silently.")
     full_info_df = pd.concat(processed_groups)
 
     full_info_df.dropna(subset=['origin_binary_name', 'function_name'], inplace=True)
@@ -269,12 +281,17 @@ def build_positive_indices(dataset: datasets.Dataset, base_path: str, naming: st
                 positive_map[idx1].append(idx2)
                 positive_map[idx2].append(idx1)
 
+    if not positive_map:
+        raise ValueError(f"No positive pairs: no function occurs in two build variants of one binary under '{naming}'. "
+                         "Check --naming and that the dataset holds several variants per binary.")
     return dict(positive_map), full_info_df
 
 
 def main(
     dataset_path: str = typer.Argument(..., help="Path to the dataset directory"),
-    base_path: str = typer.Option("/home/damaoooo/Datasets/IR/small_test/small_test", help="Base path for function mapping CSV files"),
+    base_path: Optional[str] = typer.Option(
+        None, help="Root holding <project>/<binary>_functions/function_map.csv when the data moved since Task 3 "
+                   "(default: each function file's own directory)"),
     train_ratio: float = typer.Option(0.9, help="Training set ratio (0.0-1.0)"),
     random_seed: int = typer.Option(42, help="Random seed for reproducibility"),
     output_dir: str = typer.Option(".", help="Output directory for generated files"),
@@ -289,7 +306,7 @@ def main(
     
     # Resolve inputs before changing into the output directory, so relative paths keep their meaning
     dataset_path = os.path.abspath(dataset_path)
-    base_path = os.path.abspath(base_path)
+    base_path = os.path.abspath(base_path) if base_path else None
 
     # Change to output directory
     original_cwd = os.getcwd()

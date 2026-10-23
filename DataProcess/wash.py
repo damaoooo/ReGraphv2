@@ -9,13 +9,14 @@ import multiprocess
 import sys
 import glob
 import typer
+from typing import Optional
 from typing_extensions import Annotated
 
 # 如果从其他地方调用，可以导入配置
 # parent_path = os.path.dirname(os.getcwd())
 # sys.path.append(parent_path)
 from Tokenizer.ir_tokenizer import load_tokenizer
-from Utils.utils import DEFAULT_TOKENIZER_PATH
+from Utils.utils import DEFAULT_TOKENIZER_PATH, available_cpu_count
 
 def clip_span(start, end, last_position):
     """Clip an inclusive token span to `last_position`; None if the span starts after it."""
@@ -53,6 +54,8 @@ def main(
     output_path: Annotated[str, typer.Option(help="Path to save the processed dataset.", rich_help_panel="Custom Arguments")],
     tokenizer_path: Annotated[str, typer.Option(help="Path to the tokenizer file.", rich_help_panel="Custom Arguments")] = DEFAULT_TOKENIZER_PATH,
     max_seq_length: Annotated[int, typer.Option(help="Maximum sequence length.",rich_help_panel="Custom Arguments")] = 2048,
+    num_proc: Annotated[Optional[int], typer.Option(min=1, help="Worker processes; defaults to the CPUs allocated to this process.",
+                                                    rich_help_panel="Custom Arguments")] = None,
 ):
     
     # datasets' worker pool (multiprocess) forks by default; this process already runs threads
@@ -69,8 +72,10 @@ def main(
     def filter_function(example):
         return example['cfg_graph'] is not None and example['ddg_graph'] is not None
 
-    num_cores = os.cpu_count()
-    print(f"Number of CPU cores: {num_cores}")
+    num_cores = available_cpu_count() if num_proc is None else num_proc
+    if num_cores < 1:
+        raise ValueError("num_proc must be positive")
+    print(f"Worker processes: {num_cores}")
 
     processed_dataset = dataset.filter(filter_function,num_proc=num_cores, writer_batch_size=100).map(trunker, num_proc=num_cores, writer_batch_size=100)
     print("Finished processing dataset.")

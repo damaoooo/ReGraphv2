@@ -11,10 +11,9 @@ from pathlib import Path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import typer
-import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
-from utils import console, run_command
+from utils import available_cpu_count, console, run_command
 from pipeline_cache import (
     build_input_signature,
     compute_file_sha256,
@@ -145,7 +144,7 @@ def extract_functions_wrapper(args):
 @app.command()
 def main(
     input_path: str = typer.Option(..., help="Input directory containing .bc files"),
-    workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
+    workers: int = typer.Option(available_cpu_count(), min=1, help="Number of worker processes (default: CPUs allocated to this process)"),
     resume: bool = typer.Option(False, help="Resume from previous run, skip existing files"),
 ):
     """Extract individual functions from LLVM IR files"""

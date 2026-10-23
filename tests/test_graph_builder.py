@@ -281,3 +281,166 @@ def test_unreadable_function_fails_the_prefilter(tools, tmp_path):
     (tmp_path / 'bin_functions' / 'b.ll').write_bytes(b'define i32 @f() {\n\xff\xfe\n}\n')
     with pytest.raises(ValueError, match='not UTF-8'):
         generator.pipeline(str(tmp_path), cleanup=True, use_cache=False, jobs=1)
+
+
+# Passes the size prefilter, but opt rejects it (use of an undefined value)
+INVALID = 'define i32 @broken(i32 %x) {\nentry:\n  %y = add i32 %x, %undefined\n  %z = mul i32 %y, 2\n  ret i32 %z\n}\n'
+
+
+def failing_opt(tmp_path):
+    """An opt that reports the real version but fails every pass run, like a plugin it cannot load."""
+    real = shutil.which('opt')
+    bin_dir = tmp_path / 'fake_bin'
+    bin_dir.mkdir()
+    script = bin_dir / 'opt'
+    script.write_text(f'#!/bin/sh\nif [ "$1" = "--version" ]; then exec {real} --version; fi\n'
+                      'echo "simulated plugin load failure" >&2\nexit 1\n')
+    script.chmod(0o755)
+    return bin_dir
+
+
+def test_broken_toolchain_fails_before_touching_results(tools, tmp_path, monkeypatch, capsys):
+    import os
+    import GraphBuilder.graph_generator as generator
+    functions = tmp_path / 'data' / 'bin_functions'
+    keep = write_function(functions, 'a', TWO_STORES)
+    edited = write_function(functions, 'b', SWITCH)
+    assert generator.pipeline(str(tmp_path / 'data'), cleanup=True, use_cache=False, jobs=1)
+    before = rows(tmp_path / 'data' / 'results.db')
+    stamps = {p: Path(p).stat().st_mtime_ns for row in before.values() for p in row[:4]}
+    edited.write_text(TWO_STORES.replace('add i32 %x, 1', 'add i32 %x, 9'))  # would be regenerated
+    monkeypatch.setenv('PATH', f"{failing_opt(tmp_path)}:{os.environ['PATH']}")
+    assert generator.pipeline(str(tmp_path / 'data'), cleanup=True, use_cache=False, jobs=1) is False
+    assert rows(tmp_path / 'data' / 'results.db') == before
+    assert {p: Path(p).stat().st_mtime_ns for p in stamps} == stamps
+    output = capsys.readouterr().out
+    assert 'Toolchain check failed' in output and 'simulated plugin load failure' in output
+
+
+def test_missing_plugins_name_the_build_command(tmp_path, monkeypatch, capsys):
+    import GraphBuilder.graph_generator as generator
+    monkeypatch.setattr(generator, 'DEFAULT_CFG_SO_PATH', str(tmp_path / 'missing.so'))
+    assert generator.pipeline(str(tmp_path), cleanup=True, use_cache=False, jobs=1) is False
+    assert 'cmake --build LLVMTools/build' in capsys.readouterr().out.replace('\n', ' ')
+
+
+def test_rejected_functions_are_skipped_and_reruns_still_succeed(tools, tmp_path):
+    import GraphBuilder.graph_generator as generator
+    functions = tmp_path / 'bin_functions'
+    good = write_function(functions, 'a', TWO_STORES)
+    write_function(functions, 'b', INVALID)
+    assert generator.pipeline(str(tmp_path), cleanup=True, use_cache=False, jobs=1)
+    assert set(rows(tmp_path / 'results.db')) == {str(good)}
+    # the invalid function is retried on every run; with the rest up to date that is not a failure
+    assert generator.pipeline(str(tmp_path), cleanup=True, use_cache=False, jobs=1)
+
+
+def test_every_attempted_function_failing_fails_the_run(tools, tmp_path):
+    import GraphBuilder.graph_generator as generator
+    write_function(tmp_path / 'bin_functions', 'b', INVALID)
+    assert generator.pipeline(str(tmp_path), cleanup=True, use_cache=False, jobs=1) is False
+    assert rows(tmp_path / 'results.db') == {}
+
+
+def test_empty_input_is_not_a_failure(tools, tmp_path):
+    import GraphBuilder.graph_generator as generator
+    (tmp_path / 'bin_functions').mkdir()
+    assert generator.pipeline(str(tmp_path), cleanup=True, use_cache=False, jobs=1)
+
+
+def test_unwritable_artifact_directory_fails_the_run(tools, tmp_path):
+    import os
+    import GraphBuilder.graph_generator as generator
+    if os.geteuid() == 0:
+        pytest.skip('root can write anywhere')
+    write_function(tmp_path / 'bin_functions', 'a', TWO_STORES)
+    artifacts = tmp_path / 'bin_graphs'
+    artifacts.mkdir()
+    artifacts.chmod(0o500)
+    try:
+        assert generator.pipeline(str(tmp_path), cleanup=True, use_cache=False, jobs=1) is False
+    finally:
+        artifacts.chmod(0o700)
+
+
+def test_jobs_also_bound_the_prefilter(tools, tmp_path, monkeypatch):
+    import GraphBuilder.graph_generator as generator
+    budgets = []
+
+    class RecordingFilter:
+        def __init__(self, num_processes):
+            budgets.append(num_processes)
+
+        def filter_files_parallel(self, files):
+            return files
+    monkeypatch.setattr(generator, 'FileFilter', RecordingFilter)
+    write_function(tmp_path / 'bin_functions', 'a', TWO_STORES)
+    assert generator.pipeline(str(tmp_path), cleanup=True, use_cache=False, jobs=3)
+    assert budgets == [3]
+
+
+def test_output_write_failure_stops_the_run_and_keeps_the_old_row(tools, tmp_path):
+    """A read-only existing artifact makes opt fail on valid IR: an output failure, not a rejected function."""
+    import os
+    import GraphBuilder.graph_generator as generator
+    if os.geteuid() == 0:
+        pytest.skip('root can write anywhere')
+    functions = tmp_path / 'bin_functions'
+    write_function(functions, 'a', TWO_STORES)
+    b = write_function(functions, 'b', SWITCH)
+    assert generator.pipeline(str(tmp_path), cleanup=True, use_cache=False, jobs=1)
+    before = rows(tmp_path / 'results.db')
+    purified = Path(before[str(b)][0])
+    purified.chmod(0o444)
+    b.write_text(SWITCH.replace('add i32 %base, 1', 'add i32 %base, 5'))  # b must be regenerated; a is up to date
+    try:
+        assert generator.pipeline(str(tmp_path), cleanup=True, use_cache=False, jobs=1) is False
+    finally:
+        purified.chmod(0o644)
+    assert rows(tmp_path / 'results.db') == before  # the old row stays until a run can replace it
+
+
+def test_pass_failures_are_rejections_only_for_invalid_ir(tools, tmp_path):
+    import GraphBuilder.graph_generator as generator
+    invalid = write_function(tmp_path / 'bin_functions', 'bad', INVALID)
+    valid = write_function(tmp_path / 'bin_functions', 'good', TWO_STORES)
+    assert generator._pass_failed('metadata stripping', str(invalid), 'detail') is None
+    with pytest.raises(generator.PassExecutionError, match='failed on valid IR'):
+        generator._pass_failed('metadata stripping', str(valid), 'Permission denied')
+
+
+def test_a_killed_verifier_is_not_a_rejection(tools, tmp_path, monkeypatch):
+    """returncode -9 (e.g. the OOM killer) says nothing about the input: stop the run instead of skipping."""
+    import subprocess
+    import GraphBuilder.graph_generator as generator
+    invalid = write_function(tmp_path / 'bin_functions', 'bad', INVALID)
+    monkeypatch.setattr(generator.subprocess, 'run', lambda *args, **kwargs: subprocess.CompletedProcess(args, -9, '', ''))
+    with pytest.raises(generator.PassExecutionError, match='killed by signal 9'):
+        generator._pass_failed('DDG generation', str(invalid), 'pass failed')
+
+
+def test_a_killed_pass_is_not_a_rejection_even_for_invalid_ir(tools, tmp_path):
+    import GraphBuilder.graph_generator as generator
+    invalid = write_function(tmp_path / 'bin_functions', 'bad', INVALID)
+    with pytest.raises(generator.PassExecutionError, match='killed by signal 9'):
+        generator._pass_failed('metadata stripping', str(invalid), 'terminated', returncode=-9)
+
+
+def test_a_pass_killed_mid_run_keeps_the_rows(tools, tmp_path, monkeypatch):
+    """An opt killed while regenerating b (sibling a up to date) must not delete b's row or report success."""
+    import os
+    import GraphBuilder.graph_generator as generator
+    functions = tmp_path / 'data' / 'bin_functions'
+    write_function(functions, 'a', TWO_STORES)
+    b = write_function(functions, 'b', SWITCH)
+    assert generator.pipeline(str(tmp_path / 'data'), cleanup=True, use_cache=False, jobs=1)
+    before = rows(tmp_path / 'data' / 'results.db')
+    b.write_text(SWITCH.replace('add i32 %base, 1', 'add i32 %base, 5'))
+    bin_dir = tmp_path / 'killing_bin'
+    bin_dir.mkdir()
+    killer = bin_dir / 'opt'
+    killer.write_text(f'#!/bin/sh\ncase "$*" in *b.ll*) kill -9 $$ ;; esac\nexec {shutil.which("opt")} "$@"\n')
+    killer.chmod(0o755)
+    monkeypatch.setenv('PATH', f"{bin_dir}:{os.environ['PATH']}")
+    assert generator.pipeline(str(tmp_path / 'data'), cleanup=True, use_cache=False, jobs=1) is False
+    assert rows(tmp_path / 'data' / 'results.db') == before

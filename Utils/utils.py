@@ -7,7 +7,23 @@ LLVM_LIBRARY_DIR = Path(__file__).resolve().parents[1] / 'LLVMTools' / 'build' /
 DEFAULT_DDG_SO_PATH = str(LLVM_LIBRARY_DIR / 'libDDGPrinter.so')
 DEFAULT_PURIFY_SO_PATH = str(LLVM_LIBRARY_DIR / 'libStripAllMetadataPass.so')
 DEFAULT_CFG_SO_PATH = str(LLVM_LIBRARY_DIR / 'libMyCFGPrinterPass.so')
-DEFAULT_TOKENIZER_PATH = '/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json'
+DEFAULT_TOKENIZER_PATH = str(Path(__file__).resolve().parents[1] / 'Tokenizer' / 'output_tokenizer' / 'llvm_ir_bpe.json')
+
+
+def available_cpu_count() -> int:
+    """CPUs this process may use, the default worker budget of every preprocessing stage.
+
+    The affinity mask reflects cgroup/Slurm CPU binding, and SLURM_CPUS_PER_TASK caps it when set;
+    os.cpu_count() would count every CPU of the node, including other jobs' CPUs.
+    """
+    if hasattr(os, 'process_cpu_count'):
+        count = os.process_cpu_count()
+    else:
+        count = len(os.sched_getaffinity(0))
+    allocated = os.environ.get('SLURM_CPUS_PER_TASK', '')
+    if allocated.isdigit() and int(allocated) > 0:
+        count = min(count or int(allocated), int(allocated))
+    return max(count or 1, 1)
 
 @contextlib.contextmanager
 def suppress_stderr():

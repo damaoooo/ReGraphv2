@@ -3,10 +3,18 @@ Common utilities for the lift dataset pipeline
 """
 import subprocess
 import os
+import sys
+from pathlib import Path
 import resource
 import signal
 import typer
 from rich.console import Console
+
+# One CPU-budget policy for every stage; Utils lives at the repository root
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
+from Utils.utils import available_cpu_count  # noqa: E402
 
 console = Console()
 

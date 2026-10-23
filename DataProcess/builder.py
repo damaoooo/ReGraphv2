@@ -10,6 +10,8 @@ import tempfile
 
 import datasets
 
+from Utils.utils import available_cpu_count
+
 from .file_processor import FileProcessor
 
 
@@ -127,7 +129,7 @@ class DatasetBuilder:
     def __init__(self, tokenizer_path: str, db_file: str, num_processes: int | None = None):
         self.tokenizer_path = str(Path(tokenizer_path).resolve())
         self.db_file = str(Path(db_file).resolve())
-        self.num_processes = num_processes if num_processes is not None else (os.cpu_count() or 1)
+        self.num_processes = num_processes if num_processes is not None else available_cpu_count()
         if self.num_processes < 1:
             raise ValueError("num_processes must be positive")
 

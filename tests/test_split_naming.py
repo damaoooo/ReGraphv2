@@ -106,3 +106,49 @@ def test_relative_paths_and_the_seed_decide_the_split(tmp_path, monkeypatch):
     assert first == again
     assert first != other
     assert len(first['train']) + len(first['validation']) == 48
+
+
+def write_binary(root, binary, functions, with_map=True, map_functions=None):
+    directory = root / 'pkg' / f'{binary}_functions'
+    directory.mkdir(parents=True)
+    rows, paths = ['OriginalFunctionName,HashedFileName'], []
+    for function in functions:
+        hashed = hashlib.sha1(f'{binary}/{function}'.encode()).hexdigest() + '.ll'
+        paths.append(str(directory / hashed))
+        if map_functions is None or function in map_functions:
+            rows.append(f'"{function}","{hashed}"')
+    if with_map:
+        (directory / 'function_map.csv').write_text('\n'.join(rows) + '\n')
+    return paths
+
+
+def test_missing_function_map_is_an_error(tmp_path):
+    paths = write_binary(tmp_path, 'x64-gcc-4.8-O0_demo', ['f']) + write_binary(tmp_path, 'x64-gcc-4.8-O3_demo', ['f'], with_map=False)
+    with pytest.raises(ValueError, match='1 binaries have no function_map.csv'):
+        build_positive_indices(datasets.Dataset.from_dict({'file_path': paths}), None, 'dataset1')
+
+
+def test_function_missing_from_its_map_is_an_error(tmp_path):
+    paths = (write_binary(tmp_path, 'x64-gcc-4.8-O0_demo', ['f', 'g'])
+             + write_binary(tmp_path, 'x64-gcc-4.8-O3_demo', ['f', 'g'], map_functions={'f'}))
+    with pytest.raises(ValueError, match='1 functions are missing'):
+        build_positive_indices(datasets.Dataset.from_dict({'file_path': paths}), None, 'dataset1')
+
+
+def test_binaries_off_the_convention_need_no_map(tmp_path):
+    paths = (write_binary(tmp_path, 'x64-gcc-4.8-O0_demo', ['f']) + write_binary(tmp_path, 'x64-gcc-4.8-O3_demo', ['f'])
+             + write_binary(tmp_path, 'aes.o', ['f'], with_map=False))
+    positive_map, info = build_positive_indices(datasets.Dataset.from_dict({'file_path': paths}), None, 'dataset1')
+    assert len(info) == 2 and len(positive_map) == 2
+
+
+def test_no_positive_pairs_is_an_error(tmp_path):
+    paths = write_binary(tmp_path, 'x64-gcc-4.8-O0_demo', ['f']) + write_binary(tmp_path, 'x64-gcc-4.8-O3_other', ['f'])
+    with pytest.raises(ValueError, match='No positive pairs'):
+        build_positive_indices(datasets.Dataset.from_dict({'file_path': paths}), None, 'dataset1')
+
+
+def test_function_names_are_read_verbatim(tmp_path):
+    paths = write_binary(tmp_path, 'x64-gcc-4.8-O0_demo', ['NA', 'nan']) + write_binary(tmp_path, 'x64-gcc-4.8-O3_demo', ['NA', 'nan'])
+    positive_map, info = build_positive_indices(datasets.Dataset.from_dict({'file_path': paths}), None, 'dataset1')
+    assert sorted(set(info['function_name'])) == ['NA', 'nan'] and len(positive_map) == 4

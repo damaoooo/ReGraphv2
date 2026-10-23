@@ -10,7 +10,6 @@ Both steps use parallel processing with separate progress bars for efficiency.
 import os
 import json
 import typer
-import multiprocessing
 import logging
 import subprocess
 import traceback
@@ -21,7 +20,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from utils import console, ensure_directory, file_exists_and_not_empty
+from utils import available_cpu_count, console, ensure_directory, file_exists_and_not_empty
 from pipeline_cache import (
     build_input_signature,
     compute_file_sha256,
@@ -31,7 +30,7 @@ from pipeline_cache import (
 
 # Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BINARY_PATH = "/home/damaoooo/Downloads/regraphv2/Binaries"
+BINARY_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Binaries")
 
 
 def default_ida_path() -> str:
@@ -232,7 +231,7 @@ def lift_single_file(
 def main(
     input_path: str = typer.Option("", help="Input directory (defaults to DataProcess-1)"),
     output: str = typer.Option(..., help="Output directory"),
-    workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
+    workers: int = typer.Option(available_cpu_count(), min=1, help="Number of worker processes (default: CPUs allocated to this process)"),
     resume: bool = typer.Option(False, help="Resume from previous run, skip existing files"),
     backend: str = typer.Option(
         "ida",

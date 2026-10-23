@@ -22,7 +22,7 @@ def main(
         exists=True, dir_okay=False, help="IR tokenizer JSON"
     ),
     num_processes: int | None = typer.Option(
-        None, "--num-processes", "-p", min=1, help="Workers; defaults to CPU count"
+        None, "--num-processes", "-p", min=1, help="Workers; defaults to the CPUs allocated to this process"
     ),
 ):
     builder = DatasetBuilder(str(tokenizer_path), str(input_dir / "results.db"), num_processes)

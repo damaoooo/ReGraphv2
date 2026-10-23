@@ -8,14 +8,13 @@ from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 
 import typer
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from task2_reoptimize import ARCH_TO_CLANG_FLAG, normalize_arch_mode, resolve_arch
-from utils import console, ensure_directory, file_exists_and_not_empty, run_command
+from utils import available_cpu_count, console, ensure_directory, file_exists_and_not_empty, run_command
 from pipeline_cache import (
     build_input_signature,
     create_temporary_output_path,
@@ -103,7 +102,7 @@ def recompile_file_wrapper(args):
 @app.command()
 def main(
     input_path: str = typer.Option(..., help="Input directory containing .bc files"),
-    workers: int = typer.Option(multiprocessing.cpu_count(), help="Number of worker processes"),
+    workers: int = typer.Option(available_cpu_count(), min=1, help="Number of worker processes (default: CPUs allocated to this process)"),
     resume: bool = typer.Option(False, help="Resume from previous run, skip existing files"),
     arch: str = typer.Option(
         "auto",

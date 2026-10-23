@@ -1,6 +1,8 @@
 import os
+import shutil
 import subprocess
 import logging
+import tempfile
 import hashlib
 from contextlib import closing
 from functools import lru_cache
@@ -58,10 +60,33 @@ def result_signature(llvm_ir_path: str) -> str:
     return hashlib.sha256((_tool_signature() + _file_sha256(llvm_ir_path)).encode()).hexdigest()
 
 
-def _run_opt(cmd: List[str], cwd: str, step: str, llvm_ir_path: str) -> Optional[subprocess.CompletedProcess]:
+class PassExecutionError(RuntimeError):
+    """A pass failed on input opt accepts: an output, plugin or environment failure, never a rejected function."""
+
+
+def _pass_failed(step: str, input_path: str, detail: str, returncode: Optional[int] = None) -> None:
+    """Classify a failed pass run: a function opt itself rejects is skipped; anything else stops the run.
+
+    Unwritable or full output storage and broken plugins also make opt fail, so only input that the verifier
+    runs to completion on and rejects counts as a rejected function; the check runs on the failure path only.
+    A pass or verifier killed by a signal (e.g. by the OOM killer) has shown nothing about the input.
+    """
+    if returncode is not None and returncode < 0:
+        raise PassExecutionError(f"{step} on {input_path} was killed by signal {-returncode}: {detail}")
+    verifier = subprocess.run(["opt", "-disable-output", "-passes=verify", os.path.abspath(input_path)],
+                              text=True, capture_output=True)
+    if verifier.returncode < 0:
+        raise PassExecutionError(f"verifying {input_path} after a {step} failure was killed by signal "
+                                 f"{-verifier.returncode}: {detail}")
+    if verifier.returncode == 0:
+        raise PassExecutionError(f"{step} failed on valid IR {input_path}: {detail}")
+    logger.error(f"{step} rejected {input_path}: {detail}; verifier: {verifier.stderr.strip()[:500]}")
+
+
+def _run_opt(cmd: List[str], cwd: str, step: str, input_path: str) -> Optional[subprocess.CompletedProcess]:
     p = subprocess.run(cmd, text=True, capture_output=True, cwd=cwd)
     if p.returncode != 0:
-        logger.error(f"{step} failed for {llvm_ir_path} with return code {p.returncode}, stdout: {p.stdout}, stderr: {p.stderr}")
+        _pass_failed(step, input_path, f"return code {p.returncode}, stderr: {p.stderr.strip()[:2000]}", p.returncode)
         return None
     return p
 
@@ -69,107 +94,113 @@ def _run_opt(cmd: List[str], cwd: str, step: str, llvm_ir_path: str) -> Optional
 def _opt_initial_purify(llvm_ir_path: str, artifact_dir: str) -> Optional[str]:
     """Strip all metadata from LLVM IR using custom pass"""
     purified_file = os.path.join(artifact_dir, os.path.splitext(os.path.basename(llvm_ir_path))[0] + '_purified.ll')
-
-    try:
-        cmd = [
-            "opt",
-            "-S",
-            "-load-pass-plugin=" + DEFAULT_PURIFY_SO_PATH,
-            "--passes=strip-all-metadata",
-            "-non-global-value-max-name-size=16384",
-            # relative to the artifact directory, so the ModuleID opt records does not depend on where the data lives
-            os.path.relpath(os.path.abspath(llvm_ir_path), artifact_dir),
-            "-o", os.path.basename(purified_file)
-        ]
-
-        if _run_opt(cmd, artifact_dir, "metadata stripping", llvm_ir_path) is None:
-            return None
-
-        if not os.path.exists(purified_file):
-            logger.error(f"Purified file was not created: {purified_file}")
-            return None
-
-        return purified_file
-
-    except Exception as e:
-        logger.error(f"Exception in metadata stripping for {llvm_ir_path}: {e}")
+    cmd = [
+        "opt",
+        "-S",
+        "-load-pass-plugin=" + DEFAULT_PURIFY_SO_PATH,
+        "--passes=strip-all-metadata",
+        "-non-global-value-max-name-size=16384",
+        # relative to the artifact directory, so the ModuleID opt records does not depend on where the data lives
+        os.path.relpath(os.path.abspath(llvm_ir_path), artifact_dir),
+        "-o", os.path.basename(purified_file)
+    ]
+    if _run_opt(cmd, artifact_dir, "metadata stripping", llvm_ir_path) is None:
         return None
+    if not os.path.exists(purified_file):
+        _pass_failed("metadata stripping", llvm_ir_path, f"{purified_file} was not created")
+        return None
+    return purified_file
+
 
 def _opt_generate_ddg(purified_llvm_ir_path: str) -> Optional[Tuple[str, str]]:
     """Generate DDG using opt tool on purified IR"""
     instrumented_file = os.path.splitext(purified_llvm_ir_path)[0] + '_instrumented.ll'
     new_path = os.path.dirname(purified_llvm_ir_path)
-
-    try:
-        cmd = [
-            "opt",
-            "-load-pass-plugin=" + DEFAULT_DDG_SO_PATH,
-            "-passes=dot-id-graph",
-            "-non-global-value-max-name-size=16384",
-            os.path.basename(purified_llvm_ir_path),
-            "-S",
-            "-o", os.path.basename(instrumented_file)
-        ]
-
-        p = _run_opt(cmd, new_path, "DDG generation", purified_llvm_ir_path)
-        if p is None:
-            return None
-
-        dot_file = None
-        for line in p.stderr.splitlines():
-            if "Writing ID-tagged graph to" in line:
-                dot_file = line.split("'")[1]
-                break
-        else:
-            logger.error("No dot file generated by opt, output is" f"{p.stdout} | stderr: {p.stderr}")
-            return None
-
-        dot_file = os.path.normpath(os.path.join(new_path, dot_file))
-        if not (os.path.exists(dot_file) and os.path.exists(instrumented_file)):
-            logger.error(f"DDG outputs missing for {purified_llvm_ir_path}")
-            return None
-        return instrumented_file, dot_file
-
-    except Exception as e:
-        logger.error(f"Exception in DDG generation for {purified_llvm_ir_path}: {e}")
+    cmd = [
+        "opt",
+        "-load-pass-plugin=" + DEFAULT_DDG_SO_PATH,
+        "-passes=dot-id-graph",
+        "-non-global-value-max-name-size=16384",
+        os.path.basename(purified_llvm_ir_path),
+        "-S",
+        "-o", os.path.basename(instrumented_file)
+    ]
+    p = _run_opt(cmd, new_path, "DDG generation", purified_llvm_ir_path)
+    if p is None:
         return None
+    dot_file = next((line.split("'")[1] for line in p.stderr.splitlines() if "Writing ID-tagged graph to" in line), None)
+    dot_file = dot_file and os.path.normpath(os.path.join(new_path, dot_file))
+    if not (dot_file and os.path.exists(dot_file) and os.path.exists(instrumented_file)):
+        _pass_failed("DDG generation", purified_llvm_ir_path, f"outputs missing; stderr: {p.stderr.strip()[:2000]}")
+        return None
+    return instrumented_file, dot_file
+
 
 def _opt_generate_cfg(purified_llvm_ir_path: str) -> Optional[str]:
     """Generate CFG using opt tool on purified IR"""
     new_path = os.path.dirname(purified_llvm_ir_path)
-
-    try:
-        cmd = [
-            "opt",
-            "-load-pass-plugin=" + DEFAULT_CFG_SO_PATH,
-            "-passes=dot-my-cfg",
-            "-non-global-value-max-name-size=16384",
-            os.path.basename(purified_llvm_ir_path),
-            "-o", "/dev/null"
-        ]
-
-        p = _run_opt(cmd, new_path, "CFG generation", purified_llvm_ir_path)
-        if p is None:
-            return None
-
-        dot_file = None
-        for line in p.stderr.splitlines():
-            if "Write CFG to " in line:
-                dot_file = line.split("'")[1]
-                break
-        else:
-            logger.error("No dot file generated by opt, output is" f"{p.stdout} | stderr: {p.stderr}")
-            return None
-
-        dot_file = os.path.normpath(os.path.join(new_path, dot_file))  # the pass reports './cfg_<hash>.dot'
-        if not os.path.exists(dot_file):
-            logger.error(f"CFG dot file missing for {purified_llvm_ir_path}")
-            return None
-        return dot_file
-
-    except Exception as e:
-        logger.error(f"Exception in CFG generation for {purified_llvm_ir_path}: {e}")
+    cmd = [
+        "opt",
+        "-load-pass-plugin=" + DEFAULT_CFG_SO_PATH,
+        "-passes=dot-my-cfg",
+        "-non-global-value-max-name-size=16384",
+        os.path.basename(purified_llvm_ir_path),
+        "-o", "/dev/null"
+    ]
+    p = _run_opt(cmd, new_path, "CFG generation", purified_llvm_ir_path)
+    if p is None:
         return None
+    dot_file = next((line.split("'")[1] for line in p.stderr.splitlines() if "Write CFG to " in line), None)
+    dot_file = dot_file and os.path.normpath(os.path.join(new_path, dot_file))  # the pass reports './cfg_<hash>.dot'
+    if not (dot_file and os.path.exists(dot_file)):
+        _pass_failed("CFG generation", purified_llvm_ir_path, f"dot file missing; stderr: {p.stderr.strip()[:2000]}")
+        return None
+    return dot_file
+
+
+# A small function every working toolchain handles: two blocks for the CFG, a data dependence for the DDG
+_PROBE_IR = ('define i32 @probe(i32 %x) {\nentry:\n  %y = add i32 %x, 1\n  %c = icmp sgt i32 %y, 0\n'
+             '  br i1 %c, label %pos, label %neg\npos:\n  ret i32 %y\nneg:\n  ret i32 0\n}\n')
+
+
+class _ErrorCollector(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.ERROR)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def check_toolchain():
+    """Raise before any result changes if opt or a pass plugin cannot process a known-good function.
+
+    A broken toolchain makes every function fail alike; without this check that would look like a dataset
+    of invalid functions, and their results would be deleted.
+    """
+    missing = [path for path in (DEFAULT_PURIFY_SO_PATH, DEFAULT_DDG_SO_PATH, DEFAULT_CFG_SO_PATH)
+               if not os.path.isfile(path)]
+    if missing:
+        raise RuntimeError(f"LLVMTools pass plugins are missing: {missing}. Build them with "
+                           "`cmake -S LLVMTools -B LLVMTools/build -DCMAKE_BUILD_TYPE=Release` and "
+                           "`cmake --build LLVMTools/build -j 4`")
+    collector = _ErrorCollector()
+    logger.addHandler(collector)
+    try:
+        with tempfile.TemporaryDirectory(prefix='graph-toolchain-check-') as workspace:
+            probe = Path(workspace, f'probe{FUNCTIONS_SUFFIX}', 'probe.ll')
+            probe.parent.mkdir()
+            probe.write_text(_PROBE_IR)
+            try:
+                result = process_one_file(str(probe))
+            except Exception as error:  # e.g. PassExecutionError, or opt missing from PATH
+                raise RuntimeError(f"opt ({shutil.which('opt')}) cannot run the graph passes on a known-good function: {error}") from error
+    finally:
+        logger.removeHandler(collector)
+    if result is None:
+        detail = collector.messages[0][:2000] if collector.messages else 'no diagnostics'
+        raise RuntimeError(f"opt ({shutil.which('opt')}) cannot run the graph passes on a known-good function: {detail}")
+
 
 def process_one_file(llvm_ir_path: str) -> Optional[Tuple[str, str, str, str, str]]:
     """
@@ -184,6 +215,9 @@ def process_one_file(llvm_ir_path: str) -> Optional[Tuple[str, str, str, str, st
     """
     artifact_dir = artifact_dir_for(llvm_ir_path)
     os.makedirs(artifact_dir, exist_ok=True)
+    if not os.access(artifact_dir, os.W_OK | os.X_OK):
+        # An unwritable output directory is an environment problem, not an invalid function: fail the run
+        raise PermissionError(f"cannot write graph artifacts to {artifact_dir}")
     produced = []
     result = None
     try:
@@ -275,7 +309,7 @@ def _function_dirs_digest(input_dir: str) -> str:
     return digest.hexdigest()
 
 
-def _list_valid_files(input_dir: str, use_cache: bool) -> List[str]:
+def _list_valid_files(input_dir: str, use_cache: bool, jobs: int) -> List[str]:
     cache_path = os.path.join(input_dir, 'filecache.pkl')
     key = _function_dirs_digest(input_dir)
     if use_cache and os.path.exists(cache_path):
@@ -292,7 +326,7 @@ def _list_valid_files(input_dir: str, use_cache: bool) -> List[str]:
 
     # Remove graph artifacts left inside function directories by older versions
     llvm_files = [f for f in llvm_files if not f.endswith(ARTIFACT_ENDINGS)]
-    file_filter = FileFilter(num_processes=multiprocessing.cpu_count())
+    file_filter = FileFilter(num_processes=jobs)
     valid_files = sorted(file_filter.filter_files_parallel(llvm_files))
     if use_cache:
         with open(cache_path, 'wb') as f:
@@ -348,10 +382,27 @@ def _prune_and_cleanup(input_dir: str, db_path: str, valid_files: List[str], cle
     console.print(f"[green]Cleaned up {removed} unreferenced graph artifacts[/green]")
 
 
-def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs: int = multiprocessing.cpu_count()) -> bool:
+def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs: Optional[int] = None) -> bool:
+    """Generate graphs for the functions under input_dir; False when the run is incomplete.
+
+    Failure policy: a function whose IR opt rejects (fails verification) is skipped and reported, and its old
+    row is removed. Any other pass failure, e.g. an unwritable or full output, a broken plugin, or a missing
+    output, stops the run and leaves that chunk's rows as they were. The run also fails when the toolchain
+    check fails, when a worker fails, or when every attempted function was rejected while none was already
+    up to date.
+    """
+    jobs = available_cpu_count() if jobs is None else jobs
+    if jobs < 1:
+        raise ValueError("jobs must be positive")
     input_dir = os.path.abspath(input_dir)
     db_path = os.path.join(input_dir, 'results.db')
-    valid_files = _list_valid_files(input_dir, use_cache)
+    # Before anything prunes, cleans or signs results: a broken toolchain must not delete valid ones
+    try:
+        check_toolchain()
+    except RuntimeError as error:
+        console.print(f"[red]Toolchain check failed: {error}[/red]")
+        return False
+    valid_files = _list_valid_files(input_dir, use_cache, jobs)
 
     console.print(f"[yellow]Filtering finished Files...[/yellow]")
     init_database(db_path)
@@ -367,6 +418,7 @@ def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs:
     chunk_size = 100
     chunks = [valid_files[i:i + chunk_size] for i in range(0, len(valid_files), chunk_size)]
     generated = failed_count = 0
+    failed_examples = []
 
     with closing(sqlite3.connect(db_path)) as connection, Progress(
         SpinnerColumn(),
@@ -384,12 +436,19 @@ def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs:
                 write_results(connection, results, failed)
                 generated += len(results)
                 failed_count += len(failed)
+                failed_examples += failed[:3 - len(failed_examples)]
                 progress.update(task, advance=len(results) + len(failed))
         except Exception as error:  # a worker raised: not a per-function failure, the run is incomplete
             console.print(f"[red]Graph generation incomplete after {generated} functions: {error!r}[/red]")
             return False
 
     console.print(f"[blue]Generated {generated}, failed {failed_count} functions. Results saved to {db_path}[/blue]")
+    if failed_count:
+        console.print(f"[yellow]{failed_count} functions were rejected by the passes and skipped, e.g. {failed_examples}[/yellow]")
+    if failed_count and not generated and not completed:
+        # Permanently invalid functions are retried on every run, so only "nothing at all" is a failure
+        console.print("[red]Every attempted function failed and none was already up to date.[/red]")
+        return False
     console.print("[green]Pipeline completed successfully![/green]")
     return True
 
@@ -400,7 +459,8 @@ def main(
     input_dir: str = typer.Argument(..., help="Input directory containing LLVM IR files"),
     cleanup: bool = typer.Option(True, "--cleanup/--no-cleanup", help="Delete graph artifacts no result refers to (interrupted runs, older layouts)"),
     use_cache: bool = typer.Option(True, "--cache/--no-cache", help="Use cached file list if the extracted functions are unchanged"),
-    jobs: int = typer.Option(multiprocessing.cpu_count(), "--jobs", "-j", help="Number of parallel jobs to run (default: number of CPU cores)")
+    jobs: int = typer.Option(available_cpu_count(), "--jobs", "-j", min=1,
+                             help="Worker processes for filtering and graph generation (default: CPUs allocated to this process)")
 ):
     """
     Process LLVM IR files to generate purified IR, DDG, and CFG files.
@@ -412,6 +472,11 @@ def main(
 
     Artifacts are written to `<binary>_graphs/` next to `<binary>_functions/`; results are stored in
     `results.db`, and a rerun only regenerates functions whose input, passes or opt changed.
+
+    Exit status 1 when the toolchain check fails (opt or a pass plugin cannot process a known-good
+    function), a pass fails on IR that opt accepts (unwritable/full output, plugin failure), a worker
+    fails, or every attempted function was rejected with none already up to date. Functions whose IR opt
+    rejects are otherwise skipped and listed.
     """
     if not pipeline(input_dir, cleanup, use_cache, jobs):
         raise typer.Exit(code=1)
