@@ -15,12 +15,19 @@ import logging
 import subprocess
 import traceback
 import sys
+from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from utils import console, ensure_directory, file_exists_and_not_empty
+from pipeline_cache import (
+    build_input_signature,
+    compute_file_sha256,
+    is_cached_output_valid,
+    write_completion_record,
+)
 
 # Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -149,6 +156,7 @@ def lift_single_file(
     ghidra_analysis_timeout: int,
     ghidra_no_analysis: bool,
     allow_partial: bool,
+    cache_config: dict | None = None,
 ) -> tuple:
     """
     Lift a single binary file to LLVM IR.
@@ -196,8 +204,13 @@ def lift_single_file(
     else:
         return (False, input_binary)
 
+    marker_path = output_llvm + '.task1.done.json'
+    Path(marker_path).unlink(missing_ok=True)
+    expected_signature = build_input_signature(input_binary, cache_config) if cache_config is not None else None
     result = subprocess.run(cmd, capture_output=True, text=True)
-    success = result.returncode == 0
+    success = result.returncode == 0 and file_exists_and_not_empty(output_llvm)
+    if success and expected_signature is not None:
+        write_completion_record(marker_path, expected_signature, output_llvm)
     if result.stdout or result.stderr:
         with open(LOG_PATH, "a") as log_file:
             log_file.write("=" * 60 + "\n")
@@ -377,18 +390,7 @@ def main(
     elif not start_from_step2:
         console.print("[bold blue]Step 1: Scanning for binary files to generate .i64...[/bold blue]")
         
-        # Clean any failed IDA files first
-        files_to_remove = []
-        for root, dirs, files in os.walk(db_path):
-            for file in files:
-                if file.endswith((".idb", ".id0", ".id1", ".id2", ".til", ".nam", ".asm")):
-                    files_to_remove.append(os.path.join(root, file))
-        for f in files_to_remove:
-            try:
-                os.remove(f)
-                logger.info(f"Removed failed IDA file: {f}")
-            except Exception as e:
-                logger.warning(f"Could not remove {f}: {str(e)}")
+        # Existing IDA databases and assembly may be user-owned; never delete them here.
         
         # Scan for binary files (non-IDA files) that need .i64 generation
         i64_tasks = []
@@ -478,6 +480,8 @@ def main(
             console.print()
             
             logger.info(f"Step 1 Summary: Success={i64_success_count}, Failed={i64_failed_count}")
+            if i64_failed_count:
+                raise typer.Exit(code=1)
         else:
             console.print(f"[yellow]No binary files need .i64 generation (skipped: {i64_skipped_count})[/yellow]")
             console.print()
@@ -491,6 +495,17 @@ def main(
         console.print("[bold blue]Step 2: Scanning for binaries to lift to LLVM IR with Ghidra...[/bold blue]")
     lift_tasks = []
     skipped_count = 0
+    lifter = Path(SCRIPT_DIR) / ('ida2llvm.py' if backend == 'ida' else 'pcode2llvm.py')
+    cache_config = {
+        'lifter': compute_file_sha256(lifter), 'driver': compute_file_sha256(__file__), 'backend': backend,
+        'python': python_runner(conda_env), 'ida_path': str(Path(ida_path).resolve()),
+        'ghidra': [ghidra_home, analyze_headless, ghidra_target, ghidra_max_cpu,
+                   ghidra_decompile_timeout, ghidra_analysis_timeout, ghidra_no_analysis, allow_partial],
+    }
+    if backend == 'ida':
+        idat = Path(ida_path) / 'idat'
+        if idat.is_file():
+            cache_config['idat_sha256'] = compute_file_sha256(idat)
     
     for root, dirs, files in os.walk(db_path):
         for file in files:
@@ -510,7 +525,7 @@ def main(
             output_file_path = os.path.join(output_dir, output_name)
             
             # Check if file already exists and we're resuming
-            if resume and file_exists_and_not_empty(output_file_path):
+            if resume and is_cached_output_valid(output_file_path + '.task1.done.json', build_input_signature(file_path, cache_config), output_file_path):
                 skipped_count += 1
                 continue
                 
@@ -567,6 +582,7 @@ def main(
                     ghidra_analysis_timeout,
                     ghidra_no_analysis,
                     allow_partial,
+                    cache_config,
                 ): (input_bin, output_llvm)
                 for input_bin, output_llvm in lift_tasks
             }

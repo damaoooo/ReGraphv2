@@ -10,8 +10,7 @@
 # - Uses `llvm-nm` to reliably list defined functions.
 # - Uses the SHA1 hash of the function name as the filename to prevent
 #   "File name too long" errors.
-# - Idempotent: Skips extraction if the output file already exists, making
-#   reruns fast.
+# - Refreshes extracted files; Task 3 owns verified resume and directory publication.
 # - Overwrites the function map on each run to ensure it's always clean.
 # - Minimized output for clean batch processing.
 #
@@ -75,7 +74,7 @@ fi
 # Run llvm-nm on the bitcode file.
 # `grep ' T '` filters for defined functions (text/code symbols).
 # `awk '{print $3}'` prints the third field, which is the function name.
-FUNCTION_LIST=$(llvm-nm "$TEMP_BC_FILE" | grep ' T ' | awk '{print $3}')
+FUNCTION_LIST=$(llvm-nm --defined-only --format=posix "$TEMP_BC_FILE" | awk '$2 ~ /^[TtWw]$/ {print $1}')
 
 if [ -z "$FUNCTION_LIST" ]; then
     echo "Warning: No defined functions found in '$INPUT_FILE'. Nothing to do." >&2
@@ -101,13 +100,8 @@ for func_name in $FUNCTION_LIST; do
   #    Quoting handles potential special characters in names.
   echo "\"$func_name\",\"${safe_filename}.ll\"" >> "$MAP_FILE"
 
-  # 3. If the file already exists, skip it to make reruns efficient.
-  if [ -f "$output_filename" ]; then
-    continue
-  else
-    # The -S flag outputs human-readable LLVM IR (.ll).
-    llvm-extract -S --func="$func_name" "$TEMP_BC_FILE" -o "$output_filename"
-  fi
+  # 3. Refresh the output, including when called without the Task 3 wrapper.
+  llvm-extract -S --func="$func_name" "$TEMP_BC_FILE" -o "$output_filename"
 done
 
 # --- 4. Completion ---

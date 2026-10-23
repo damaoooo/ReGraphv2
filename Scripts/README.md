@@ -31,7 +31,7 @@ Scripts/
 
 ```bash
 # 完整流水线：lift -> reopt -> 函数提取（task4 默认关闭）
-python Scripts/pipeline.py pipeline --input-path Binaries/Dataset-1 --output IR/Dataset-1-new --workers 32
+uv run --locked --extra pipeline python Scripts/pipeline.py pipeline --input-path Binaries/Dataset-1 --output IR/Dataset-1-new --workers 32 --opt-level Oc
 
 # 断点续传 / 从某个任务开始
 python Scripts/pipeline.py pipeline --input-path ... --output ... --resume
@@ -53,6 +53,19 @@ python Scripts/pipeline.py task3 --input-path IR/xxx --resume
 - task2 在原目录把 `x.ll` 写成 `x.bc`；`--opt-level` 支持 `O0/O1/O2/O3/Os/Og/Oz/Oc`，`--arch auto` 按文件名推断 `-m32/-m64`。
 - task3 为每个 `x.bc` 生成 `x_functions/`。
 - 所有任务都支持 `--resume` 和 `--workers`。
+
+### 重跑与完整性
+
+- Task 1 的 lifting、Task 2/4 的 resume 会校验输入内容、配置和输出 SHA256；旧版无校验记录的产物会重新生成。修改 lifter 后，Task 1 不会仅因为 `.ll` 存在而跳过。
+- 已有 `.i64` 仍视为输入数据库复用，不会自动验证它与原始 binary 的对应关系。更新 binary 或 IDA 分析版本后，应使用重新生成的数据库。Task 1 不再自动删除输入目录中的 `.asm/.idb` 等文件。
+- Task 3 在临时目录完成提取后替换旧目录，`.complete.json` 记录输入与每个产物的校验值；只有 CSV 或部分函数文件不算完成。旧目录中的过期函数不会混入新结果。
+- Task 2/3/4 任一文件失败都会返回非零退出码，完整 pipeline 随即停止。Task 2/4 的产物先写临时文件，成功后再发布。
+- 不要让多个 pipeline 同时写同一个输出目录。不同优化等级建议使用不同目录；同目录切换等级会替换 `.bc`，不保留多份结果。
+- 严格 resume 会读取文件计算校验值，NAS 上可能有明显 I/O 成本。Task 2–4 限制待执行 Future 数量，但函数提取仍逐函数启动 `llvm-extract`。
+- Oc 保留 IR 的 target；其他 clang 优化模式及 Task 4 目前仍按宿主工具链和 `-m32/-m64` 工作，不能把它们当作保持源架构 ABI 的交叉编译器。
+- 历史非法函数 bitcast 清理仍保留兼容行为；触发时会警告，并在 Task 2 完成记录的 `metadata.sanitized_removed_lines` 中记录删行数。这不是语义等价保证，正式实验应检查并修复产生非法 IR 的源头。
+
+小样本回归：`uv run --locked --extra pipeline python -m pytest tests/test_pipeline_regressions.py -q`（需要 LLVM 工具和 pytest）。
 
 单个二进制的 lift 也可以直接调用：
 

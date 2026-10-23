@@ -265,7 +265,11 @@ def pipeline(
     else:
         actual_input_path = os.path.join(BINARY_PATH, "DataProcess-1")
     
-    if not os.path.exists(actual_input_path):
+    if start_from not in (1, 2, 3, 4):
+        raise typer.BadParameter("start-from must be 1, 2, 3, or 4")
+    if start_from == 4 and not enable_recompile:
+        raise typer.BadParameter("start-from 4 requires --enable-recompile")
+    if start_from == 1 and not os.path.exists(actual_input_path):
         console.print(f"[red]Error: Input path {actual_input_path} does not exist.[/red]")
         raise typer.Exit(code=1)
 
@@ -336,7 +340,6 @@ def pipeline(
         console.print("[bold blue]=" * 60 + "[/bold blue]")
         
         args = ["--input-path", final_output_path, "--workers", str(workers)]
-        args.extend(["--arch", arch])
         if resume:
             args.append("--resume")
         
@@ -351,6 +354,7 @@ def pipeline(
         console.print("[bold blue]=" * 60 + "[/bold blue]")
 
         args = ["--input-path", final_output_path, "--workers", str(workers)]
+        args.extend(["--arch", arch])
         if resume:
             args.append("--resume")
 

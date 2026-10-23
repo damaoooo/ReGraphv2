@@ -55,3 +55,6 @@ runs/
 /data/
 .venv/
 tmp/
+
+# Local deduplication records, not source artifacts.
+.dedup*

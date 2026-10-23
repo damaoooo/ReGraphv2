@@ -5,11 +5,12 @@ Task 2: Re-optimize LLVM IR files using clang
 import sys
 import os
 import re
+from pathlib import Path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import typer
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from utils import (
     console,
@@ -17,6 +18,15 @@ from utils import (
     ensure_directory,
     file_exists_and_not_empty,
     normalize_clang_opt_level,
+)
+from pipeline_cache import (
+    build_input_signature,
+    compute_file_sha256,
+    create_temporary_output_path,
+    get_tool_identity,
+    is_cached_output_valid,
+    iter_completed_tasks,
+    write_completion_record,
 )
 
 app = typer.Typer()
@@ -120,8 +130,6 @@ def detect_arch_from_ir_header(file_path: str) -> str | None:
         return None
 
     triple = triple_match.group(1)
-    if triple == "x86_64-unknown-linux-gnu":
-        return None
     if re.search(r"(x86_64|amd64|aarch64|arm64|mips64)", triple):
         return "m64"
     if re.search(r"(^|[-_])(i386|i486|i586|i686|arm|thumb|mips)([-_]|$)", triple):
@@ -145,6 +153,17 @@ def canonicalize_passes_for_opt_level(opt_level: str) -> tuple[str, ...] | None:
     return TASK2_CANONICALIZE_PASSES_BY_OPT_LEVEL.get(opt_level)
 
 
+def build_cache_signature(file_path: str, opt_level: str, arch: str) -> dict:
+    """Identify the source IR, optimization settings, and LLVM tool version."""
+    passes = canonicalize_passes_for_opt_level(opt_level)
+    return build_input_signature(file_path, {
+        'script': compute_file_sha256(__file__), 'opt': opt_level, 'arch': arch,
+        'passes': list(passes) if passes else None,
+        'flags': list(TASK2_CLANG_REOPT_FLAGS),
+        'tool': get_tool_identity('opt' if passes else 'clang'),
+    })
+
+
 def sanitize_illegal_function_bitcasts(file_path: str, output_path: str) -> tuple[str | None, int]:
     """Drop invalid lifted stores that bitcast integers into function values."""
     invalid_values = set()
@@ -153,13 +172,16 @@ def sanitize_illegal_function_bitcasts(file_path: str, output_path: str) -> tupl
 
     with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
         for line in handle:
+            stripped = line.lstrip()
+            # SSA local names can be reused in different functions.
+            if stripped.startswith("define ") or stripped.startswith("}"):
+                invalid_values.clear()
             match = ILLEGAL_FUNCTION_BITCAST_RE.match(line)
             if match:
                 invalid_values.add(match.group("name"))
                 removed += 1
                 continue
 
-            stripped = line.lstrip()
             if invalid_values and stripped.startswith("store "):
                 if any(f" {name}," in line or f"\t{name}," in line for name in invalid_values):
                     removed += 1
@@ -188,10 +210,26 @@ def marker_path_for_output(input_root: str, output_path: str, opt_level: str, ar
 
 
 def reoptimize_file(file_path: str, output_path: str, opt_level: str, arch: str, marker_path: str):
-    """Re-optimize a single LLVM IR file using clang or the opt canonicalizer."""
-    if os.path.exists(marker_path):
-        os.remove(marker_path)
+    """Re-optimize into a temporary file, then publish and record successful output."""
+    expected_signature = build_cache_signature(file_path, opt_level, arch)
+    temporary_output_path = create_temporary_output_path(output_path)
+    Path(marker_path).unlink(missing_ok=True)
+    metadata = {}
+    try:
+        success, stdout, stderr = run_reoptimization_command(file_path, temporary_output_path, opt_level, arch, metadata)
+        if success:
+            os.replace(temporary_output_path, output_path)
+            write_completion_record(marker_path, expected_signature, output_path, metadata)
+        else:
+            Path(output_path).unlink(missing_ok=True)
+        return success, stdout, stderr
+    finally:
+        Path(temporary_output_path).unlink(missing_ok=True)
+        Path(os.path.splitext(temporary_output_path)[0] + '.sanitized.ll').unlink(missing_ok=True)
 
+
+def run_reoptimization_command(file_path: str, output_path: str, opt_level: str, arch: str, metadata: dict):
+    """Run clang/opt and the legacy sanitization retry; do not publish cache state."""
     arch_flag = ARCH_TO_CLANG_FLAG[arch]
     canonicalize_passes = canonicalize_passes_for_opt_level(opt_level)
     sanitized_input = ""
@@ -230,6 +268,8 @@ def reoptimize_file(file_path: str, output_path: str, opt_level: str, arch: str,
         sanitized_path, sanitized_removed = sanitize_illegal_function_bitcasts(file_path, output_path)
         if sanitized_path is not None:
             sanitized_input = sanitized_path
+            metadata['sanitized_removed_lines'] = sanitized_removed
+            console.print(f'[yellow]Warning: removed {sanitized_removed} invalid IR lines from {file_path}; this is not semantics-preserving canonicalization.[/yellow]')
             retry_command = [
                 "opt",
                 f"-passes={','.join(canonicalize_passes)}",
@@ -244,21 +284,6 @@ def reoptimize_file(file_path: str, output_path: str, opt_level: str, arch: str,
 
     if success and not file_exists_and_not_empty(output_path):
         return False, stdout, f"{tool} finished successfully but output is missing: {output_path}"
-
-    if success:
-        ensure_directory(os.path.dirname(marker_path))
-        with open(marker_path, "w", encoding="utf-8") as handle:
-            handle.write(f"opt_level={opt_level}\n")
-            handle.write(f"tool={tool}\n")
-            handle.write(f"arch={arch}\n")
-            handle.write(f"arch_flag={arch_flag}\n")
-            if canonicalize_passes is not None:
-                handle.write(f"passes={','.join(canonicalize_passes)}\n")
-                if sanitized_input:
-                    handle.write(f"sanitized_input={sanitized_input}\n")
-                    handle.write(f"sanitized_removed_lines={sanitized_removed}\n")
-            else:
-                handle.write(f"flags={' '.join(TASK2_CLANG_REOPT_FLAGS)}\n")
 
     return success, stdout, stderr
 
@@ -285,6 +310,8 @@ def main(
     """Re-optimize LLVM IR files using clang"""
 
     normalized_input_path = os.path.abspath(input_path)
+    if workers < 1:
+        raise typer.BadParameter('workers must be positive')
     normalized_opt_level = normalize_clang_opt_level(opt_level)
     normalized_arch = normalize_arch_mode(arch)
 
@@ -310,6 +337,7 @@ def main(
     unknown_arch_files = []
 
     for root, dirs, files in os.walk(normalized_input_path):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and not d.endswith('_functions')]
         if TASK2_STATE_DIRNAME in dirs:
             dirs.remove(TASK2_STATE_DIRNAME)
 
@@ -318,7 +346,7 @@ def main(
             continue
 
         for file in files:
-            if file.endswith(".ll"):
+            if file.endswith(".ll") and not file.endswith('.sanitized.ll') and not file.startswith('.'):
                 file_path = os.path.join(root, file)
                 resolved_arch = resolve_arch(file_path, normalized_arch)
                 if resolved_arch is None:
@@ -335,7 +363,7 @@ def main(
                 )
 
                 # Check if file already exists and we're resuming
-                if resume and file_exists_and_not_empty(output_file_path) and os.path.exists(marker_path):
+                if resume and is_cached_output_valid(marker_path, build_cache_signature(file_path, normalized_opt_level, resolved_arch), output_file_path):
                     skipped_reopt += 1
                     continue
 
@@ -392,10 +420,7 @@ def main(
         reopt_task = progress.add_task("Re-optimizing LLVM IR files", total=len(reopt_commands))
         
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            future_to_cmd = {executor.submit(reoptimize_file_wrapper, cmd): cmd for cmd in reopt_commands}
-            
-            for future in as_completed(future_to_cmd):
-                cmd = future_to_cmd[future]
+            for future, cmd in iter_completed_tasks(executor, reoptimize_file_wrapper, reopt_commands, workers * 2):
                 try:
                     success, stdout, stderr = future.result()
                     if not success:
@@ -412,6 +437,8 @@ def main(
                     progress.update(reopt_task, advance=1)
 
     console.print(f"[bold green]Task 2 completed! Success: {success_count}, Failed: {failed_count}[/bold green]")
+    if failed_count:
+        raise typer.Exit(code=1)
 
 if __name__ == "__main__":
     app()

@@ -4,17 +4,27 @@ Task 4: Recompile optimized LLVM bitcode files (.bc) to .re binaries.
 """
 import sys
 import os
+from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 import typer
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from task2_reoptimize import ARCH_TO_CLANG_FLAG, normalize_arch_mode, resolve_arch
 from utils import console, ensure_directory, file_exists_and_not_empty, run_command
+from pipeline_cache import (
+    build_input_signature,
+    compute_file_sha256,
+    create_temporary_output_path,
+    get_tool_identity,
+    is_cached_output_valid,
+    iter_completed_tasks,
+    write_completion_record,
+)
 
 app = typer.Typer()
 TASK4_STATE_DIRNAME = ".task4_recompile_state"
@@ -40,10 +50,35 @@ def marker_path_for_output(input_root: str, output_path: str, arch: str) -> str:
 
 
 def recompile_file(file_path: str, output_path: str, arch: str, marker_path: str):
-    """Recompile a single optimized .bc file to a .re binary artifact."""
-    if os.path.exists(marker_path):
-        os.remove(marker_path)
+    """Compile into a temporary file, then publish and record successful output."""
+    expected_signature = build_cache_signature(file_path, arch)
+    temporary_output_path = create_temporary_output_path(output_path)
+    Path(marker_path).unlink(missing_ok=True)
+    try:
+        success, stdout, stderr = run_recompile_command(file_path, temporary_output_path, arch)
+        if success:
+            os.replace(temporary_output_path, output_path)
+            write_completion_record(marker_path, expected_signature, output_path)
+        else:
+            Path(output_path).unlink(missing_ok=True)
+        return success, stdout, stderr
+    finally:
+        Path(temporary_output_path).unlink(missing_ok=True)
 
+
+def build_cache_signature(file_path: str, arch: str) -> dict:
+    """Identify the input bitcode, compilation settings, and clang version."""
+    compile_config = {
+        'script': compute_file_sha256(__file__),
+        'arch': arch,
+        'flags': list(TASK4_CLANG_RECOMPILE_FLAGS),
+        'tool': get_tool_identity('clang'),
+    }
+    return build_input_signature(file_path, compile_config)
+
+
+def run_recompile_command(file_path: str, output_path: str, arch: str):
+    """Run clang and validate its output; publication belongs to recompile_file."""
     arch_flag = ARCH_TO_CLANG_FLAG[arch]
     command = [
         "clang",
@@ -58,13 +93,6 @@ def recompile_file(file_path: str, output_path: str, arch: str, marker_path: str
 
     if success and not file_exists_and_not_empty(output_path):
         return False, stdout, f"clang finished successfully but output is missing: {output_path}"
-
-    if success:
-        ensure_directory(os.path.dirname(marker_path))
-        with open(marker_path, "w", encoding="utf-8") as handle:
-            handle.write(f"arch={arch}\n")
-            handle.write(f"arch_flag={arch_flag}\n")
-            handle.write(f"flags={' '.join(TASK4_CLANG_RECOMPILE_FLAGS)}\n")
 
     return success, stdout, stderr
 
@@ -88,6 +116,8 @@ def main(
     """Recompile optimized .bc files to .re files with clang."""
 
     normalized_input_path = os.path.abspath(input_path)
+    if workers < 1:
+        raise typer.BadParameter('workers must be positive')
     normalized_arch = normalize_arch_mode(arch)
 
     if not os.path.exists(normalized_input_path):
@@ -106,6 +136,7 @@ def main(
     unknown_arch_files = []
 
     for root, dirs, files in os.walk(normalized_input_path):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and not d.endswith('_functions')]
         if TASK4_STATE_DIRNAME in dirs:
             dirs.remove(TASK4_STATE_DIRNAME)
 
@@ -127,7 +158,7 @@ def main(
                 resolved_arch,
             )
 
-            if resume and file_exists_and_not_empty(output_file_path) and os.path.exists(marker_path):
+            if resume and is_cached_output_valid(marker_path, build_cache_signature(file_path, resolved_arch), output_file_path):
                 skipped_recompile += 1
                 continue
 
@@ -174,12 +205,7 @@ def main(
         recompile_task = progress.add_task("Recompiling bitcode files", total=len(recompile_commands))
 
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            future_to_cmd = {
-                executor.submit(recompile_file_wrapper, cmd): cmd for cmd in recompile_commands
-            }
-
-            for future in as_completed(future_to_cmd):
-                cmd = future_to_cmd[future]
+            for future, cmd in iter_completed_tasks(executor, recompile_file_wrapper, recompile_commands, workers * 2):
                 try:
                     success, stdout, stderr = future.result()
                     if not success:
@@ -198,6 +224,8 @@ def main(
     console.print(
         f"[bold green]Task 4 completed! Success: {success_count}, Failed: {failed_count}[/bold green]"
     )
+    if failed_count:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

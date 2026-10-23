@@ -4,6 +4,7 @@ Common utilities for the lift dataset pipeline
 import subprocess
 import os
 import resource
+import signal
 import typer
 from rich.console import Console
 
@@ -46,14 +47,20 @@ def run_command(command, description="", timeout=3600, memory_limit_gb=10):
             command, 
             stdout=subprocess.PIPE, 
             stderr=subprocess.PIPE,
+            start_new_session=True,
             preexec_fn=set_limits
         )
         stdout, stderr = p.communicate(timeout=timeout)
         success = p.returncode == 0
-        return success, stdout.decode(), stderr.decode()
+        return success, stdout.decode(errors='replace'), stderr.decode(errors='replace')
     except subprocess.TimeoutExpired:
-        p.kill()
-        return False, "", f"Command timed out after {timeout} seconds"
+        # The command can be a shell running llvm-extract; kill its whole group.
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = p.communicate()
+        return False, stdout.decode(errors='replace'), f"Command timed out after {timeout} seconds\n{stderr.decode(errors='replace')}"
     except Exception as e:
         return False, "", str(e)
 
