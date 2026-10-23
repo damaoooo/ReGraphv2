@@ -56,13 +56,13 @@ class FileFilter:
         self.num_processes = num_processes
         
     def _should_skip_file(self, file_path: str) -> bool:
-        """检查单个文件是否应该跳过"""
+        """检查单个文件是否应该跳过；读不了的文件是错误，不能当作小函数跳过"""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            return should_skip_this_file(content)
-        except Exception as e:
-            return True  # 读取失败时跳过该文件
+        except UnicodeDecodeError as error:
+            raise ValueError(f'{file_path} is not UTF-8 text: {error}') from error
+        return should_skip_this_file(content)
     
     def _filter_files_chunk(self, file_paths: List[str]) -> List[str]:
         """处理一批文件的预筛选"""
@@ -106,14 +106,10 @@ class FileFilter:
                     future_to_chunk[future] = chunk
                 
                 for future in as_completed(future_to_chunk):
-                    try:
-                        chunk_valid_files = future.result()
-                        valid_files.extend(chunk_valid_files)
-                        chunk = future_to_chunk[future]
-                        progress.update(task, advance=len(chunk))
-                    except Exception as e:
-                        chunk = future_to_chunk[future]
-                        progress.update(task, advance=len(chunk))
+                    # A failed chunk must fail the run: an incomplete list would be cached and would
+                    # remove the missing functions' results from the database
+                    valid_files.extend(future.result())
+                    progress.update(task, advance=len(future_to_chunk[future]))
         
         console.print(f"[green]Filtering completed: {len(valid_files)}/{len(file_paths)} files passed the filter")
         return valid_files

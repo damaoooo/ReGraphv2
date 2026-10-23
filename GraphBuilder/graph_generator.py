@@ -2,6 +2,7 @@ import os
 import subprocess
 import logging
 import hashlib
+from contextlib import closing
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 FUNCTIONS_SUFFIX = '_functions'
 ARTIFACTS_SUFFIX = '_graphs'
 ARTIFACT_ENDINGS = ('_purified.ll', '_instrumented.ll', '.dot')
-CACHE_FORMAT = 2
+CACHE_FORMAT = 3
 # Workers start with spawn: the parent already runs rich's progress-refresh thread when the pool starts, and
 # forking a multi-threaded process can leave a lock held forever in the child.
 MP_CONTEXT = multiprocessing.get_context('spawn')
@@ -76,7 +77,8 @@ def _opt_initial_purify(llvm_ir_path: str, artifact_dir: str) -> Optional[str]:
             "-load-pass-plugin=" + DEFAULT_PURIFY_SO_PATH,
             "--passes=strip-all-metadata",
             "-non-global-value-max-name-size=16384",
-            os.path.abspath(llvm_ir_path),
+            # relative to the artifact directory, so the ModuleID opt records does not depend on where the data lives
+            os.path.relpath(os.path.abspath(llvm_ir_path), artifact_dir),
             "-o", os.path.basename(purified_file)
         ]
 
@@ -210,7 +212,8 @@ def process_one_file(llvm_ir_path: str) -> Optional[Tuple[str, str, str, str, st
                     os.remove(path)
 
 
-def process_chunk(file_paths: List[str], queue: multiprocessing.Queue) -> Tuple[int, int]:
+def process_chunk(file_paths: List[str]) -> Tuple[List[tuple], List[str]]:
+    """Result rows of the functions that produced graphs, and the paths of those that failed."""
     results = []
     failed = []
     for file_path in file_paths:
@@ -221,8 +224,7 @@ def process_chunk(file_paths: List[str], queue: multiprocessing.Queue) -> Tuple[
             results.append(result + (signature,))
         else:
             failed.append(file_path)
-    queue.put((results, failed))  # Send results back to the main process
-    return len(results), len(failed)
+    return results, failed
 
 
 def init_database(output_db_path: str):
@@ -248,40 +250,28 @@ def init_database(output_db_path: str):
         conn.commit()
 
 
-def file_writer(queue: multiprocessing.Queue, output_db_path: str):
-    with sqlite3.connect(output_db_path) as conn:
-        cursor = conn.cursor()
-
-        while True:
-            message = queue.get()
-            if isinstance(message, str) and message == "STOP":
-                break
-            results, failed = message
-
-            # Use executemany for batch insert - much more efficient
-            cursor.executemany("""
-                INSERT OR REPLACE INTO results (input_path, purify_path, instrumented_path, cfg_dot, ddg_dot, signature)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, results)
-            # A function that fails now must not keep a result row from an earlier input or toolchain
-            cursor.executemany("DELETE FROM results WHERE input_path = ?", [(path,) for path in failed])
-
-            # Commit every batch_size batches instead of every batch
-            conn.commit()
-
-        # Final commit for any remaining data
-        conn.commit()
+def write_results(connection: sqlite3.Connection, results: List[tuple], failed: List[str]):
+    connection.executemany("""
+        INSERT OR REPLACE INTO results (input_path, purify_path, instrumented_path, cfg_dot, ddg_dot, signature)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, results)
+    # A function that fails now must not keep a result row from an earlier input or toolchain
+    connection.executemany("DELETE FROM results WHERE input_path = ?", [(path,) for path in failed])
+    connection.commit()
 
 
 def _function_dirs_digest(input_dir: str) -> str:
-    """Changes whenever Task 3 re-extracts any binary (function_map.csv is rewritten with the directory)."""
+    """Changes whenever any file of any function directory is added, removed or rewritten.
+
+    Task 3 republishes a function directory as new files, so name, size and modification time of every
+    file cover a re-extraction even when function_map.csv and the file count stay the same.
+    """
     digest = hashlib.sha256()
-    for map_file in sorted(find_llvm_files(input_dir, pattern=f"**/*{FUNCTIONS_SUFFIX}/function_map.csv")):
-        digest.update(map_file.encode())
-        digest.update(_file_sha256(map_file).encode())
     for function_dir in sorted(find_llvm_files(input_dir, pattern=f"**/*{FUNCTIONS_SUFFIX}/")):
         digest.update(function_dir.encode())
-        digest.update(str(len(os.listdir(function_dir))).encode())
+        for entry in sorted(os.scandir(function_dir), key=lambda entry: entry.name):
+            stat = entry.stat()
+            digest.update(f'{entry.name}\0{stat.st_size}\0{stat.st_mtime_ns}\n'.encode())
     return digest.hexdigest()
 
 
@@ -371,17 +361,14 @@ def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs:
     completed = _completed_inputs(db_path, valid_files)
     valid_files = [f for f in valid_files if f not in completed]
     console.print(f"[green]Filtered {len(valid_files)} files to process ({len(completed)} up to date).[/green]")
-    queue = MP_CONTEXT.Manager().Queue()
-    writer_process = MP_CONTEXT.Process(target=file_writer, args=(queue, db_path))
-    writer_process.start()
-
     # Use multiprocessing to process files in parallel
     console.print("[cyan]Starting file processing in parallel...[/cyan]")
 
-    counts = {'ok': 0, 'failed': 0}
-    chunk_errors = []
+    chunk_size = 100
+    chunks = [valid_files[i:i + chunk_size] for i in range(0, len(valid_files), chunk_size)]
+    generated = failed_count = 0
 
-    with Progress(
+    with closing(sqlite3.connect(db_path)) as connection, Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -389,42 +376,20 @@ def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs:
         TextColumn("[cyan]{task.completed}/{task.total}"),
         TimeElapsedColumn(),
         TimeRemainingColumn()
-    ) as progress:
-
-        pool = MP_CONTEXT.Pool(processes=jobs)
-
+    ) as progress, MP_CONTEXT.Pool(processes=jobs) as pool:
         task = progress.add_task("[cyan]Processing files...", total=len(valid_files))
-        chunk_size = 100
+        try:
+            # Results come back to this process, which alone writes the database
+            for results, failed in pool.imap_unordered(process_chunk, chunks):
+                write_results(connection, results, failed)
+                generated += len(results)
+                failed_count += len(failed)
+                progress.update(task, advance=len(results) + len(failed))
+        except Exception as error:  # a worker raised: not a per-function failure, the run is incomplete
+            console.print(f"[red]Graph generation incomplete after {generated} functions: {error!r}[/red]")
+            return False
 
-        def on_done(result, size):
-            counts['ok'] += result[0]
-            counts['failed'] += result[1]
-            progress.update(task, advance=size)
-
-        def on_error(error, size):
-            chunk_errors.append(error)
-            progress.update(task, advance=size)
-
-        for i in range(0, len(valid_files), chunk_size):
-            chunk = valid_files[i:i + chunk_size]
-            current_chunk_size = len(chunk)
-            pool.apply_async(process_chunk, args=(chunk, queue),
-                             callback=lambda result, size=current_chunk_size: on_done(result, size),
-                             error_callback=lambda error, size=current_chunk_size: on_error(error, size))
-
-        pool.close()
-        pool.join()
-
-        queue.put("STOP")  # Signal the writer process to stop
-        writer_process.join()
-
-    console.print(f"[blue]Generated {counts['ok']}, failed {counts['failed']} functions; "
-                  f"{len(chunk_errors)} chunk errors. Results saved to {db_path}[/blue]")
-    for error in chunk_errors[:5]:
-        console.print(f"[red]Chunk error: {error!r}[/red]")
-    if chunk_errors or writer_process.exitcode != 0:
-        console.print(f"[red]Graph generation incomplete (writer exit code {writer_process.exitcode}).[/red]")
-        return False
+    console.print(f"[blue]Generated {generated}, failed {failed_count} functions. Results saved to {db_path}[/blue]")
     console.print("[green]Pipeline completed successfully![/green]")
     return True
 

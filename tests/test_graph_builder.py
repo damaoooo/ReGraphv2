@@ -260,3 +260,24 @@ def test_file_processor_shares_one_encoding_with_both_graphs(tools, tmp_path):
     assert result.input_ids == tools(normalize_file(purified))['input_ids']
     assert result.cfg_graph == CFGGraphBuilder(tools, purified, cfg_dot).build_cfg_edges()
     assert result.ddg_graph == DataDependencyGraphBuilder(tools).generate_ddg_matrix(ddg_dot, instrumented, purified)
+
+
+def test_file_cache_sees_a_function_rewritten_in_place(tools, tmp_path):
+    """Re-extraction can keep function_map.csv and the file count; the cache must still notice."""
+    import GraphBuilder.graph_generator as generator
+    functions = tmp_path / 'bin_functions'
+    small = write_function(functions, 'a', 'define i32 @probe() {\nentry:\n  ret i32 0\n}\n')
+    (functions / 'function_map.csv').write_text('OriginalFunctionName,HashedFileName\n"probe","a.ll"\n')
+    assert generator.pipeline(str(tmp_path), cleanup=True, use_cache=True, jobs=1)
+    assert rows(tmp_path / 'results.db') == {}  # too small: filtered out
+    small.write_text(TWO_STORES)
+    assert generator.pipeline(str(tmp_path), cleanup=True, use_cache=True, jobs=1)
+    assert set(rows(tmp_path / 'results.db')) == {str(small)}
+
+
+def test_unreadable_function_fails_the_prefilter(tools, tmp_path):
+    import GraphBuilder.graph_generator as generator
+    write_function(tmp_path / 'bin_functions', 'a', TWO_STORES)
+    (tmp_path / 'bin_functions' / 'b.ll').write_bytes(b'define i32 @f() {\n\xff\xfe\n}\n')
+    with pytest.raises(ValueError, match='not UTF-8'):
+        generator.pipeline(str(tmp_path), cleanup=True, use_cache=False, jobs=1)
