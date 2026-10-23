@@ -10,6 +10,42 @@ import bisect
 from Tokenizer.ir_tokenizer import load_tokenizer
 
 
+_LABEL_LINE = re.compile(r'^\s*(?:"[^"]*"|[-$.\w]+):\s*$')
+
+
+def split_instructions(normalized_ir: str):
+    """Return (start, end, text) character spans of the instructions in function bodies, in order.
+
+    A `switch` / `indirectbr` that opens a `[` case list continues up to the line starting with `]`,
+    so each span is one whole instruction even when it covers several lines.
+    """
+    spans = []
+    offset = 0
+    inside_function = False
+    open_start, open_parts = None, []
+    for line in normalized_ir.splitlines(keepends=True):
+        body = line.rstrip('\r\n')
+        stripped = body.strip()
+        if open_start is not None:
+            open_parts.append(stripped)
+            if stripped.startswith(']'):
+                spans.append((open_start, offset + len(body), ' '.join(open_parts)))
+                open_start, open_parts = None, []
+        elif body.startswith('define '):
+            inside_function = True
+        elif body.startswith('}'):
+            inside_function = False
+        elif inside_function and stripped and not _LABEL_LINE.match(body):
+            if stripped.endswith('['):
+                open_start, open_parts = offset + len(body) - len(body.lstrip()), [stripped]
+            else:
+                spans.append((offset + len(body) - len(body.lstrip()), offset + len(body), stripped))
+        offset += len(line)
+    if open_start is not None:
+        raise ValueError("unterminated multi-line instruction in normalized IR")
+    return spans
+
+
 class DataDependencyGraphBuilder:
     def __init__(self, tokenizer: PreTrainedTokenizerFast):
         self.tokenizer = tokenizer
@@ -31,41 +67,23 @@ class DataDependencyGraphBuilder:
         return g
     
     def _build_instrumented_dict(self, instrumented_file: str):
-        instrumented_normalized = normalize_file(instrumented_file)
-        
-        for line in instrumented_normalized.splitlines():
-            if "!my_id !" in line:
-                match = self.my_id_pattern.search(line)
-                if match:
-                    line_instruction_number = match.group(1)
-                    # Remove: ", !my_id !57"
-                    refined_line = self.my_id_remove_pattern.sub('', line)
-                    self.normalized_instrumented_dict[line_instruction_number] = refined_line
-    
+        """Instructions of the instrumented IR in order, as (my_id or None, text without the my_id tag)."""
+        self.instrumented_instructions = []
+        for _, _, text in split_instructions(normalize_file(instrumented_file)):
+            match = self.my_id_pattern.search(text)
+            # Remove: ", !my_id !57"
+            refined = self.my_id_remove_pattern.sub('', text)
+            self.instrumented_instructions.append((match.group(1) if match else None, refined))
+            if match:
+                self.normalized_instrumented_dict[match.group(1)] = refined
+
     def _get_tokenization_result(self, text: str):
         """Cache tokenization results to avoid repeated computation"""
         if text not in self._tokenization_cache:
             self._tokenization_cache[text] = self.tokenizer(text, return_offsets_mapping=True)
         return self._tokenization_cache[text]
-    
-    def _find_mapping_in_normalized_origin(self, instruct_number: str, normalized_origin: str, tokens_cache=None):
-        mapping_str = self.normalized_instrumented_dict[instruct_number]
-        start_index = normalized_origin.find(mapping_str)
-        
-        if start_index == -1:
-            print(f"Mapping for instruction {instruct_number} not found in normalized origin.")
-            return None, None
-        
-        end_index = start_index + len(mapping_str)
 
-        # Use cached tokenization result if available
-        if tokens_cache is not None:
-            tokens = tokens_cache
-        else:
-            tokens = self._get_tokenization_result(normalized_origin)
-        
-        offsets = tokens['offset_mapping']
-
+    def _char_span_to_token_range(self, start_index: int, end_index: int, offsets):
         search_start_idx = bisect.bisect_left(offsets, (start_index, 0))
         scan_start_idx = max(0, search_start_idx - 1)
         token_idx_start = None
@@ -90,15 +108,30 @@ class DataDependencyGraphBuilder:
         return token_idx_start, token_idx_end
     
     def _build_id_range_map(self, origin_ir: str):
+        """Pair the k-th instrumented instruction with the k-th instruction of the origin IR.
+
+        The DDG pass only attaches metadata, so both files list the same instructions in the same order;
+        locating an instruction by its text would pick the first of several identical instructions.
+        Any disagreement between the two listings fails the function instead of producing wrong edges.
+        """
         original_normalized = normalize_file(origin_ir)
-        
+        if not original_normalized:
+            raise ValueError(f"empty normalized IR: {origin_ir}")
+        origin_instructions = split_instructions(original_normalized)
+        if len(origin_instructions) != len(self.instrumented_instructions):
+            raise ValueError(f"instrumented IR has {len(self.instrumented_instructions)} instructions, "
+                             f"origin IR has {len(origin_instructions)}")
+
         # Tokenize once and reuse for all mappings
-        tokens = self._get_tokenization_result(original_normalized)
-        
-        for instruct_number in self.normalized_instrumented_dict:
-            start_idx, end_idx = self._find_mapping_in_normalized_origin(
-                instruct_number, original_normalized, tokens
-            )
+        offsets = self._get_tokenization_result(original_normalized)['offset_mapping']
+
+        for (instruct_number, instrumented_text), (start, end, text) in zip(self.instrumented_instructions,
+                                                                          origin_instructions):
+            if instrumented_text != text:
+                raise ValueError(f"instrumented IR does not match origin IR: {instrumented_text!r} != {text!r}")
+            if instruct_number is None:
+                continue
+            start_idx, end_idx = self._char_span_to_token_range(start, end, offsets)
             if end_idx is not None:
                 self.id_range_map[instruct_number] = (start_idx, end_idx)
     
@@ -150,8 +183,11 @@ class DataDependencyGraphBuilder:
         self._tokenization_cache.clear()
     
     def generate_ddg_matrix(self, dot_file: str, instrumented_file: str, origin_ir: str):
-        # Clear previous state and cache
-        self.matrix_edges.clear()
+        # Fresh state per function; the returned list must not be cleared by a later call
+        self.matrix_edges = []
+        self.normalized_instrumented_dict = {}
+        self.id_range_map = {}
+        self.node_id_inst_id_map = {}
         self.clear_cache()
         
         graph = self._read_dot_file(dot_file)

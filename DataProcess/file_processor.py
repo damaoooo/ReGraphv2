@@ -48,6 +48,10 @@ class FileProcessor:
         """Generate token IDs and attention mask using purified IR"""
         try:
             normalized_ir = normalize_file(purified_file)
+            # normalize_file returns "" when the file cannot be read; that is a failure, not an empty function
+            if not normalized_ir.strip():
+                self.logger.error(f"Empty normalized IR for {input_file} ({purified_file})")
+                return None
             tokens = self.tokenizer(normalized_ir)
             return tokens['input_ids'], tokens['attention_mask']
         except Exception as e:
@@ -82,7 +86,8 @@ class FileProcessor:
             token_result = self._generate_token_ids(input_file=input_file, purified_file=purified_file)
             input_ids, attention_mask = token_result if token_result else (None, None)
             
-            success = ddg_graph is not None or cfg_graph is not None or input_ids is not None
+            # A sample needs its tokens and both graphs; an empty edge list is a valid graph, None is a failure
+            success = ddg_graph is not None and cfg_graph is not None and input_ids is not None
             
             return ProcessingResult(
                 file_path=input_file,

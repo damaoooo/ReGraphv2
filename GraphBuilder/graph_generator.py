@@ -1,12 +1,15 @@
 import os
 import subprocess
 import logging
+import hashlib
+from functools import lru_cache
+from pathlib import Path
 from typing import Optional, Tuple, List
 from Utils.utils import *
 import pickle
 import sqlite3
 import multiprocessing
-from DataProcess.dataset_utils import FileFilter, find_llvm_files, cleanup_residual_temp_files
+from DataProcess.dataset_utils import FileFilter, find_llvm_files
 import typer
 
 from rich.console import Console
@@ -17,11 +20,52 @@ console = Console()
 # Global logger for multiprocessing
 logger = logging.getLogger(__name__)
 
-def _opt_initial_purify(llvm_ir_path: str) -> Optional[str]:
+# Graph artifacts live next to the extracted functions, never inside them: Task 3 publishes
+# `<binary>_functions/` as an exact file set and replaces it when that set changes.
+FUNCTIONS_SUFFIX = '_functions'
+ARTIFACTS_SUFFIX = '_graphs'
+ARTIFACT_ENDINGS = ('_purified.ll', '_instrumented.ll', '.dot')
+CACHE_FORMAT = 2
+
+
+def artifact_dir_for(llvm_ir_path: str) -> str:
+    """`.../<binary>_functions/<hash>.ll` -> `.../<binary>_graphs`; a file elsewhere keeps its own directory."""
+    function_dir = os.path.dirname(os.path.abspath(llvm_ir_path))
+    if not function_dir.endswith(FUNCTIONS_SUFFIX):
+        return function_dir
+    return function_dir[:-len(FUNCTIONS_SUFFIX)] + ARTIFACTS_SUFFIX
+
+
+def _file_sha256(path: str) -> str:
+    with open(path, 'rb') as handle:
+        return hashlib.file_digest(handle, 'sha256').hexdigest()
+
+
+@lru_cache(maxsize=None)
+def _tool_signature() -> str:
+    """Passes and opt that produce the artifacts; a rebuild or upgrade invalidates earlier results."""
+    opt_version = subprocess.run(["opt", "--version"], text=True, capture_output=True, check=True).stdout
+    parts = [opt_version] + [_file_sha256(path) for path in (DEFAULT_PURIFY_SO_PATH, DEFAULT_DDG_SO_PATH, DEFAULT_CFG_SO_PATH)]
+    return hashlib.sha256('\n'.join(parts).encode()).hexdigest()
+
+
+def result_signature(llvm_ir_path: str) -> str:
+    """Bind a result row to the input function's content (paths are reused when functions are re-extracted)."""
+    return hashlib.sha256((_tool_signature() + _file_sha256(llvm_ir_path)).encode()).hexdigest()
+
+
+def _run_opt(cmd: List[str], cwd: str, step: str, llvm_ir_path: str) -> Optional[subprocess.CompletedProcess]:
+    p = subprocess.run(cmd, text=True, capture_output=True, cwd=cwd)
+    if p.returncode != 0:
+        logger.error(f"{step} failed for {llvm_ir_path} with return code {p.returncode}, stdout: {p.stdout}, stderr: {p.stderr}")
+        return None
+    return p
+
+
+def _opt_initial_purify(llvm_ir_path: str, artifact_dir: str) -> Optional[str]:
     """Strip all metadata from LLVM IR using custom pass"""
-    purified_file = os.path.splitext(llvm_ir_path)[0] + '_purified.ll'
-    new_path = os.path.dirname(llvm_ir_path)
-    
+    purified_file = os.path.join(artifact_dir, os.path.splitext(os.path.basename(llvm_ir_path))[0] + '_purified.ll')
+
     try:
         cmd = [
             "opt",
@@ -29,33 +73,28 @@ def _opt_initial_purify(llvm_ir_path: str) -> Optional[str]:
             "-load-pass-plugin=" + DEFAULT_PURIFY_SO_PATH,
             "--passes=strip-all-metadata",
             "-non-global-value-max-name-size=16384",
-            os.path.basename(llvm_ir_path),
+            os.path.abspath(llvm_ir_path),
             "-o", os.path.basename(purified_file)
         ]
 
-        p = subprocess.run(cmd, text=True, capture_output=True, cwd=new_path)
-        stdout, stderr = p.stdout, p.stderr
-        if p.returncode != 0:
-            error_message = f"opt failed with return code {p.returncode}, stdout: {stdout}, stderr: {stderr}"
-            logger.error(error_message)
-            raise ValueError(error_message)
-            
-        if not os.path.exists(os.path.join(new_path, os.path.basename(purified_file))):
-            error_message = f"Purified file was not created: {purified_file}"
-            logger.error(error_message)
-            raise ValueError(error_message)
-            
-        return os.path.join(new_path, os.path.basename(purified_file))
-        
+        if _run_opt(cmd, artifact_dir, "metadata stripping", llvm_ir_path) is None:
+            return None
+
+        if not os.path.exists(purified_file):
+            logger.error(f"Purified file was not created: {purified_file}")
+            return None
+
+        return purified_file
+
     except Exception as e:
         logger.error(f"Exception in metadata stripping for {llvm_ir_path}: {e}")
         return None
-        
+
 def _opt_generate_ddg(purified_llvm_ir_path: str) -> Optional[Tuple[str, str]]:
     """Generate DDG using opt tool on purified IR"""
     instrumented_file = os.path.splitext(purified_llvm_ir_path)[0] + '_instrumented.ll'
     new_path = os.path.dirname(purified_llvm_ir_path)
-    
+
     try:
         cmd = [
             "opt",
@@ -67,32 +106,33 @@ def _opt_generate_ddg(purified_llvm_ir_path: str) -> Optional[Tuple[str, str]]:
             "-o", os.path.basename(instrumented_file)
         ]
 
-        p = subprocess.run(cmd, text=True, capture_output=True, cwd=new_path)
-        stdout, stderr = p.stdout, p.stderr
+        p = _run_opt(cmd, new_path, "DDG generation", purified_llvm_ir_path)
+        if p is None:
+            return None
 
         dot_file = None
-        for line in stderr.splitlines():
+        for line in p.stderr.splitlines():
             if "Writing ID-tagged graph to" in line:
                 dot_file = line.split("'")[1]
                 break
         else:
-            logger.error("No dot file generated by opt, output is" f"{stdout} | stderr: {stderr}")
+            logger.error("No dot file generated by opt, output is" f"{p.stdout} | stderr: {p.stderr}")
             return None
-                
-        if dot_file is None:
+
+        dot_file = os.path.normpath(os.path.join(new_path, dot_file))
+        if not (os.path.exists(dot_file) and os.path.exists(instrumented_file)):
+            logger.error(f"DDG outputs missing for {purified_llvm_ir_path}")
             return None
-            
-        dot_file = os.path.join(new_path, dot_file)
         return instrumented_file, dot_file
-        
+
     except Exception as e:
         logger.error(f"Exception in DDG generation for {purified_llvm_ir_path}: {e}")
         return None
-        
+
 def _opt_generate_cfg(purified_llvm_ir_path: str) -> Optional[str]:
     """Generate CFG using opt tool on purified IR"""
     new_path = os.path.dirname(purified_llvm_ir_path)
-    
+
     try:
         cmd = [
             "opt",
@@ -103,61 +143,83 @@ def _opt_generate_cfg(purified_llvm_ir_path: str) -> Optional[str]:
             "-o", "/dev/null"
         ]
 
-        p = subprocess.run(cmd, text=True, capture_output=True, cwd=new_path)
-        stdout, stderr = p.stdout, p.stderr
+        p = _run_opt(cmd, new_path, "CFG generation", purified_llvm_ir_path)
+        if p is None:
+            return None
 
         dot_file = None
-        for line in stderr.splitlines():
+        for line in p.stderr.splitlines():
             if "Write CFG to " in line:
                 dot_file = line.split("'")[1]
                 break
         else:
-            logger.error("No dot file generated by opt, output is" f"{stdout} | stderr: {stderr}")
+            logger.error("No dot file generated by opt, output is" f"{p.stdout} | stderr: {p.stderr}")
             return None
-        
-        if dot_file is None:
+
+        dot_file = os.path.normpath(os.path.join(new_path, dot_file))  # the pass reports './cfg_<hash>.dot'
+        if not os.path.exists(dot_file):
+            logger.error(f"CFG dot file missing for {purified_llvm_ir_path}")
             return None
-            
-        return os.path.join(new_path, dot_file)
-        
+        return dot_file
+
     except Exception as e:
         logger.error(f"Exception in CFG generation for {purified_llvm_ir_path}: {e}")
         return None
-    
-def process_one_file(llvm_ir_path: str) -> Optional[Tuple[str, str, str, str]]:
+
+def process_one_file(llvm_ir_path: str) -> Optional[Tuple[str, str, str, str, str]]:
     """
     Process a single LLVM IR file to generate purified IR, DDG, and CFG.
-    
+
     Args:
         llvm_ir_path: Path to the LLVM IR file.
-        
+
     Returns:
-        Tuple of paths (purified_llvm_ir_path, ddg_dot_file, cfg_dot_file) or None if any step fails.
+        Tuple (input, purified IR, instrumented IR, CFG dot, DDG dot) or None if any step fails;
+        a failed function leaves no artifacts behind.
     """
-    purified_llvm_ir_path = _opt_initial_purify(llvm_ir_path)
-    if purified_llvm_ir_path is None:
-        return None
-    
-    ddg_result = _opt_generate_ddg(purified_llvm_ir_path)
-    if ddg_result is None:
-        return None
-    
-    instrumented_file, ddg_dot_file = ddg_result
-    
-    cfg_dot_file = _opt_generate_cfg(purified_llvm_ir_path)
-    if cfg_dot_file is None:
-        return None
-    
-    return llvm_ir_path, purified_llvm_ir_path, instrumented_file, cfg_dot_file, ddg_dot_file
+    artifact_dir = artifact_dir_for(llvm_ir_path)
+    os.makedirs(artifact_dir, exist_ok=True)
+    produced = []
+    result = None
+    try:
+        purified_llvm_ir_path = _opt_initial_purify(llvm_ir_path, artifact_dir)
+        if purified_llvm_ir_path is None:
+            return None
+        produced.append(purified_llvm_ir_path)
+
+        ddg_result = _opt_generate_ddg(purified_llvm_ir_path)
+        if ddg_result is None:
+            return None
+
+        instrumented_file, ddg_dot_file = ddg_result
+        produced += [instrumented_file, ddg_dot_file]
+
+        cfg_dot_file = _opt_generate_cfg(purified_llvm_ir_path)
+        if cfg_dot_file is None:
+            return None
+
+        result = (llvm_ir_path, purified_llvm_ir_path, instrumented_file, cfg_dot_file, ddg_dot_file)
+        return result
+    finally:
+        if result is None:
+            for path in produced:
+                if os.path.exists(path):
+                    os.remove(path)
 
 
-def process_chunk(file_paths: List[str], queue: multiprocessing.Queue) -> List[Optional[Tuple[str, str, str, str]]]:
+def process_chunk(file_paths: List[str], queue: multiprocessing.Queue) -> Tuple[int, int]:
     results = []
+    failed = []
     for file_path in file_paths:
+        # Hash the input before processing so the row describes the content the artifacts came from
+        signature = result_signature(file_path)
         result = process_one_file(file_path)
         if result is not None:
-            results.append(result)
-    queue.put(results)  # Send results back to the main process
+            results.append(result + (signature,))
+        else:
+            failed.append(file_path)
+    queue.put((results, failed))  # Send results back to the main process
+    return len(results), len(failed)
 
 
 def init_database(output_db_path: str):
@@ -171,9 +233,14 @@ def init_database(output_db_path: str):
             purify_path TEXT,
             instrumented_path TEXT,
             cfg_dot TEXT,
-            ddg_dot TEXT
+            ddg_dot TEXT,
+            signature TEXT
             )
         """)
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(results)")}
+        if 'signature' not in columns:
+            # Rows from before signatures were recorded cannot be verified and will be regenerated
+            cursor.execute("ALTER TABLE results ADD COLUMN signature TEXT")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_input_path ON results(input_path)")
         conn.commit()
 
@@ -181,70 +248,135 @@ def init_database(output_db_path: str):
 def file_writer(queue: multiprocessing.Queue, output_db_path: str):
     with sqlite3.connect(output_db_path) as conn:
         cursor = conn.cursor()
-        
+
         while True:
-            results = queue.get()
-            if isinstance(results, str) and results == "STOP":
+            message = queue.get()
+            if isinstance(message, str) and message == "STOP":
                 break
-            
+            results, failed = message
+
             # Use executemany for batch insert - much more efficient
             cursor.executemany("""
-                INSERT OR REPLACE INTO results (input_path, purify_path, instrumented_path, cfg_dot, ddg_dot)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO results (input_path, purify_path, instrumented_path, cfg_dot, ddg_dot, signature)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, results)
-            
+            # A function that fails now must not keep a result row from an earlier input or toolchain
+            cursor.executemany("DELETE FROM results WHERE input_path = ?", [(path,) for path in failed])
+
             # Commit every batch_size batches instead of every batch
             conn.commit()
-        
+
         # Final commit for any remaining data
         conn.commit()
 
 
-def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs: int = multiprocessing.cpu_count()):
-    if cleanup:
-        cleanup_residual_temp_files(input_dir)
+def _function_dirs_digest(input_dir: str) -> str:
+    """Changes whenever Task 3 re-extracts any binary (function_map.csv is rewritten with the directory)."""
+    digest = hashlib.sha256()
+    for map_file in sorted(find_llvm_files(input_dir, pattern=f"**/*{FUNCTIONS_SUFFIX}/function_map.csv")):
+        digest.update(map_file.encode())
+        digest.update(_file_sha256(map_file).encode())
+    for function_dir in sorted(find_llvm_files(input_dir, pattern=f"**/*{FUNCTIONS_SUFFIX}/")):
+        digest.update(function_dir.encode())
+        digest.update(str(len(os.listdir(function_dir))).encode())
+    return digest.hexdigest()
 
 
+def _list_valid_files(input_dir: str, use_cache: bool) -> List[str]:
     cache_path = os.path.join(input_dir, 'filecache.pkl')
-    db_path = os.path.join(input_dir, 'results.db')
+    key = _function_dirs_digest(input_dir)
     if use_cache and os.path.exists(cache_path):
         with open(cache_path, 'rb') as f:
-            valid_files = pickle.load(f)
-            console.print(f"[green]Loaded {len(valid_files)} valid files from cache.[/green]")
+            cached = pickle.load(f)
+        if isinstance(cached, dict) and cached.get('format') == CACHE_FORMAT and cached.get('key') == key:
+            console.print(f"[green]Loaded {len(cached['files'])} valid files from cache.[/green]")
+            return cached['files']
+        console.print("[yellow]File cache is stale (functions were re-extracted); rebuilding it.[/yellow]")
 
-    else:
-        console.print("[yellow]Start to build the file and save to cache...[/yellow]")
-        llvm_files = find_llvm_files(input_dir, pattern="**/*_functions/*.ll")
-        llvm_files = [os.path.abspath(f) for f in llvm_files]
-        
-        # Remove those files end with '.dot' or '_instrumented.ll' or '_purified.ll'
-        llvm_files = [f for f in llvm_files if not (f.endswith('.dot') or 
-                                                    f.endswith('_instrumented.ll') or 
-                                                    f.endswith('_purified.ll'))]
-        file_filter = FileFilter(num_processes=multiprocessing.cpu_count())
-        valid_files = file_filter.filter_files_parallel(llvm_files)
-        if use_cache:
-            with open(cache_path, 'wb') as f:
-                pickle.dump(valid_files, f)
-            console.print(f"[green]Saved {len(valid_files)} valid files to cache.[/green]")
+    console.print("[yellow]Start to build the file and save to cache...[/yellow]")
+    llvm_files = find_llvm_files(input_dir, pattern=f"**/*{FUNCTIONS_SUFFIX}/*.ll")
+    llvm_files = [os.path.abspath(f) for f in llvm_files]
+
+    # Remove graph artifacts left inside function directories by older versions
+    llvm_files = [f for f in llvm_files if not f.endswith(ARTIFACT_ENDINGS)]
+    file_filter = FileFilter(num_processes=multiprocessing.cpu_count())
+    valid_files = sorted(file_filter.filter_files_parallel(llvm_files))
+    if use_cache:
+        with open(cache_path, 'wb') as f:
+            pickle.dump({'format': CACHE_FORMAT, 'key': key, 'files': valid_files}, f)
+        console.print(f"[green]Saved {len(valid_files)} valid files to cache.[/green]")
+    return valid_files
+
+
+def _completed_inputs(db_path: str, valid_files: List[str]) -> set:
+    """Inputs whose row matches the current input content and toolchain and whose artifacts all exist."""
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT input_path, purify_path, instrumented_path, cfg_dot, ddg_dot, signature FROM results").fetchall()
+    rows = {row[0]: row for row in rows}
+    completed = set()
+    for path in valid_files:
+        row = rows.get(path)
+        if row is None or not all(row[1:5]) or not all(os.path.exists(p) for p in row[1:5]):
+            continue
+        if row[5] == result_signature(path):
+            completed.add(path)
+    return completed
+
+
+def _prune_and_cleanup(input_dir: str, db_path: str, valid_files: List[str], cleanup: bool):
+    """Drop rows of functions that are gone or filtered out, then (cleanup) delete unreferenced artifacts."""
+    with sqlite3.connect(db_path) as conn:
+        stored = [row[0] for row in conn.execute("SELECT input_path FROM results")]
+        valid = set(valid_files)
+        stale = [(path,) for path in stored if path not in valid]
+        conn.executemany("DELETE FROM results WHERE input_path = ?", stale)
+        conn.commit()
+        referenced = {os.path.normpath(p) for row in conn.execute(
+            "SELECT purify_path, instrumented_path, cfg_dot, ddg_dot FROM results") for p in row if p}
+    if stale:
+        console.print(f"[yellow]Removed {len(stale)} results of functions no longer present.[/yellow]")
+    if not cleanup:
+        return
+
+    removed = 0
+    for root, dirs, files in os.walk(input_dir):
+        # Only GraphBuilder's own artifacts: leftovers in *_graphs (interrupted runs) and, from older
+        # versions, artifacts written inside *_functions; artifacts of recorded results are kept
+        if not root.endswith((ARTIFACTS_SUFFIX, FUNCTIONS_SUFFIX)):
+            continue
+        for file in files:
+            path = os.path.join(root, file)
+            if file.endswith(ARTIFACT_ENDINGS) and path not in referenced:
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    continue
+    console.print(f"[green]Cleaned up {removed} unreferenced graph artifacts[/green]")
+
+
+def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs: int = multiprocessing.cpu_count()) -> bool:
+    input_dir = os.path.abspath(input_dir)
+    db_path = os.path.join(input_dir, 'results.db')
+    valid_files = _list_valid_files(input_dir, use_cache)
 
     console.print(f"[yellow]Filtering finished Files...[/yellow]")
     init_database(db_path)
+    _prune_and_cleanup(input_dir, db_path, valid_files, cleanup)
 
-    # Get all input_path from database and filter out already processed files
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT input_path FROM results")
-        processed_files: set = {row[0] for row in cursor.fetchall()}
-    
-    valid_files = [f for f in valid_files if f not in processed_files]
-    console.print(f"[green]Filtered {len(valid_files)} files to process.[/green]")
+    # Skip only results that still match the input and toolchain and whose artifacts exist
+    completed = _completed_inputs(db_path, valid_files)
+    valid_files = [f for f in valid_files if f not in completed]
+    console.print(f"[green]Filtered {len(valid_files)} files to process ({len(completed)} up to date).[/green]")
     queue = multiprocessing.Manager().Queue()
     writer_process = multiprocessing.Process(target=file_writer, args=(queue, db_path))
     writer_process.start()
 
     # Use multiprocessing to process files in parallel
     console.print("[cyan]Starting file processing in parallel...[/cyan]")
+
+    counts = {'ok': 0, 'failed': 0}
+    chunk_errors = []
 
     with Progress(
         SpinnerColumn(),
@@ -260,40 +392,61 @@ def pipeline(input_dir: str, cleanup: bool = True, use_cache: bool = True, jobs:
 
         task = progress.add_task("[cyan]Processing files...", total=len(valid_files))
         chunk_size = 100
+
+        def on_done(result, size):
+            counts['ok'] += result[0]
+            counts['failed'] += result[1]
+            progress.update(task, advance=size)
+
+        def on_error(error, size):
+            chunk_errors.append(error)
+            progress.update(task, advance=size)
+
         for i in range(0, len(valid_files), chunk_size):
             chunk = valid_files[i:i + chunk_size]
             current_chunk_size = len(chunk)
-            pool.apply_async(process_chunk, args=(chunk, queue), callback=lambda _, size=current_chunk_size: progress.update(task, advance=size))
+            pool.apply_async(process_chunk, args=(chunk, queue),
+                             callback=lambda result, size=current_chunk_size: on_done(result, size),
+                             error_callback=lambda error, size=current_chunk_size: on_error(error, size))
 
         pool.close()
         pool.join()
-    
+
         queue.put("STOP")  # Signal the writer process to stop
         writer_process.join()
-    
+
+    console.print(f"[blue]Generated {counts['ok']}, failed {counts['failed']} functions; "
+                  f"{len(chunk_errors)} chunk errors. Results saved to {db_path}[/blue]")
+    for error in chunk_errors[:5]:
+        console.print(f"[red]Chunk error: {error!r}[/red]")
+    if chunk_errors or writer_process.exitcode != 0:
+        console.print(f"[red]Graph generation incomplete (writer exit code {writer_process.exitcode}).[/red]")
+        return False
     console.print("[green]Pipeline completed successfully![/green]")
-    console.print(f"[blue]Results saved to {db_path}[/blue]")
+    return True
 
 app = typer.Typer()
 
 @app.command()
 def main(
     input_dir: str = typer.Argument(..., help="Input directory containing LLVM IR files"),
-    cleanup: bool = typer.Option(True, "--cleanup/--no-cleanup", help="Clean up residual temp files before processing"),
-    use_cache: bool = typer.Option(True, "--cache/--no-cache", help="Use cached file list if available"),
+    cleanup: bool = typer.Option(True, "--cleanup/--no-cleanup", help="Delete graph artifacts no result refers to (interrupted runs, older layouts)"),
+    use_cache: bool = typer.Option(True, "--cache/--no-cache", help="Use cached file list if the extracted functions are unchanged"),
     jobs: int = typer.Option(multiprocessing.cpu_count(), "--jobs", "-j", help="Number of parallel jobs to run (default: number of CPU cores)")
 ):
     """
     Process LLVM IR files to generate purified IR, DDG, and CFG files.
-    
+
     This tool processes LLVM IR files in parallel, generating:
     - Purified LLVM IR (metadata stripped)
     - Data Dependence Graph (DDG) in DOT format
     - Control Flow Graph (CFG) in DOT format
-    
-    Results are stored in a SQLite database for efficient querying.
+
+    Artifacts are written to `<binary>_graphs/` next to `<binary>_functions/`; results are stored in
+    `results.db`, and a rerun only regenerates functions whose input, passes or opt changed.
     """
-    pipeline(input_dir, cleanup, use_cache, jobs)
+    if not pipeline(input_dir, cleanup, use_cache, jobs):
+        raise typer.Exit(code=1)
 
 if __name__ == "__main__":
     app()
