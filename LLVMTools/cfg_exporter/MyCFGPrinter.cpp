@@ -1,4 +1,4 @@
-// MyCFGPrinter.cpp (基于你成功的DDGPrinter.cpp适配而成)
+// CFG exporter.
 
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"

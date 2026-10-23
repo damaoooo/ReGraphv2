@@ -18,7 +18,6 @@ from task2_reoptimize import ARCH_TO_CLANG_FLAG, normalize_arch_mode, resolve_ar
 from utils import console, ensure_directory, file_exists_and_not_empty, run_command
 from pipeline_cache import (
     build_input_signature,
-    compute_file_sha256,
     create_temporary_output_path,
     get_tool_identity,
     is_cached_output_valid,
@@ -69,7 +68,6 @@ def recompile_file(file_path: str, output_path: str, arch: str, marker_path: str
 def build_cache_signature(file_path: str, arch: str) -> dict:
     """Identify the input bitcode, compilation settings, and clang version."""
     compile_config = {
-        'script': compute_file_sha256(__file__),
         'arch': arch,
         'flags': list(TASK4_CLANG_RECOMPILE_FLAGS),
         'tool': get_tool_identity('clang'),

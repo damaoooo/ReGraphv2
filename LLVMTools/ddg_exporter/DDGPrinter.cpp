@@ -1,4 +1,4 @@
-// DDGPrinter.cpp (最终版 - 注入并显示唯一ID)
+// DDG exporter with instruction IDs.
 
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"

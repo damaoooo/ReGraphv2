@@ -1,0 +1,2 @@
+add_library(StripAllMetadataPass MODULE StripAllMetadata.cpp)
+target_link_libraries(StripAllMetadataPass PRIVATE LLVM)

@@ -21,6 +21,7 @@ from pipeline_cache import (
     get_tool_identity,
     iter_completed_tasks,
 )
+from split_functions import configured_extractor_path, CHUNK_SIZE, MODULE_ID
 
 # Configuration
 EXTRACT_SCRIPT = str(Path(__file__).with_name('split_llvm_ir.sh'))
@@ -29,10 +30,16 @@ app = typer.Typer()
 
 def build_extraction_signature(file_path: str) -> dict:
     """Bind extracted functions to the input module and extraction tools."""
+    compiled_extractor = configured_extractor_path()
+    extractor_stat = compiled_extractor.stat() if compiled_extractor.exists() else None
     extraction_config = {
-        'script': compute_file_sha256(EXTRACT_SCRIPT),
-        'extractor': compute_file_sha256(__file__),
-        'tools': [get_tool_identity(tool) for tool in ('llvm-nm', 'llvm-extract')],
+        'tools': [get_tool_identity(tool) for tool in ('llvm-as', 'llvm-nm', 'llvm-extract')],
+        'compiled_extractor': (
+            [str(compiled_extractor), extractor_stat.st_size, extractor_stat.st_mtime_ns]
+            if extractor_stat is not None else None
+        ),
+        'chunk_size': CHUNK_SIZE,
+        'module_id': MODULE_ID,
     }
     return build_input_signature(file_path, extraction_config)
 
@@ -65,7 +72,8 @@ def extract_functions(file_path: str, output_path: str) -> tuple[bool, str, str]
     staging_directory = Path(tempfile.mkdtemp(prefix='.extract-', dir=output_directory.parent))
     backup_directory = output_directory.with_name(f'.{output_directory.name}.previous')
     try:
-        command = ['bash', EXTRACT_SCRIPT, file_path, str(staging_directory)]
+        command = ['env', f'REGRAPH_PYTHON={sys.executable}', 'bash', EXTRACT_SCRIPT,
+                   file_path, str(staging_directory)]
         success, stdout, stderr = run_command(command, f"Extracting functions from {file_path}")
         if not success:
             return success, stdout, stderr

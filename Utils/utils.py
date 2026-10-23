@@ -1,10 +1,12 @@
 import os
 import sys
 import contextlib
+from pathlib import Path
 
-DEFAULT_DDG_SO_PATH = '/home/damaoooo/Downloads/regraphv2/GraphBuilder/ddg_exporter/build/libDDGPrinter.so'
-DEFAULT_PURIFY_SO_PATH = '/home/damaoooo/Downloads/regraphv2/GraphBuilder/meta_remover/build/libStripAllMetadataPass.so'
-DEFAULT_CFG_SO_PATH = '/home/damaoooo/Downloads/regraphv2/GraphBuilder/cfg_exporter/build/libMyCFGPrinterPass.so'
+LLVM_LIBRARY_DIR = Path(__file__).resolve().parents[1] / 'LLVMTools' / 'build' / 'lib'
+DEFAULT_DDG_SO_PATH = str(LLVM_LIBRARY_DIR / 'libDDGPrinter.so')
+DEFAULT_PURIFY_SO_PATH = str(LLVM_LIBRARY_DIR / 'libStripAllMetadataPass.so')
+DEFAULT_CFG_SO_PATH = str(LLVM_LIBRARY_DIR / 'libMyCFGPrinterPass.so')
 DEFAULT_TOKENIZER_PATH = '/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json'
 
 @contextlib.contextmanager

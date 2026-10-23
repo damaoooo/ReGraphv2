@@ -1,4 +1,4 @@
-// DDGPrinter.cpp (值流图 Value-Flow Graph 版本)
+// Alternative value-flow exporter (not built by default).
 
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"

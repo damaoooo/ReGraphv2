@@ -28,6 +28,15 @@ uv 不安装 NVIDIA 驱动。PyG 扩展固定从对应 Torch/CUDA 的官方 whee
 数据生成依赖使用 `--extra pipeline`；API 使用 `--extra api`；notebook 使用
 `--extra notebook`。同时使用多个功能时同时传入相应 extra。
 LLVM 18.1、CFG/DDG 插件、Graphviz、Ghidra/Java 和 IDA 安装及许可证仍单独管理。
+
+CFG/DDG、MetaRemover 和函数提取工具现统一从 `LLVMTools/` 构建（需 LLVM 18.1、OpenSSL 开发包）：
+
+```bash
+cmake -S LLVMTools -B LLVMTools/build -DCMAKE_BUILD_TYPE=Release
+cmake --build LLVMTools/build -j 4
+```
+
+Python 默认加载 `LLVMTools/build/lib/` 下的插件和 `LLVMTools/build/bin/split_funcs`。构建时的 LLVM 应与运行时 PATH 中的 `opt`、`llvm-extract` 一致。
 IDA 的本地 Python wheel 不包含在公开锁文件中。
 
 已有 shell 包装脚本默认使用 uv；支持 `PYTHON_CMD` 的脚本仍可显式指定其他解释器。

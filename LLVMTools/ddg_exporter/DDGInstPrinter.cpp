@@ -1,4 +1,4 @@
-// DDGPrinter.cpp (最终版 - 增加边去重功能)
+// Alternative statement-level DDG exporter (not built by default).
 
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"

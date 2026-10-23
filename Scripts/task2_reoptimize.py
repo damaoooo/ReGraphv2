@@ -21,7 +21,6 @@ from utils import (
 )
 from pipeline_cache import (
     build_input_signature,
-    compute_file_sha256,
     create_temporary_output_path,
     get_tool_identity,
     is_cached_output_valid,
@@ -157,7 +156,7 @@ def build_cache_signature(file_path: str, opt_level: str, arch: str) -> dict:
     """Identify the source IR, optimization settings, and LLVM tool version."""
     passes = canonicalize_passes_for_opt_level(opt_level)
     return build_input_signature(file_path, {
-        'script': compute_file_sha256(__file__), 'opt': opt_level, 'arch': arch,
+        'opt': opt_level, 'arch': arch,
         'passes': list(passes) if passes else None,
         'flags': list(TASK2_CLANG_REOPT_FLAGS),
         'tool': get_tool_identity('opt' if passes else 'clang'),

@@ -38,7 +38,8 @@ lsp_start_server(server_id="bash", workspace_root="/home/damaoooo/Downloads/regr
 - `Scripts/task3_extract.py`: 对 `.bc` 调 `Scripts/split_llvm_ir.sh` 提取函数级 IR。
 - `Scripts/task4_recompile.py`: `.bc -> .re`，用于把优化后的 bitcode 重新编译成可执行/对象侧产物。
 - `DataProcess/`: 从函数级 LLVM IR 构建 HuggingFace dataset。`cli.py` 是 Typer CLI，`dataset_builder_new.py` 串起 `FileProcessor` 和 `ParallelProcessor`，`file_processor.py` 生成 token、CFG、DDG。
-- `GraphBuilder/`: Python 图解析和 LLVM pass 源码。`cfg_graph_builder.py` 输出 `(src_start, src_end, dst_start, dst_end, probability)`，`ddg_graph_builder.py` 输出 `(src_start, src_end, dst_start, dst_end)`。
+- `GraphBuilder/`: Python 图生成与解析。`cfg_graph_builder.py` 输出 `(src_start, src_end, dst_start, dst_end, probability)`，`ddg_graph_builder.py` 输出 `(src_start, src_end, dst_start, dst_end)`。
+- `LLVMTools/`: CFG/DDG、MetaRemover 和 split_funcs 的 C++ 源码与统一 CMake 入口。执行 `cmake -S LLVMTools -B LLVMTools/build -DCMAKE_BUILD_TYPE=Release` 和 `cmake --build LLVMTools/build -j 4`；插件在 `build/lib/`，可执行文件在 `build/bin/`。提取驱动为 `Scripts/split_functions.py`。
 - `Tokenizer/`: LLVM IR tokenizer、normalizer 和 tokenizer 文件。
 - `Model/`: 模型骨架。`model_backbone.py` 的 `RoFormerGraph` 是 RoFormer 编码器 + CFG/DDG GATv2 图分支，`graph_utils.py` 把 span edge list batch 成 torch geometric 输入。
 - `Pretrain/`: 训练逻辑。`pretrain_config.py` 集中默认配置，`pretrain_dataset.py` 读取 final_set，`pretrain_model.py` 是 MoCo wrapper，`run_pretrain.py` 是 Typer 训练入口。

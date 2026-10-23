@@ -497,7 +497,7 @@ def main(
     skipped_count = 0
     lifter = Path(SCRIPT_DIR) / ('ida2llvm.py' if backend == 'ida' else 'pcode2llvm.py')
     cache_config = {
-        'lifter': compute_file_sha256(lifter), 'driver': compute_file_sha256(__file__), 'backend': backend,
+        'lifter': compute_file_sha256(lifter), 'backend': backend,
         'python': python_runner(conda_env), 'ida_path': str(Path(ida_path).resolve()),
         'ghidra': [ghidra_home, analyze_headless, ghidra_target, ghidra_max_cpu,
                    ghidra_decompile_timeout, ghidra_analysis_timeout, ghidra_no_analysis, allow_partial],
@@ -505,7 +505,8 @@ def main(
     if backend == 'ida':
         idat = Path(ida_path) / 'idat'
         if idat.is_file():
-            cache_config['idat_sha256'] = compute_file_sha256(idat)
+            ida_stat = idat.stat()
+            cache_config['idat'] = [ida_stat.st_size, ida_stat.st_mtime_ns]
     
     for root, dirs, files in os.walk(db_path):
         for file in files:

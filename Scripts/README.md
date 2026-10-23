@@ -61,11 +61,29 @@ python Scripts/pipeline.py task3 --input-path IR/xxx --resume
 - Task 3 在临时目录完成提取后替换旧目录，`.complete.json` 记录输入与每个产物的校验值；只有 CSV 或部分函数文件不算完成。旧目录中的过期函数不会混入新结果。
 - Task 2/3/4 任一文件失败都会返回非零退出码，完整 pipeline 随即停止。Task 2/4 的产物先写临时文件，成功后再发布。
 - 不要让多个 pipeline 同时写同一个输出目录。不同优化等级建议使用不同目录；同目录切换等级会替换 `.bc`，不保留多份结果。
-- 严格 resume 会读取文件计算校验值，NAS 上可能有明显 I/O 成本。Task 2–4 限制待执行 Future 数量，但函数提取仍逐函数启动 `llvm-extract`。
+- 严格 resume 会读取文件计算校验值，NAS 上可能有明显 I/O 成本。Task 2–4 限制待执行 Future 数量。
 - Oc 保留 IR 的 target；其他 clang 优化模式及 Task 4 目前仍按宿主工具链和 `-m32/-m64` 工作，不能把它们当作保持源架构 ABI 的交叉编译器。
 - 历史非法函数 bitcast 清理仍保留兼容行为；触发时会警告，并在 Task 2 完成记录的 `metadata.sanitized_removed_lines` 中记录删行数。这不是语义等价保证，正式实验应检查并修复产生非法 IR 的源头。
 
 小样本回归：`uv run --locked --extra pipeline python -m pytest tests/test_pipeline_regressions.py -q`（需要 LLVM 工具和 pytest）。
+
+### 批量函数提取
+
+Task 3 先用 `llvm-extract` 按 128 个函数分块，再用 `split_funcs` 在每块内复用进程和 bitcode 缓冲区。它仍为每个函数建立独立 lazy module，不是修改原始模块后重复打印。
+
+```bash
+cmake -S LLVMTools -B LLVMTools/build -DCMAKE_BUILD_TYPE=Release
+cmake --build LLVMTools/build -j 4
+uv run --locked --extra pipeline python -m pytest tests/test_function_extraction.py -q
+```
+
+需要 LLVM 18.1 和 OpenSSL 开发包。这一次构建同时生成 CFG/DDG、MetaRemover 插件（`LLVMTools/build/lib/`）和 `split_funcs`（`LLVMTools/build/bin/`）。源码分别放在 `LLVMTools/cfg_exporter/`、`ddg_exporter/`、`meta_remover/`、`split_functions/`；Python 图解析仍在 `GraphBuilder/`，提取驱动在 `Scripts/split_functions.py`。两个历史 DDG 实验源码保留，但不加入默认构建。
+
+请在实际运行环境（例如 Shaheen 的 LLVM 容器）内构建，二进制不会提交到 Git。`split_funcs` 与 PATH 中 `llvm-extract` 的版本必须一致；缺失时自动警告并回退到纯 CLI 两级分块，已有工具损坏或版本不一致则报错，不静默降级。
+
+可用 `REGRAPH_SPLIT_FUNCS=/absolute/path/to/split_funcs` 指定工具；指向不存在的路径可测试 CLI 回退。独立运行 shell 脚本默认使用 `python3`（仅标准库），Task 3 会显式传入当前 Python。
+
+两种后端均保持 `T/t/W/w` 符号筛选、SHA1 文件名和 `function_map.csv` 格式；每个输出的 ModuleID 固定为 `regraph-function`。含空白或引号的函数名显式拒绝，不静默截断。缓存使用 LLVM 版本、可执行文件路径/大小/修改时间及分块配置，不重复哈希工具和源码。输入和输出内容仍做校验。修改提取逻辑后请不带 `--resume` 重跑；工具大小和时间戳不是内容完整性保证。
 
 单个二进制的 lift 也可以直接调用：
 
