@@ -146,6 +146,32 @@ class ModernBertTests(unittest.TestCase):
         result["loss"].backward()
         self.assertTrue(torch.isfinite(result["loss"]))
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
+    def test_compiled_encoders_match_eager_and_keep_checkpoint_names(self):
+        torch.manual_seed(0)
+        eager = MoCoPretrainModel(self.config()).cuda()
+        compiled = MoCoPretrainModel(self.config()).cuda()
+        compiled.load_state_dict(eager.state_dict())
+        names = list(compiled.state_dict())
+        compiled.compile_encoders()
+        self.assertEqual(list(compiled.state_dict()), names)
+
+        batch = {key: value.cuda() for key, value in self.batch().items()}
+        expected = eager(view1=batch, view2=batch)["loss"]
+        actual = compiled(view1=batch, view2=batch)["loss"]
+        actual.backward()
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+        # another padded width: a new shape must recompile or reuse a dynamic graph, not fail
+        wider = dict(batch)
+        pad = torch.zeros(2, 8, dtype=torch.long, device="cuda")
+        wider["input_ids"] = torch.cat([batch["input_ids"], pad], dim=1)
+        wider["attention_mask"] = torch.cat([batch["attention_mask"], pad], dim=1)
+        wider["labels"] = torch.cat([batch["labels"], pad - 100], dim=1)
+        loss = compiled(view1=wider, view2=wider)["loss"]
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+
 
 if __name__ == "__main__":
     unittest.main()

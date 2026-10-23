@@ -88,7 +88,7 @@ class PretrainConfig(ModernBertConfig):
         # === 数据处理配置 ===
         dataloader_num_workers: Optional[int] = None,
         remove_unused_columns: bool = False,
-        torch_compile: bool = False,
+        torch_compile: bool = True,
         # === MLM配置 ===
         mlm: bool = True,
         mlm_probability: float = 0.15,

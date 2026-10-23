@@ -815,7 +815,9 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         "bf16": config.bf16,
         "remove_unused_columns": config.remove_unused_columns,
         "dataloader_num_workers": config.dataloader_num_workers,
-        "torch_compile": config.torch_compile,
+        # Trainer would compile the whole MoCo model, which fails on the in-place queue update;
+        # config.torch_compile compiles the encoders instead (below)
+        "torch_compile": False,
         "logging_dir": logging_dir,
         "learning_rate": config.learning_rate,
         "warmup_steps": config.warmup_steps,
@@ -847,6 +849,9 @@ def main(config: PretrainConfig = DEFAULT_CONFIG):
         model.gradient_checkpointing_enable()
     else:
         model.gradient_checkpointing_disable()
+    if config.torch_compile:
+        # After the checkpointing switch, which would otherwise trigger a recompile
+        model.compile_encoders()
 
     class SafeTrainer(Trainer):
         def __init__(self, *args, **kwargs):

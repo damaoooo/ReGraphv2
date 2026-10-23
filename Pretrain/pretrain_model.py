@@ -266,6 +266,19 @@ class MoCoPretrainModel(nn.Module):
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.encoder_q.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
 
+    def compile_encoders(self, **compile_kwargs):
+        """torch.compile the two encoders; the MoCo queue update in forward stays eager.
+
+        Compiling the whole MoCo model fails: forward updates queue_labels in place while the compiled
+        backward still reads it. Assigning instance attributes keeps parameter names, so checkpoints
+        save and load as before.
+        """
+        # Both encoders run the same layer code, with and without grad, in training and in evaluation,
+        # on varying shapes: the default limit of 8 graphs per function sends some of them back to eager
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 32)
+        self.encoder_q.forward = torch.compile(self.encoder_q.forward, **compile_kwargs)
+        self.encoder_k.forward_embedding = torch.compile(self.encoder_k.forward_embedding, **compile_kwargs)
+
     def gradient_checkpointing_disable(self):
         self.encoder_q.gradient_checkpointing_disable()
 
