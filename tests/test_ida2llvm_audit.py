@@ -378,6 +378,24 @@ def test_void_value_cannot_be_fabricated_as_zero(L):
         L.typecast(value, ir.IntType(32), builder)
 
 
+def test_store_to_a_function_symbol_writes_the_value_type(L):
+    # IDA names some MIPS data addresses as functions; a store there writes memory at that address
+    module, func, (entry, _), builder = new_function()
+    target = ir.Function(module, ir.FunctionType(ir.IntType(32), [ir.IntType(32).as_pointer(), ir.IntType(32)]), 'misnamed')
+    store = L._store_as(ir.Constant(ir.IntType(32), 1), target, entry, builder)
+    value, pointer = store.operands
+    assert value.type == ir.IntType(32) and pointer.type == ir.IntType(32).as_pointer()
+    verify(module)
+
+
+def test_function_type_value_cast_rejects(L):
+    module, func, (entry, _), builder = new_function()
+    fnty = ir.FunctionType(ir.IntType(32), [ir.IntType(32)])
+    with pytest.raises(L.UnsupportedMicrocode) as err:
+        L.typecast(ir.Constant(ir.IntType(32), 1), fnty, builder)
+    assert err.value.reason == 'function_type_value_cast'
+
+
 def test_direct_call_multi_retregs_rejects(stub_operands):
     L = stub_operands
     module, entry, builder, call_insn = typed_call(L, ir.IntType(64), ir.IntType(64), retregs=2)

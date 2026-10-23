@@ -790,6 +790,9 @@ def typecast(src: ir.Value, dst_type: ir.Type, builder: ir.IRBuilder, signed: bo
         raise UnsupportedMicrocode('void_value_cast', f'void -> {dst_type}')
     if src_type == dst_type:
         return src
+    if isinstance(src_type, ir.FunctionType) or isinstance(dst_type, ir.FunctionType):
+        # 函数类型不是值类型，任何转换都只能生成非法 IR；拒绝该函数，不让整个模块校验失败
+        raise UnsupportedMicrocode('function_type_value_cast', f'{src_type} -> {dst_type}')
 
     src_is_ptr = isinstance(src_type, ir.PointerType)
     dst_is_ptr = isinstance(dst_type, ir.PointerType)
@@ -2289,8 +2292,9 @@ def _store_as(l: ir.Value, d: ir.Value, blk: ir.Block, builder: ir.IRBuilder, d_
         return
 
     aggregate = (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)
-    if isinstance(l.type, aggregate) or isinstance(d.type.pointee, aggregate):
-        # 聚合值整体写入，或者把标量的位写入聚合存储的起始位置
+    if isinstance(l.type, aggregate) or isinstance(d.type.pointee, aggregate + (ir.FunctionType,)):
+        # 聚合值整体写入，或者把标量的位写入聚合存储的起始位置；
+        # 目标是函数符号时（IDA 把数据地址认成了函数），同样按值的类型写入该地址
         d = typecast(d, l.type.as_pointer(), builder)
     else:
         l = typecast(l, d.type.pointee, builder, signed)
