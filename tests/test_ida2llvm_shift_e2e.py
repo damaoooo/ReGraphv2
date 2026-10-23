@@ -266,8 +266,8 @@ def test_a64_native_division(tmp_path):
             lines += [f'.globl {name}', f'.type {name},%function', f'{name}:',
                       f'{op} {reg}0,{reg}0,{reg}1', 'ret', f'.size {name},.-{name}']
     values = [0, 1, 0xffffffff, 0x80000000, 0xffffffffffffffff, 0x8000000000000000]
-    check_machine_equivalence('a64', tmp_path, '\n'.join(lines), names,
-                              ['hexrays_division_control_flow_unverified'],
+    # rewritten before Hex-Rays optimisation: exact, so no approximation tag is allowed
+    check_machine_equivalence('a64', tmp_path, '\n'.join(lines), names, (),
                               [(x, y) for x in values for y in values])
 
 
@@ -350,8 +350,53 @@ L.run_lift(sys.argv[2], sys.argv[3])
     assert not output.exists()
 
 
-def test_upstream_division_branch_loss_is_not_claimed_exact(tmp_path):
-    """Known IDA 9.4 limitation: retain a visible approximation, not false proof."""
+def _a64_division_cases():
+    """Native A64 division whose zero / overflow results are observed by later control flow."""
+    cases = []
+    for width, r in ((32, 'w'), (64, 'x')):
+        int_min = 'movz x3,#0x8000,lsl #48' if width == 64 else 'movz w3,#0x8000,lsl #16'
+        bodies = {
+            # division first, guard afterwards: Hex-Rays GLBOPT1 deleted this guard before the fix
+            'udiv_after': [f'udiv {r}2,{r}0,{r}1', f'cbz {r}1,1f', f'mov {r}0,{r}2', 'ret', f'1: mov {r}0,#-1', 'ret'],
+            'sdiv_after': [f'sdiv {r}2,{r}0,{r}1', f'cbz {r}1,1f', f'mov {r}0,{r}2', 'ret', f'1: mov {r}0,#-1', 'ret'],
+            # INT_MIN / -1 is INT_MIN on A64; the overflow check after the division is reachable
+            'sdiv_overflow': [f'sdiv {r}2,{r}0,{r}1', f'cmn {r}1,#1', 'b.ne 2f', int_min, f'cmp {r}0,{r}3',
+                              'b.ne 2f', f'mov {r}0,#7', 'ret', f'2: mov {r}0,{r}2', 'ret'],
+            'udiv_before': [f'cbz {r}1,1f', f'udiv {r}0,{r}0,{r}1', 'ret', f'1: mov {r}0,#-1', 'ret'],
+            # remainder as udiv/sdiv + msub: x % 0 == x, INT_MIN % -1 == 0 on the machine
+            'urem_msub': [f'udiv {r}2,{r}0,{r}1', f'msub {r}0,{r}2,{r}1,{r}0', 'ret'],
+            'srem_msub': [f'sdiv {r}2,{r}0,{r}1', f'msub {r}0,{r}2,{r}1,{r}0', 'ret'],
+            # division and guard in different blocks with an intervening branch
+            'udiv_blocks': [f'udiv {r}2,{r}0,{r}1', f'cmp {r}0,#10', 'b.lo 3f', f'add {r}2,{r}2,#1',
+                            f'3: cbz {r}1,4f', f'mov {r}0,{r}2', 'ret', f'4: mov {r}0,#-1', 'ret'],
+            # divisor forms: the zero register (always 0) and the dividend register itself
+            'udiv_zr': [f'udiv {r}0,{r}0,{r}zr', 'ret'],
+            'sdiv_zr': [f'sdiv {r}0,{r}0,{r}zr', 'ret'],
+            'udiv_self': [f'udiv {r}0,{r}0,{r}0', 'ret'],
+            'sdiv_self': [f'sdiv {r}0,{r}0,{r}0', 'ret'],
+        }
+        for kind, body in bodies.items():
+            cases.append((f'{kind}{width}', width, body))
+    return cases
+
+
+def test_a64_division_guards_preserved(tmp_path):
+    """Early microcode rewrite keeps guards Hex-Rays would delete under C UB assumptions."""
+    lines, names = ['.text'], []
+    for name, width, body in _a64_division_cases():
+        names.append((name, width))
+        lines += [f'.globl {name}', f'.type {name},%function', f'{name}:', *body, f'.size {name},.-{name}']
+    pairs = []
+    for width in (32, 64):
+        mask = (1 << width) - 1
+        int_min, int_max = 1 << (width - 1), (1 << (width - 1)) - 1
+        values = [0, 1, 2, 3, 7, 10, int_max, int_min, mask, mask - 1, 0x8123456789ABCDEF & mask]
+        pairs += [(x, y) for x in values for y in values]
+    # no approximation tag: the guards are preserved, not merely flagged
+    check_machine_equivalence('a64', tmp_path, '\n'.join(lines) + '\n', names, (), sorted(set(pairs)))
+
+
+def _lift_with_patched_division_hook(tmp_path, patch):
     src, obj, exe = [tmp_path / name for name in ('guard.S', 'guard.o', 'guard.elf')]
     src.write_text('.text\n.global guard\n.type guard,%function\nguard:\n'
                    'udiv w2,w0,w1\ncbz w1,1f\nmov w0,w2\nret\n'
@@ -359,22 +404,71 @@ def test_upstream_division_branch_loss_is_not_claimed_exact(tmp_path):
     run(['clang', '--target=aarch64-linux-gnu', '-c', src, '-o', obj])
     run(['ld.lld', '-e', 'guard', obj, '-o', exe])
     output = tmp_path / 'guard.ll'
+    wrapper = ('import idapro\nimport sys\nsys.path.insert(0, sys.argv[1])\nimport ida2llvm as L\n'
+               + patch + '\nL.run_lift(sys.argv[2], sys.argv[3])\n')
     env = dict(os.environ, PYTHONPATH=os.path.join(os.environ['IDADIR'], 'idalib', 'python'))
-    run([sys.executable, ROOT / 'Scripts/ida2llvm.py', '-f', exe, '-o', output], env=env)
-    state = json.loads(Path(str(output) + '.lift.json').read_text())
+    run([sys.executable, '-c', wrapper, ROOT / 'Scripts', exe, output], env=env)
+    return obj, output, json.loads(Path(str(output) + '.lift.json').read_text())
+
+
+def test_division_tag_kept_without_early_rewrite(tmp_path):
+    """Fail-safe: if the rewrite did not run, the guard loss stays visible as an approximation."""
+    obj, output, state = _lift_with_patched_division_hook(tmp_path, 'L._install_a64_division_fix = lambda: None')
     record = next(r for r in state['functions'] if r['name'] == 'guard')
     assert 'hexrays_division_control_flow_unverified' in record['approx']
     original, symbols = object_text(obj, tmp_path)
+    compiled = output.with_suffix('.o')
+    run(['llc', '-filetype=obj', output, '-o', compiled])
+    code, lifted_symbols = object_text(compiled, tmp_path)
+    # the unrewritten lift is still wrong for b == 0 -- that is why the tag must remain
     assert execute('a64', original, symbols['guard'], 10, 0, 32) == 0xffffffff
-    oc = tmp_path / 'oc.ll'
-    run(['opt', '-S', '-passes=' + ','.join(canonicalize_passes_for_opt_level('-Oc')), output, '-o', oc])
-    observed = []
-    for ll in (output, oc):
-        compiled = ll.with_suffix('.o')
-        run(['llc', '-filetype=obj', ll, '-o', compiled])
-        code, symbols = object_text(compiled, tmp_path)
-        observed.append(execute('a64', code, symbols['guard'], 10, 0, 32))
-    assert observed == [0, 0], 'Upstream behavior changed: reassess the limitation'
+    assert execute('a64', code, lifted_symbols['guard'], 10, 0, 32) == 0
+
+
+def test_division_hook_exception_prevents_publication(tmp_path):
+    patch = ('install = L._install_a64_division_fix\n'
+             'def failing_install():\n'
+             '    hook = install()\n'
+             '    def fail(self, mba):\n'
+             '        raise RuntimeError("injected-division-failure")\n'
+             '    type(hook).rewrite = fail\n'
+             '    return hook\n'
+             'L._install_a64_division_fix = failing_install')
+    obj, output, state = _lift_with_patched_division_hook(tmp_path, patch)
+    assert state['status'] == 'error' and 'injected-division-failure' in state['error']
+    assert not output.exists()
+
+
+RETURN_ENTRY_CASES = {
+    'a64': {
+        # some path returns the incoming x0 without writing it: Hex-Rays splits result / a1 on x0
+        'ret_entry': (64, ['cbz x1,1f', 'ret', '1: mov x0,#-1', 'ret']),
+        'ret_entry_w': (32, ['cbz w1,1f', 'ret', '1: mov w0,#-1', 'ret']),
+        'ret_entry_tbz': (64, ['tbz x1,#0,1f', 'ret', '1: neg x0,x0', 'ret']),
+        'ret_entry_modified': (64, ['cbz x1,1f', 'add x0,x0,#1', '1: ret']),
+        'ret_entry_or_second': (64, ['cbz x1,1f', 'mov x0,x1', '1: ret']),
+        'ret_second_or_const': (64, ['cbz x0,1f', 'mov x1,#3', '1: mov x0,x1', 'ret']),
+        'ret_entry_loop': (64, ['1: cbz x1,2f', 'sub x1,x1,#1', 'add x0,x0,#2', 'b 1b', '2: ret']),
+        'ret_entry_narrow': (64, ['cbz x1,1f', 'ret', '1: mov w0,#5', 'ret']),
+    },
+    'arm32': {
+        'ret_entry': (32, ['cmp r1,#0', 'beq 1f', 'bx lr', '1: mvn r0,#0', 'bx lr']),
+        'ret_entry_modified': (32, ['cmp r1,#0', 'beq 1f', 'add r0,r0,#1', '1: bx lr']),
+        'ret_second_or_const': (32, ['cmp r0,#0', 'beq 1f', 'mov r1,#3', '1: mov r0,r1', 'bx lr']),
+    },
+}
+
+
+@pytest.mark.parametrize('arch', list(RETURN_ENTRY_CASES))
+def test_return_of_entry_register(arch, tmp_path):
+    """Paths that return an argument register unmodified keep its entry value (was 0 before)."""
+    lines, names = ['.text'], []
+    for kind, (width, body) in RETURN_ENTRY_CASES[arch].items():
+        names.append((kind, width))
+        lines += [f'.globl {kind}', f'.type {kind},%function', f'{kind}:', *body, f'.size {kind},.-{kind}']
+    pairs = [(x, y) for x in (0, 1, 17, 0x7fffffff, 0xffffffff, 0x8123456789ABCDEF, (1 << 64) - 1)
+             for y in (0, 1, 2, 5)]
+    check_machine_equivalence(arch, tmp_path, '\n'.join(lines) + '\n', names, (), pairs)
 
 
 @pytest.mark.parametrize('kind', ['ror', 'aeabi'])

@@ -260,6 +260,7 @@ def _reset_lift_state():
     current_approx.clear()
     function_records.clear()
     unresolved_data_items.clear()
+    a64_rewritten_divisions.clear()
     _set_sizing_layout(None)
     target_data = None
     llvm_context = ir.Context()
@@ -1083,6 +1084,195 @@ def _infer_value_type_from_mop(mop):
     return ir.IntType(ptrsize)
 
 
+def _record_lvar_access(acc, lvars, op, is_target):
+    """
+    记录一个操作数：lvar 读 / 写的字节范围 (下标, 偏移, 大小)、被写的物理寄存器、调用。
+    调用记为其 spoiled 列表（Hex-Rays 给出的被调用破坏的位置，不含 callee-saved 寄存器）；
+    拿不到时记为 True，按所有寄存器都被破坏处理。
+    """
+    if op.t == ida_hexrays.mop_l:
+        width = lvars[op.l.idx].width
+        size = op.size if op.size > 0 else width
+        (acc.defs if is_target else acc.uses).append((op.l.idx, int(op.l.off), size))
+    elif op.t == ida_hexrays.mop_r and is_target:
+        acc.reg_defs.append((int(op.r), int(op.r) + max(op.size, 1)))
+    elif op.t == ida_hexrays.mop_f:
+        spoiled = getattr(getattr(op, "f", None), "spoiled", None)
+        if spoiled is None or acc.call is True:
+            acc.call = True
+        else:
+            acc.call = (acc.call or []) + [spoiled]
+
+
+_lvar_collector_class = None
+
+
+def _collect_lvar_accesses(ins, lvars):
+    """一条顶层指令（含嵌套子指令）读写的 lvar；visitor 类在首次使用时才定义，模块导入不依赖 Hex-Rays。"""
+    global _lvar_collector_class
+    if _lvar_collector_class is None:
+        class Collector(ida_hexrays.mop_visitor_t):
+            def __init__(self, lvars):
+                ida_hexrays.mop_visitor_t.__init__(self)
+                self.lvars = lvars
+                self.uses, self.defs, self.reg_defs, self.call = [], [], [], False
+
+            def visit_mop(self, op, type, is_target):
+                _record_lvar_access(self, self.lvars, op, is_target)
+                return 0
+
+        _lvar_collector_class = Collector
+    collector = _lvar_collector_class(lvars)
+    ins.for_all_ops(collector)
+    return collector.uses, collector.call, collector.defs, collector.reg_defs
+
+
+def _entry_register_reads(mba):
+    """
+    找出在入口处尚未赋值就可能被读取的寄存器 lvar，返回 {lvar 下标: 是否被污染}。
+
+    Hex-Rays 按生存期把同一物理寄存器拆成多个 lvar。例如 `cbz x1,1f; ret; 1: mov x0,#-1; ret`
+    中返回值 result 与参数 a1 都在 x0，cbz 不成立的路径不写 result 就返回，机器返回的是入口 x0。
+    这样的读取取的是所在寄存器的入口值；若某条路径上该寄存器被别的 lvar / 原始寄存器写过、被调用
+    破坏（按调用的 spoiled 列表），或 lvar 自身只被写了一部分（其余字节的机器值取决于架构的部分写
+    规则），这条路径上的入口值就不再成立，记为"被污染"。按字节跟踪；函数出口隐式读取返回值 lvar。
+    复杂度：每条指令的代价与其读写的字节数成正比，块状态单调增长，worklist 去重。
+    """
+    lvars = mba.vars
+    base, ranges, total = {}, {}, 0  # 每个被跟踪 lvar 的字节占位 [base, base+width) 与物理寄存器字节范围
+    for idx in range(lvars.size()):
+        lvar = lvars[idx]
+        if lvar.location.is_reg1() and lvar.width > 0 and not lvar.is_arg_var:
+            start = int(lvar.location.reg1())
+            base[idx], ranges[idx] = total, (start, start + lvar.width)
+            total += lvar.width
+    if not total:
+        return {}
+    everything = (1 << total) - 1
+    physical = {}  # 物理寄存器字节 -> 占用它的被跟踪 lvar 字节
+    whole = {}
+    for idx, (start, end) in ranges.items():
+        whole[idx] = ((1 << (end - start)) - 1) << base[idx]
+        for k in range(end - start):
+            physical[start + k] = physical.get(start + k, 0) | 1 << (base[idx] + k)
+
+    def own(idx, off, size):
+        width = ranges[idx][1] - ranges[idx][0]
+        off, end = max(off, 0), min(off + size, width)
+        return ((1 << (end - off)) - 1) << (base[idx] + off) if end > off else 0
+
+    def clobbered(start, end):
+        mask = 0
+        for byte in range(start, end):
+            mask |= physical.get(byte, 0)
+        return mask
+
+    def spoiled_mask(call):
+        if call is True:
+            return everything
+        mask = 0
+        for spoiled in call:
+            for byte, bits in physical.items():
+                if spoiled.reg.has(byte):
+                    mask |= bits
+        return mask
+
+    results = [(idx, 0, lvars[idx].width) for idx in range(lvars.size()) if lvars[idx].is_result_var]
+    events = []
+    for index in range(mba.qty):
+        blk = mba.get_mblock(index)
+        seq = []
+        ins = blk.head
+        while ins is not None:
+            uses, call, defs, reg_defs = _collect_lvar_accesses(ins, lvars)
+            uses = [(idx, own(idx, off, size)) for idx, off, size in uses if idx in base]
+            kills = []
+            for idx, off, size in defs:
+                location = lvars[idx].location
+                written = own(idx, off, size) if idx in base else 0
+                hit = clobbered(int(location.reg1()) + off, int(location.reg1()) + off + size) if location.is_reg1() else 0
+                # 写入的字节被定义；同一物理位置上其他 lvar 的字节、以及本 lvar 未写到的字节不再是入口值
+                kills.append((written, (hit | (whole[idx] if idx in base else 0)) & ~written))
+            for start, end in reg_defs:
+                kills.append((0, clobbered(start, end)))
+            seq.append((uses, spoiled_mask(call) if call else 0, kills))
+            ins = ins.next
+        if blk.type == ida_hexrays.BLT_STOP and results:
+            seq.append(([(idx, own(idx, off, size)) for idx, off, size in results if idx in base], 0, []))
+        events.append(seq)
+
+    exposed = {}
+    states = [None] * mba.qty
+    states[0] = (everything, 0)  # (入口值仍完好的未赋值字节, 入口值已被破坏的未赋值字节)
+    work, queued = [0], {0}
+    while work:
+        index = work.pop()
+        queued.discard(index)
+        clean, dirty = states[index]
+        for uses, spoiled, kills in events[index]:
+            for idx, mask in uses:
+                if (clean | dirty) & mask:
+                    exposed[idx] = exposed.get(idx, False) or bool(dirty & mask)
+            if spoiled:
+                moved = clean & spoiled
+                clean, dirty = clean & ~moved, dirty | moved
+            for written, broken in kills:
+                clean, dirty = clean & ~written, dirty & ~written
+                moved = clean & broken
+                clean, dirty = clean & ~moved, dirty | moved
+        blk = mba.get_mblock(index)
+        for k in range(blk.nsucc()):
+            succ = blk.succ(k)
+            old = states[succ]
+            new = (clean, dirty) if old is None else (old[0] | clean, old[1] | dirty)
+            if new != old:
+                states[succ] = new
+                if succ not in queued:
+                    queued.add(succ)
+                    work.append(succ)
+    return exposed
+
+
+def _init_entry_register_reads(func, lvars, entry_reads, builder):
+    """
+    入口处未赋值就读取的寄存器 lvar：
+    - 与某个参数位于同一寄存器、且所有路径上寄存器仍是入口值：取该参数的入口值（按位保留；更窄时取
+      低位，大端目标只接受同宽）；
+    - 没有对应参数：入口值未知但固定，与 _get_register_storage 一致初始化为 freeze undef 并记为近似；
+    - 某条路径上寄存器已被调用 / 其他写入破坏（"被污染"）：机器值是被调函数留下的内容（Hex-Rays 丢失的
+      返回值、变参调用的垃圾实参等），无法可靠恢复，拒绝整个函数，不输出已知错误的值。
+    """
+    def slot_of(lvar):
+        return func.lvars.get("funcresult" if lvar.is_result_var else lvar.name)
+
+    # 没有存储槽的 lvar（如 void 返回函数的 result）不会出现在 IR 里，不必因它拒绝
+    dirty = sorted(lvars[idx].name for idx, is_dirty in entry_reads.items()
+                   if is_dirty and slot_of(lvars[idx]) is not None)
+    if dirty:
+        raise UnsupportedMicrocode("register_reuse_unrecoverable", ", ".join(dirty[:8]))
+    args = {}
+    for idx in range(lvars.size()):
+        lvar = lvars[idx]
+        if lvar.is_arg_var and lvar.location.is_reg1():
+            name = "funcresult" if lvar.is_result_var else lvar.name
+            if name in func.lvars:
+                args[int(lvar.location.reg1())] = (lvar.width, func.lvars[name])
+    for idx in sorted(entry_reads):
+        lvar = lvars[idx]
+        slot = slot_of(lvar)
+        if slot is None:
+            continue
+        source = args.get(int(lvar.location.reg1()))
+        if source is not None and (source[0] == lvar.width or (source[0] > lvar.width and not is_big_endian)):
+            value = typecast(builder.load(source[1]), ir.IntType(lvar.width * 8), builder)
+            _store_as(value, slot, func.entry_basic_block, builder)
+        elif not isinstance(slot.type.pointee, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)):
+            builder.store(_freeze_undef(builder, slot.type.pointee), slot)
+            _note_approx("register_livein")
+        else:
+            _note_approx("register_livein")
+
+
 def _infer_return_type_from_mba(mba):
     for index in range(mba.qty):
         ida_blk = mba.get_mblock(index)
@@ -1191,9 +1381,12 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
                 builder.call(va_start, (builder.bitcast(ptr, i8ptr), ))
 
             # store stack variables
-            for arg, arg_n in zip(res.args, names):   
-                arg = typecast(arg, res.lvars[arg_n].type.pointee, builder) 
-                builder.store(arg, res.lvars[arg_n]) 
+            for arg, arg_n in zip(res.args, names):
+                arg = typecast(arg, res.lvars[arg_n].type.pointee, builder)
+                builder.store(arg, res.lvars[arg_n])
+
+            # 与参数共用寄存器、可能未赋值就读取的 lvar（如直接返回入口 x0 的 result）取寄存器入口值
+            _init_entry_register_reads(res, pfunc.lvars, _entry_register_reads(mba), builder)
 
         # lift each bblk in cfg
         for index, blk in enumerate(res.blocks):
@@ -2413,6 +2606,98 @@ def _shift_count_rule(width: int):
     return None
 
 
+# AArch64 原生除法：在 Hex-Rays 刚生成 microcode 时（MMAT_GENERATED）改写成不会除以 0 的等价式。
+# 原因：GLBOPT1 会依据"已执行 x / y 所以 y != 0"（C 的 UB 假设）删除除法之后的 y == 0 判断，而
+# AArch64 UDIV/SDIV 除以 0 的结果定义为 0、SDIV INT_MIN / -1 的结果定义为 INT_MIN，这些分支是可达的。
+# 改写后的除数在任何输入下都不为 0（有符号时也不是 INT_MIN / -1），Hex-Rays 只能推出恒真的事实：
+#   q = (x / (y + (y == 0) [+ 2 * (x == INT_MIN && y == -1)])) & ((y == 0) - 1)
+a64_rewritten_divisions = set()  # 被改写的原生除法指令地址；只有这些除法不需要"控制流未验证"标记
+
+
+def _mc_number(value, size):
+    operand = ida_hexrays.mop_t()
+    operand.make_number(value & ((1 << (size * 8)) - 1), size)
+    return operand
+
+
+def _mc_expr(ea, opcode, left, right, size):
+    node = ida_hexrays.minsn_t(ea)
+    node.opcode = opcode
+    node.d.size = size
+    node.l.assign(left)
+    if right is not None:
+        node.r.assign(right)
+    operand = ida_hexrays.mop_t()
+    operand.make_insn(node)
+    operand.size = size
+    return operand
+
+
+def _a64_native_division_width(ea, signed):
+    """原指令确为同宽寄存器形式的 A64 SDIV/UDIV 时返回字节宽度（4/8），否则 None。"""
+    if idc.print_insn_mnem(ea).lower() != ("sdiv" if signed else "udiv"):
+        return None
+    operands = [idc.print_operand(ea, i).lower() for i in range(3)]
+    for prefix, size in (("w", 4), ("x", 8)):
+        if all(re.fullmatch(prefix + r"(?:[0-9]+|zr)", operand) for operand in operands):
+            return size
+    return None
+
+
+def _install_a64_division_fix():
+    """Express A64 division by zero / overflow before Hex-Rays applies C UB assumptions."""
+    if source_family != "arm" or ptrsize != 64:
+        return None
+    h = ida_hexrays
+
+    class DivisionFix(h.Hexrays_Hooks):
+        error = None
+
+        def microcode(self, mba):
+            try:
+                self.rewrite(mba)
+                return 0
+            except Exception as exc:
+                self.error = str(exc)
+                return h.MERR_INSN
+
+        def rewrite(self, mba):
+            for index in range(mba.qty):
+                ins = mba.get_mblock(index).head
+                while ins is not None:
+                    if ins.opcode in (h.m_udiv, h.m_sdiv):
+                        signed = ins.opcode == h.m_sdiv
+                        size = _a64_native_division_width(ins.ea, signed)
+                        if size is not None and ins.l.size == ins.r.size == ins.d.size == size:
+                            self.expand(ins, size, signed)
+                            a64_rewritten_divisions.add(ins.ea)
+                        # 其他来源（宽度不符等）保持原样：lifter 仍会标记或拒绝
+                    ins = ins.next
+
+        @staticmethod
+        def expand(ins, size, signed):
+            ea = ins.ea
+            x, y = h.mop_t(ins.l), h.mop_t(ins.r)
+            is_zero = _mc_expr(ea, h.m_xdu, _mc_expr(ea, h.m_setz, y, _mc_number(0, size), 1), None, size)
+            divisor = _mc_expr(ea, h.m_add, y, is_zero, size)
+            if signed:
+                overflow = _mc_expr(ea, h.m_and,
+                                    _mc_expr(ea, h.m_setz, y, _mc_number(-1, size), 1),
+                                    _mc_expr(ea, h.m_setz, x, _mc_number(1 << (size * 8 - 1), size), 1), 1)
+                twice = _mc_expr(ea, h.m_shl, _mc_expr(ea, h.m_xdu, overflow, None, size), _mc_number(1, 1), size)
+                divisor = _mc_expr(ea, h.m_add, divisor, twice, size)  # -1 + 2 = 1: INT_MIN / 1 = INT_MIN
+            quotient = _mc_expr(ea, ins.opcode, x, divisor, size)
+            keep = _mc_expr(ea, h.m_sub, is_zero, _mc_number(1, size), size)  # y == 0 -> 0, else all ones
+            ins.opcode = h.m_and
+            ins.l.assign(quotient)
+            ins.r.assign(keep)
+
+    hook = DivisionFix()
+    if not hook.hook():
+        raise RuntimeError("cannot install AArch64 division normalization hook")
+    return hook
+
+
 def _install_arm_carry_fix():
     """Preserve A32 shifter carry before Hex-Rays folds it into a pure expression."""
     if source_family != "arm" or ptrsize != 32:
@@ -2681,8 +2966,9 @@ def _lift_division(op, lhs, rhs, builder, ea):
             and not (op.startswith("s") and bits == (1 << rhs.type.width) - 1)):
         return getattr(builder, op)(lhs, ir.Constant(rhs.type, bits))
     # LVARS may already have discarded guards using C undefined-behaviour
-    # assumptions. This tag is a limitation, not a claim to restore those guards.
-    _note_approx("hexrays_division_control_flow_unverified")
+    # assumptions, unless the early A64 hook rewrote this native division.
+    if ea not in a64_rewritten_divisions:
+        _note_approx("hexrays_division_control_flow_unverified")
     mnemonic = idc.print_insn_mnem(ea).lower()
     expected = "sdiv" if op.startswith("s") else "udiv"
     if (source_family != "arm" or ptrsize != 64 or mnemonic != expected
@@ -3322,13 +3608,13 @@ class BIN2LLVMController():
         try:
             # Scan original instructions, including ones that disappear before
             # LVARS. Linear in function size; retain no per-instruction cache.
+            native_divisions = []
             for item in idautils.FuncItems(ea):
                 if idc.print_insn_mnem(item).lower() in ("udiv", "sdiv", "div", "idiv", "divu", "ddiv", "ddivu"):
                     if source_family != "arm" or ptrsize != 64:
                         raise UnsupportedMicrocode("division_machine_semantics_unresolved",
                                                    f"native division at {item:#x}")
-                    _note_approx("hexrays_division_control_flow_unverified")
-                    break
+                    native_divisions.append(item)
             pfunc = ptext.get(ea)
             if pfunc is None or getattr(pfunc, "type", None) is None:
                 with suppress(KeyError):
@@ -3338,6 +3624,10 @@ class BIN2LLVMController():
                 lift_stats["no_decompile"] += 1
                 record["status"] = "no_decompile"
                 return
+            if any(item not in a64_rewritten_divisions for item in native_divisions):
+                # run_lift 已清空反编译缓存，本次运行中的每次 microcode 生成都经过早期 hook；
+                # 不在集合里说明 hook 没有改写它（如非寄存器同宽形式），其后的判零分支可能已被删除
+                _note_approx("hexrays_division_control_flow_unverified")
 
             typ = pfunc.type
             function_signature_cache[ea] = typ
@@ -3731,13 +4021,19 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
     bin2llvm = None
     database_open = False
     carry_hook = None
+    division_hook = None
     try:
         idapro.open_database(input_binary, True)
         database_open = True
         ida_auto.auto_wait()
         _init_target_state()
         carry_hook = _install_arm_carry_fix()
+        division_hook = _install_a64_division_fix()
         _apply_arm_runtime_types()
+        # IDB 中可能保存着以前的反编译结果：直接复用不会触发 microcode 事件（早期 hook 不生效），
+        # 且与全新反编译的类型推断不同，使输出依赖 IDB 的缓存状态。清空后每个函数在本次运行中
+        # 全新反编译一次（与 task1 新生成、本无缓存的 IDB 相同），运行内仍复用内存缓存
+        ida_hexrays.clear_cached_cfuncs()
         result["ida_version"] = _ida_version()
         result["source"] = _source_info()
         bin2llvm = BIN2LLVMController(target_mode=target_mode)
@@ -3755,6 +4051,8 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
         bin2llvm.insertAllFunctions()
         if carry_hook is not None and carry_hook.error is not None:
             raise RuntimeError("ARM carry normalization failed: " + carry_hook.error)
+        if division_hook is not None and division_hook.error is not None:
+            raise RuntimeError("AArch64 division normalization failed: " + division_hook.error)
         bin2llvm.finish_stream_to_file(fsync=True)
         # 校验前释放 IDA 数据库和 lifter 的模块/缓存：llvm-as 对大模块的峰值内存与 lifter 相当，
         # 避免两者同时驻留（逐函数记录先保存下来）
@@ -3793,6 +4091,8 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
     finally:
         if carry_hook is not None:
             carry_hook.unhook()
+        if division_hook is not None:
+            division_hook.unhook()
         if bin2llvm is not None:
             with suppress(Exception):
                 bin2llvm.close_stream()
