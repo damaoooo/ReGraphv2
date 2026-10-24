@@ -180,6 +180,7 @@ byteorder = "little"
 ptext = {}  # 缓存反编译的函数: {地址: 反编译结果}
 refreshed_funcs = set()  # 避免重复触发无缓存反编译
 decompile_skip = frozenset()  # 不交给 Hex-Rays 的函数名，run_lift 时从 REGRAPH_DECOMPILE_SKIP 读取
+rotate_rewrites = {}  # RotateFix 每个函数改写的移位数: {函数地址: 次数}
 lifting_funcs = set()  # 正在定义函数体的函数，防止递归重入
 lifted_funcs = set()  # 已经完成函数体定义的函数
 function_signature_cache = {}  # 缓存函数签名: {地址: ida_typeinf.tinfo_t}
@@ -246,6 +247,7 @@ def _reset_lift_state():
     global target_data, llvm_context
     ptext.clear()
     refreshed_funcs.clear()
+    rotate_rewrites.clear()
     lifting_funcs.clear()
     lifted_funcs.clear()
     function_signature_cache.clear()
@@ -2800,6 +2802,249 @@ def _install_arm_carry_fix():
     return hook
 
 
+# ============================================================================
+# 循环移位：clang -O0 把 C 的 ROTATE(x, n) 编译成 (x << n) | (x >> (W - n)) 三条指令，不用 rol/ror。
+# Hex-Rays 的局部优化在这种展开的移位链上耗时急剧增长（OpenSSL SM3 的 64 轮展开要数小时以上），
+# 而同样的源码编译成 rol（gcc，或 clang -O1+）只要几秒。在局部优化之前把这种模式改写成 Hex-Rays
+# 自己表示 rol 的 __ROLn__ helper 调用（lift 时翻译成 llvm.fshl），语义不变。
+# 改写会改变 Hex-Rays 对该函数的类型推断（进而影响调用者），所以只对指定的函数启用。
+# ============================================================================
+
+def _rotate_fix_from_env() -> frozenset:
+    """
+    REGRAPH_ROTATE_FIX：逗号分隔的 IDA 函数名（精确匹配），只对这些函数改写循环移位；"*" 表示所有函数。
+    默认为空，lift 行为不变。
+    """
+    return frozenset(name.strip() for name in os.environ.get("REGRAPH_ROTATE_FIX", "").split(",") if name.strip())
+
+
+class _BlockValues:
+    """
+    一个基本块内的局部值编号：同一个值（mov 复制、或由相同运算和操作数重新算出）得到同一个编号。
+    寄存器/栈变量/全局变量按字节区间跟踪，写入时让重叠的位置失效；stx 和调用使所有内存位置失效，
+    调用还使所有寄存器失效。不认识的运算和访存结果每次都是新编号，所以只会少认相等，不会误认。
+    """
+
+    PURE = None  # 首次使用时按 ida_hexrays 填充
+
+    def __init__(self):
+        h = ida_hexrays
+        if _BlockValues.PURE is None:
+            _BlockValues.PURE = frozenset((h.m_add, h.m_sub, h.m_mul, h.m_and, h.m_or, h.m_xor, h.m_shl, h.m_shr,
+                                           h.m_sar, h.m_xdu, h.m_xds, h.m_low, h.m_high, h.m_neg, h.m_bnot))
+        self.numbers = {}   # 表达式 -> 编号
+        self.exprs = []     # 编号 -> 表达式：("n", 值, 宽度) / ("op", 操作码, 左, 右, 宽度) / ("leaf", 序号, 宽度)
+        self.places = {}    # (类型, 起始, 宽度) -> (编号, 该位置的 mop 副本)
+
+    def number(self, expr):
+        n = self.numbers.get(expr)
+        if n is None:
+            n = self.numbers[expr] = len(self.exprs)
+            self.exprs.append(expr)
+        return n
+
+    def fresh(self, size):
+        return self.number(("leaf", len(self.exprs), size))
+
+    @staticmethod
+    def place(mop):
+        h = ida_hexrays
+        if mop.t == h.mop_r:
+            return ("r", mop.r, mop.size)
+        if mop.t == h.mop_S:
+            return ("S", mop.s.off, mop.size)
+        if mop.t == h.mop_v:
+            return ("v", mop.g, mop.size)
+        return None
+
+    def read(self, mop):
+        h = ida_hexrays
+        if mop.t == h.mop_n:
+            return self.number(("n", mop.nnn.value, mop.size))
+        if mop.t == h.mop_d:
+            return self.value_of(mop.d)
+        key = self.place(mop)
+        if key is None:
+            return self.fresh(mop.size)
+        if key not in self.places:
+            # 块入口的值：第一次读到时给一个编号，之后同一位置读到同一个
+            low = self.low_part(key)
+            self.places[key] = (self.fresh(mop.size) if low is None else low, ida_hexrays.mop_t(mop))
+        return self.places[key][0]
+
+    def low_part(self, key):
+        """寄存器低位部分（w0 之于 x0）：宽位置上是扩展结果或常数时，低位就是扩展前的值或截断的常数。"""
+        h = ida_hexrays
+        kind, start, size = key
+        if kind != "r":  # 栈/全局变量的低位在哪个地址取决于字节序，不推导
+            return None
+        for (k, s, wide), (value, _) in self.places.items():
+            if k != kind or s != start or wide <= size:
+                continue
+            expr = self.exprs[value]
+            if expr[0] == "n":
+                return self.number(("n", expr[1] & ((1 << (size * 8)) - 1), size))
+            if expr[0] == "op" and expr[1] in (h.m_xdu, h.m_xds) and self.exprs[expr[2]][-1] == size:
+                return expr[2]
+        return None
+
+    def value_of(self, ins):
+        h = ida_hexrays
+        if ins.opcode == h.m_mov:
+            return self.read(ins.l)
+        if ins.opcode in self.PURE:
+            right = self.read(ins.r) if ins.r.t != h.mop_z else None
+            return self.number(("op", ins.opcode, self.read(ins.l), right, ins.d.size))
+        return self.fresh(ins.d.size)
+
+    @staticmethod
+    def clobbers(ins):
+        """ins 除 d 以外可能改变的位置类型：调用（含内嵌在操作数里的）和外部指令改变一切，存储改变内存。"""
+        h = ida_hexrays
+        if ins.opcode in (h.m_call, h.m_icall, h.m_ext) or ins.contains_call(True):
+            return ("S", "v", "r")
+        if ins.opcode in (h.m_stx, h.m_push, h.m_pop):
+            return ("S", "v")
+        return ()
+
+    def step(self, ins, value, clobbered):
+        """执行 ins 对位置的影响：value、clobbered 是改写之前用 value_of、clobbers 算好的。"""
+        h = ida_hexrays
+        if clobbered:
+            self.places = {k: v for k, v in self.places.items() if k[0] not in clobbered}
+        key = self.place(ins.d)
+        if key is None:
+            return
+        kind, start, size = key
+        self.places = {k: v for k, v in self.places.items()
+                       if not (k[0] == kind and k[1] < start + size and start < k[1] + k[2])}
+        self.places[key] = (value, h.mop_t(ins.d))
+
+    def materialize(self, n, ea, depth=6):
+        """当前持有编号 n 的位置；没有时用仍然有效的叶子按表达式重建（深度有限）。"""
+        for value, mop in self.places.values():
+            if value == n:
+                return ida_hexrays.mop_t(mop)
+        expr = self.exprs[n]
+        if expr[0] == "n":
+            return _mc_number(expr[1], expr[2])
+        if expr[0] != "op" or depth == 0:
+            return None
+        _, opcode, left, right, size = expr
+        left = self.materialize(left, ea, depth - 1)
+        right = None if right is None else self.materialize(right, ea, depth - 1)
+        if left is None or (expr[3] is not None and right is None):
+            return None
+        return _mc_expr(ea, opcode, left, right, size)
+
+    def rotate(self, ins):
+        """ins 为 or (x << n), (x >> (W - n))（左移可能已被预优化写成 mul #2^n）时返回 (x 的编号, n)。"""
+        h = ida_hexrays
+        size = ins.d.size
+        if ins.opcode != h.m_or or size not in (4, 8):
+            return None
+        shifts = [self.shift(self.read(op), size) for op in (ins.l, ins.r)]
+        if None in shifts or {s[0] for s in shifts} != {"l", "r"}:
+            return None
+        (_, x, n), (_, y, m) = sorted(shifts)
+        if x != y or not 0 < n < size * 8 or m != size * 8 - n or self.exprs[x][-1] != size:
+            return None
+        return x, n
+
+    def shift(self, n, size):
+        h = ida_hexrays
+        expr = self.exprs[n]
+        if expr[0] != "op" or expr[4] != size:
+            return None
+        _, opcode, left, right, _ = expr
+        if opcode in (h.m_shl, h.m_shr) and self.exprs[right][0] == "n":
+            return "l" if opcode == h.m_shl else "r", left, self.exprs[right][1]
+        if opcode == h.m_mul:
+            for factor, x in ((left, right), (right, left)):
+                k = self.exprs[factor]
+                if k[0] == "n" and k[1] > 1 and k[1] & (k[1] - 1) == 0:
+                    return "l", x, k[1].bit_length() - 1
+        return None
+
+
+def _install_rotate_fix(names: frozenset):
+    if not names:
+        return None
+    h = ida_hexrays
+    unsigned = {1: ida_typeinf.BTF_UINT8, 4: ida_typeinf.BTF_UINT32, 8: ida_typeinf.BTF_UINT64}
+
+    def int_type(size):
+        tif = ida_typeinf.tinfo_t()
+        tif.create_simple_type(unsigned[size])
+        return tif
+
+    def rol_call(ea, value, amount, size):
+        """与 Hex-Rays 为 rol 指令生成的 __ROLn__ helper 调用相同的形式。"""
+        info = h.mcallinfo_t()
+        info.cc = ida_typeinf.CM_CC_FASTCALL
+        info.flags = h.FCI_PROP | h.FCI_FINAL | h.FCI_PURE
+        info.role = h.ROLE_ROL
+        info.callee = ida_idaapi.BADADDR
+        info.solid_args = 2
+        info.return_type = int_type(size)
+        for operand, typ in ((value, int_type(size)), (_mc_number(amount, 1), int_type(1))):
+            arg = h.mcallarg_t()
+            arg.copy_mop(operand)
+            arg.type = typ
+            info.args.push_back(arg)
+        call = h.minsn_t(ea)
+        call.opcode = h.m_call
+        call.l.make_helper(f"__ROL{size}__")
+        call.d._make_callinfo(info)
+        call.d.size = size
+        return call
+
+    class RotateFix(h.Hexrays_Hooks):
+        error = None
+
+        def preoptimized(self, mba):
+            if "*" not in names and _get_name_cached(mba.entry_ea) not in names:
+                return 0
+            try:
+                count = sum(self.rewrite_block(mba.get_mblock(index)) for index in range(mba.qty))
+                if count:
+                    rotate_rewrites[mba.entry_ea] = rotate_rewrites.get(mba.entry_ea, 0) + count
+                    mba.verify(True)
+                return 0
+            except Exception as exc:
+                self.error = str(exc)
+                return h.MERR_INSN
+
+        @staticmethod
+        def rewrite_block(block):
+            """or (x<<n),(x>>(W-n)) → mov __ROLn__(x, n)；两条移位保持原样，由死代码消除去掉。"""
+            values = _BlockValues()
+            count = 0
+            ins = block.head
+            while ins is not None:
+                result, clobbered = values.value_of(ins), values.clobbers(ins)
+                match = values.rotate(ins)
+                x = None if match is None else values.materialize(match[0], ins.ea)
+                if x is not None:
+                    call = rol_call(ins.ea, x, match[1], ins.d.size)
+                    ins.opcode = h.m_mov
+                    ins.l.erase()
+                    ins.l.make_insn(call)
+                    ins.l.size = ins.d.size
+                    ins.r.erase()
+                    count += 1
+                values.step(ins, result, clobbered)
+                ins = ins.next
+            if count:
+                block.mark_lists_dirty()
+            return count
+
+    hook = RotateFix()
+    if not hook.hook():
+        raise RuntimeError("cannot install rotate normalization hook")
+    return hook
+
+
 _ARM_DOUBLE_RUNTIME = frozenset(('__aeabi_dadd', '__aeabi_dsub', '__aeabi_drsub', '__aeabi_dmul', '__aeabi_ddiv'))
 
 
@@ -3657,6 +3902,9 @@ class BIN2LLVMController():
                 if current_approx:
                     lift_stats["approx"] += 1
                     record["approx"] = sorted(current_approx)
+                rewrites = rotate_rewrites.pop(ea, 0)
+                if rewrites:
+                    record["rotate_rewrites"] = rewrites
             else:
                 record["status"] = "not_defined"
         except Exception as e:
@@ -4024,6 +4272,7 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
     _reset_lift_state()
     global decompile_skip
     decompile_skip = _decompile_skip_from_env()
+    rotate_fix = _rotate_fix_from_env()
     started = time.time()
     out = os.path.abspath(output_llvm_ir)
     sidecar = out + _LiftArtifactState.LIFT_SUFFIX
@@ -4042,11 +4291,13 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
         "target_mode": target_mode,
         "previous_output": _previous_output(out, sidecar),
         "decompile_skip": sorted(decompile_skip),
+        "rotate_fix": sorted(rotate_fix),
     }
     bin2llvm = None
     database_open = False
     carry_hook = None
     division_hook = None
+    rotate_hook = None
     try:
         idapro.open_database(input_binary, True)
         database_open = True
@@ -4054,6 +4305,7 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
         _init_target_state()
         carry_hook = _install_arm_carry_fix()
         division_hook = _install_a64_division_fix()
+        rotate_hook = _install_rotate_fix(rotate_fix)
         _apply_arm_runtime_types()
         # IDB 中可能保存着以前的反编译结果：直接复用不会触发 microcode 事件（早期 hook 不生效），
         # 且与全新反编译的类型推断不同，使输出依赖 IDB 的缓存状态。清空后每个函数在本次运行中
@@ -4074,12 +4326,16 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
         ]
         if decompile_skip:
             header.append("decompile_skip=" + ",".join(sorted(decompile_skip)))
+        if rotate_fix:
+            header.append("rotate_fix=" + ",".join(sorted(rotate_fix)))
         bin2llvm.begin_stream_to_file(tmp, header)
         bin2llvm.insertAllFunctions()
         if carry_hook is not None and carry_hook.error is not None:
             raise RuntimeError("ARM carry normalization failed: " + carry_hook.error)
         if division_hook is not None and division_hook.error is not None:
             raise RuntimeError("AArch64 division normalization failed: " + division_hook.error)
+        if rotate_hook is not None and rotate_hook.error is not None:
+            raise RuntimeError("rotate normalization failed: " + rotate_hook.error)
         bin2llvm.finish_stream_to_file(fsync=True)
         # 校验前释放 IDA 数据库和 lifter 的模块/缓存：llvm-as 对大模块的峰值内存与 lifter 相当，
         # 避免两者同时驻留（逐函数记录先保存下来）
@@ -4120,6 +4376,8 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
             carry_hook.unhook()
         if division_hook is not None:
             division_hook.unhook()
+        if rotate_hook is not None:
+            rotate_hook.unhook()
         if bin2llvm is not None:
             with suppress(Exception):
                 bin2llvm.close_stream()
