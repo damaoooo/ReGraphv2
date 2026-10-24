@@ -396,6 +396,31 @@ def test_function_type_value_cast_rejects(L):
     assert err.value.reason == 'function_type_value_cast'
 
 
+def test_listed_function_is_rejected_without_decompiling(L, monkeypatch):
+    # Hex-Rays cannot be interrupted once decompile() starts, so the list is checked before it
+    L._reset_lift_state()
+    monkeypatch.setattr(L, 'decompile_skip', frozenset({'sm3_block_data_order'}))
+    monkeypatch.setattr(L, '_segment_name', lambda ea: '.text')
+    monkeypatch.setattr(L.ida_hexrays, 'mark_cfunc_dirty', lambda *args: None, raising=False)
+    decompiled = []
+    controller = types.SimpleNamespace(
+        _get_name=lambda ea: 'sm3_block_data_order', _decompile_function=decompiled.append,
+        _drop_partial_definition=lambda ea: None, _trim_ptext=lambda keep_ea=None: None)
+    L.BIN2LLVMController.insertFunctionAtEa(controller, 0x1000)
+    assert decompiled == []
+    assert L.function_records == [{'ea': '0x1000', 'name': 'sm3_block_data_order', 'segment': '.text',
+                                   'status': 'rejected', 'reason': 'decompile_skipped_by_list',
+                                   'detail': 'decompile_skipped_by_list: sm3_block_data_order'}]
+    assert L.unsupported_reasons == {'decompile_skipped_by_list': 1}
+
+
+def test_decompile_skip_list_is_exact_names(L, monkeypatch):
+    monkeypatch.setenv('REGRAPH_DECOMPILE_SKIP', ' sm3_block_data_order, _sm3_block_data_order,,')
+    assert L._decompile_skip_from_env() == {'sm3_block_data_order', '_sm3_block_data_order'}
+    monkeypatch.delenv('REGRAPH_DECOMPILE_SKIP')
+    assert L._decompile_skip_from_env() == frozenset()
+
+
 def test_direct_call_multi_retregs_rejects(stub_operands):
     L = stub_operands
     module, entry, builder, call_insn = typed_call(L, ir.IntType(64), ir.IntType(64), retregs=2)

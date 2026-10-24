@@ -179,6 +179,7 @@ is_big_endian = False
 byteorder = "little"
 ptext = {}  # 缓存反编译的函数: {地址: 反编译结果}
 refreshed_funcs = set()  # 避免重复触发无缓存反编译
+decompile_skip = frozenset()  # 不交给 Hex-Rays 的函数名，run_lift 时从 REGRAPH_DECOMPILE_SKIP 读取
 lifting_funcs = set()  # 正在定义函数体的函数，防止递归重入
 lifted_funcs = set()  # 已经完成函数体定义的函数
 function_signature_cache = {}  # 缓存函数签名: {地址: ida_typeinf.tinfo_t}
@@ -1031,7 +1032,7 @@ def analyze_insn(module, ida_insn, ea):
 
                 if callnum != argnum:
                     ida_hf = ida_hexrays.hexrays_failure_t()
-                    if temp_ea not in refreshed_funcs:
+                    if temp_ea not in refreshed_funcs and func_name not in decompile_skip:
                         refreshed_funcs.add(temp_ea)
                         try:
                             # 重新反编译被调用函数
@@ -3616,6 +3617,9 @@ class BIN2LLVMController():
         # segment 让 Task 3 按段排除非样本函数（PLT 跳板、.init/.fini）；IR 里照常定义，其他函数仍调用它们
         record = {"ea": hex(ea), "name": self._get_name(ea), "segment": _segment_name(ea)}
         try:
+            if record["name"] in decompile_skip:
+                # decompile() 一旦进入就无法超时或中断，只能在调用前跳过
+                raise UnsupportedMicrocode("decompile_skipped_by_list", record["name"])
             # Scan original instructions, including ones that disappear before
             # LVARS. Linear in function size; retain no per-instruction cache.
             native_divisions = []
@@ -3970,6 +3974,14 @@ def _verify_llvm_file(path: str) -> tuple[bool, str]:
     return proc.returncode == 0, (proc.stderr or "")[-2000:]
 
 
+def _decompile_skip_from_env() -> frozenset:
+    """
+    REGRAPH_DECOMPILE_SKIP：逗号分隔的 IDA 函数名（精确匹配），这些函数不调用 Hex-Rays，记为 rejected。
+    用于 Hex-Rays 自身在合理时间内反编译不完的函数（如 clang -O0 的 sm3_block_data_order）。
+    """
+    return frozenset(name.strip() for name in os.environ.get("REGRAPH_DECOMPILE_SKIP", "").split(",") if name.strip())
+
+
 def _release_heap():
     """把已释放的 malloc 堆归还给系统（glibc），否则关闭数据库后的空闲内存仍计入本进程 RSS。"""
     with suppress(Exception):
@@ -4010,6 +4022,8 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
     旧 sidecar 的 sha256 不一致，同样被拒绝。返回 sidecar 内容。
     """
     _reset_lift_state()
+    global decompile_skip
+    decompile_skip = _decompile_skip_from_env()
     started = time.time()
     out = os.path.abspath(output_llvm_ir)
     sidecar = out + _LiftArtifactState.LIFT_SUFFIX
@@ -4027,6 +4041,7 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
         "output_path": out,
         "target_mode": target_mode,
         "previous_output": _previous_output(out, sidecar),
+        "decompile_skip": sorted(decompile_skip),
     }
     bin2llvm = None
     database_open = False
@@ -4057,6 +4072,8 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
             f"memory_contract={bin2llvm.memory_contract}",
             f"source proc={source.get('proc')} bits={source['bits']} endian={source['endian']}",
         ]
+        if decompile_skip:
+            header.append("decompile_skip=" + ",".join(sorted(decompile_skip)))
         bin2llvm.begin_stream_to_file(tmp, header)
         bin2llvm.insertAllFunctions()
         if carry_hook is not None and carry_hook.error is not None:

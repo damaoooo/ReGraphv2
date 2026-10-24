@@ -500,6 +500,8 @@ def main(
         'python': python_runner(conda_env), 'ida_path': str(Path(ida_path).resolve()),
         'ghidra': [ghidra_home, analyze_headless, ghidra_target, ghidra_max_cpu,
                    ghidra_decompile_timeout, ghidra_analysis_timeout, ghidra_no_analysis, allow_partial],
+        # ida2llvm reads its skip list from the environment, so a changed list must invalidate old outputs
+        'decompile_skip': sorted(filter(None, (n.strip() for n in os.environ.get('REGRAPH_DECOMPILE_SKIP', '').split(',')))),
     }
     if backend == 'ida':
         idat = Path(ida_path) / 'idat'
