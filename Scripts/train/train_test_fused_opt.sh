@@ -17,6 +17,7 @@ reuse_embeddings=0
 resume=0
 skip_train=0
 output_root=""
+train_overrides=()
 
 print_help() {
 	cat <<'EOF'
@@ -42,6 +43,7 @@ Options:
   --eval-samples N       Test anchors to sample. 0 means all. Default: 0
   --pool-samples N       Retrieval pool samples. 0 means full pool. Default: 0
   --output-root DIR      Output directory. Default: ./runs/dataset1_<opt>_fused
+  --train-set KEY=VALUE  Extra Pretrain config override for training, repeatable.
   --resume               Resume training from the latest checkpoint.
   --skip-train           Only run test evaluation using the existing model.
   --reuse-embeddings     Reuse existing test embedding cache if present.
@@ -122,6 +124,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--output-root)
 			output_root="$2"
+			shift 2
+			;;
+		--train-set)
+			train_overrides+=(--set "$2")
 			shift 2
 			;;
 		--resume)
@@ -221,6 +227,8 @@ if [[ "${skip_train}" == "0" ]]; then
 	if [[ -n "${eval_steps}" ]]; then
 		train_cmd+=(--set "eval_steps=${eval_steps}")
 	fi
+
+	train_cmd+=("${train_overrides[@]}")
 
 	if [[ "${resume}" == "1" ]]; then
 		train_cmd+=(--resume)
