@@ -2,9 +2,15 @@
 """
 LLVM IR Corpus Builder for BPE Tokenization
 Reads LLVM IR files, normalizes them, and saves as HuggingFace dataset for BPE training
+
+The corpus text of a function is exactly what DataProcess tokenizes (see function_corpus_text), so the
+tokenizer is trained on the inputs the model sees. That needs LLVM 18 `opt` on PATH and the LLVMTools
+metadata-stripping plugin (cmake -S LLVMTools -B LLVMTools/build).
 """
 
+import contextlib
 import os
+import tempfile
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Union, Any
 import json
@@ -21,6 +27,33 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeEl
 from rich.console import Console
 
 from .normalizer import LLVMIRNormalizer
+
+
+def function_corpus_text(function_path: str, artifact_dir: Optional[str] = None) -> Optional[str]:
+    """Normalized IR of one extracted function, as DataProcess.FileProcessor tokenizes it; None if it is not a sample.
+
+    Same steps as the dataset: the GraphBuilder pre-filter (should_skip_this_file), the metadata-stripping
+    pass (graph_generator._opt_initial_purify), then normalize_file. The purified copy goes to artifact_dir
+    (a temporary directory by default) and is removed; the ModuleID it records is not part of the text.
+    """
+    from GraphBuilder.graph_generator import _opt_initial_purify
+    from Utils.utils import should_skip_this_file
+    from .normalizer import normalize_file
+
+    with open(function_path, 'r', encoding='utf-8') as f:  # undecodable IR is an error, as in FileFilter
+        if should_skip_this_file(f.read()):
+            return None
+    if artifact_dir is not None:
+        os.makedirs(artifact_dir, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='corpus-') if artifact_dir is None else contextlib.nullcontext(artifact_dir) as workdir:
+        purified = _opt_initial_purify(function_path, workdir)
+        if purified is None:
+            return None
+        try:
+            text = normalize_file(purified)
+        finally:
+            os.remove(purified)
+    return text if text.strip() else None
 
 
 def extract_optimization(filename: str) -> str:
@@ -112,8 +145,7 @@ class LLVMIRCorpusBuilder:
     def process_single_file(args: Tuple[Path, dict]) -> Tuple[List[Dict], Dict]:
         """Static method to process a single file - used for multiprocessing"""
         file_path, metadata = args
-        normalizer = LLVMIRNormalizer()
-        
+
         # Statistics for this file
         file_stats = {
             'processed_files': 0,
@@ -124,26 +156,16 @@ class LLVMIRCorpusBuilder:
         }
         
         try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                ir_code = f.read()
-            
-            # Extract individual functions
-            func_code = ir_code.strip()
-            
             results = []
 
-            if not func_code.strip():
+            # The text DataProcess tokenizes for this function; None for functions that are not samples
+            normalized_func = function_corpus_text(str(file_path))
+            if normalized_func is None:
                 return results, file_stats
-
-            # Reset normalizer for each function to get consistent naming
-            normalizer.reset()
-
-            # Normalize the function
-            normalized_func = normalizer.normalize_ir(func_code)
 
             # Create metadata
             metadata['file_path'] = str(file_path)
-            metadata['original_length'] = len(func_code)
+            metadata['original_length'] = file_path.stat().st_size
             metadata['normalized_length'] = len(normalized_func)
 
             results.append({

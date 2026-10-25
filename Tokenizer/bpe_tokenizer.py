@@ -2,9 +2,13 @@
 """
 BPE Tokenizer Training Script for LLVM IR
 Trains a BPE tokenizer on the normalized LLVM IR corpus for machine learning
+
+The training text is the corpus text as is (corpus_builder.function_corpus_text, the input DataProcess
+tokenizes); no <func>/<bb> markers are added, since samples are tokenized without them.
 """
 
 import os
+import random
 import time
 import sys
 from pathlib import Path
@@ -34,25 +38,51 @@ app = typer.Typer(help="Train BPE tokenizer on LLVM IR corpus")
 
 
 
-def _process_single_function(func: str) -> str:
-    """Process a single function - used for multiprocessing"""
-    # Add function boundary tokens
+DEFAULT_VOCAB_SIZE = 65535
+DEFAULT_MIN_FREQUENCY = 2
 
-    func_with_tokens = f"<func> {func.strip()} </func>"
-    
-    # Add basic block boundary tokens (identify basic block labels)
-    lines = func_with_tokens.split('\n')
-    processed_lines = []
-    
-    for line in lines:
-        stripped = line.strip()
-        # Basic block labels (end with ':')
-        if stripped.endswith(':') and not any(op in stripped for op in ['=', 'call', 'load', 'store']):
-            processed_lines.append(f"{line} <bb>")
-        else:
-            processed_lines.append(line)
-    
-    return '\n'.join(processed_lines)
+# Special tokens for LLVM IR. The first nine keep their ids (0-8); the six placeholders the normalizer emits
+# follow (9-14), so load_tokenizer finds them in the vocabulary instead of appending them past it, and BPE
+# spends no merges on their pieces.
+SPECIAL_TOKENS = [
+    "<pad>",     # Padding token
+    "<unk>",     # Unknown token
+    "<bos>",     # Beginning of sequence
+    "<eos>",     # End of sequence
+    "<mask>",    # Mask token for masked language modeling
+    "<func>",    # Function boundary
+    "<bb>",      # Basic block boundary
+    "<var>",     # Variable token
+    "<const>",   # Constant token
+    "<MED_INT>", "<LARGE_INT>", "<HUGE_INT>", "<HEX_CONST>", "<FLOAT_CONST>", "<STRING_CONST>",
+]
+
+# tokenizers' BpeTrainer counts pairs in 32-bit integers. On the Dataset-1 train corpus (43.6M functions)
+# the "%." pair occurs ~3.7e9 times, overflows and is never merged; a uniform sample scales all counts alike.
+# Keep the most frequent pair well below 2**31 (about 1e9) by choosing the fraction accordingly.
+
+
+def create_bpe_tokenizer() -> Tokenizer:
+    """Untrained BPE tokenizer: <unk> for unknowns, whitespace pre-tokenization."""
+    tokenizer = Tokenizer(BPE(unk_token="<unk>"))
+    tokenizer.pre_tokenizer = Whitespace()
+    return tokenizer
+
+
+def create_bpe_trainer(vocab_size: int = DEFAULT_VOCAB_SIZE, min_frequency: int = DEFAULT_MIN_FREQUENCY,
+                       show_progress: bool = True) -> BpeTrainer:
+    return BpeTrainer(vocab_size=vocab_size, min_frequency=min_frequency,
+                      special_tokens=SPECIAL_TOKENS, show_progress=show_progress)
+
+
+def add_post_processor(tokenizer: Tokenizer) -> Tokenizer:
+    """<bos> $A <eos> around every sequence. The trainer adds SPECIAL_TOKENS first and in order, so their
+    ids are their list positions, before training as after it."""
+    tokenizer.post_processor = TemplateProcessing(
+        single="<bos> $A <eos>",
+        special_tokens=[("<bos>", SPECIAL_TOKENS.index("<bos>")), ("<eos>", SPECIAL_TOKENS.index("<eos>"))],
+    )
+    return tokenizer
 
 
 def _write_batch_to_file(batch_data: tuple) -> str:
@@ -79,21 +109,11 @@ class LLVMIRTokenizerTrainer:
         console.print(f"[green]Using {self.num_workers} workers for parallel processing[/green]")
         
         # BPE Configuration
-        self.vocab_size = 50000  # Large vocabulary for complex LLVM IR
-        self.min_frequency = 2   # Minimum frequency for tokens
-        
-        # Special tokens for LLVM IR
-        self.special_tokens = [
-            "<pad>",     # Padding token
-            "<unk>",     # Unknown token
-            "<bos>",     # Beginning of sequence
-            "<eos>",     # End of sequence
-            "<mask>",    # Mask token for masked language modeling
-            "<func>",    # Function boundary
-            "<bb>",      # Basic block boundary
-            "<var>",     # Variable token
-            "<const>",   # Constant token
-        ]
+        self.vocab_size = DEFAULT_VOCAB_SIZE
+        self.min_frequency = DEFAULT_MIN_FREQUENCY
+        self.sample_fraction = 1.0  # < 1 trains on a uniform sample (see the int32 note at SPECIAL_TOKENS)
+        self.seed = 0
+        self.special_tokens = SPECIAL_TOKENS
     
     def load_corpus_text(self) -> List[str]:
         """Load the corpus text for training"""
@@ -134,48 +154,19 @@ class LLVMIRTokenizerTrainer:
         raise FileNotFoundError(f"No valid corpus found in {self.corpus_path}")
     
     def prepare_training_data(self, functions: List[str]) -> List[str]:
-        """Prepare training data by adding special tokens and formatting"""
-        
+        """Training text: the corpus functions as is (no markers), uniformly sampled if sample_fraction < 1"""
+
         console.print("[blue]Preparing training data...[/blue]")
-        
-        # Simple single-process preparation (string operations are too lightweight for multiprocessing)
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            TimeElapsedColumn(),
-            console=console
-        ) as progress:
-            
-            task = progress.add_task("Processing functions", total=len(functions))
-            prepared_data = []
-            for func in functions:
-                prepared_data.append(_process_single_function(func))
-                progress.advance(task)
-            
-            console.print(f"[green]✓ Processed {len(prepared_data)} functions[/green]")
-        
+        prepared_data = [func.strip() for func in functions if func.strip()]
+        if self.sample_fraction < 1.0:
+            rng = random.Random(self.seed)
+            prepared_data = [func for func in prepared_data if rng.random() < self.sample_fraction]
+        console.print(f"[green]✓ Prepared {len(prepared_data)} functions[/green]")
         return prepared_data
-    
+
     def create_tokenizer(self) -> Tokenizer:
         """Create and configure the BPE tokenizer"""
-
-        # Initialize BPE model
-        tokenizer = Tokenizer(BPE(unk_token="<unk>"))
-        
-        # Set pre-tokenizer (split on whitespace but preserve structure)
-        tokenizer.pre_tokenizer = Whitespace()
-        
-        # Add post-processor for special tokens
-        tokenizer.post_processor = TemplateProcessing(
-            single="<bos> $A <eos>",
-            special_tokens=[
-                ("<bos>", 2),  # ID for <bos>
-                ("<eos>", 3),  # ID for <eos>
-            ],
-        )
-        
-        return tokenizer
+        return add_post_processor(create_bpe_tokenizer())
     
     def train_tokenizer(self, training_data: List[str], tokenizer: Tokenizer) -> Tokenizer:
         """Train the BPE tokenizer on the corpus using multiprocessing for file I/O"""
@@ -183,12 +174,7 @@ class LLVMIRTokenizerTrainer:
         console.print(f"[blue]Training BPE tokenizer with vocab size {self.vocab_size}[/blue]")
         
         # Configure trainer
-        trainer = BpeTrainer(
-            vocab_size=self.vocab_size,
-            min_frequency=self.min_frequency,
-            special_tokens=self.special_tokens,
-            show_progress=True,  # Keep tokenizer's built-in progress bar
-        )
+        trainer = create_bpe_trainer(self.vocab_size, self.min_frequency)
         
         # Prepare batches for parallel file writing
         batch_size = max(1000, len(training_data) // (self.num_workers * 4))  # Adaptive batch size
@@ -285,6 +271,9 @@ class LLVMIRTokenizerTrainer:
                 "vocab_size": self.vocab_size,
                 "min_frequency": self.min_frequency,
                 "special_tokens": self.special_tokens,
+                "function_markers": False,
+                "sample_fraction": self.sample_fraction,
+                "sample_seed": self.seed,
                 "tokenizer_path": str(tokenizer_path),
                 "vocab_path": str(vocab_path),
             }
@@ -417,8 +406,10 @@ class LLVMIRTokenizerTrainer:
 def train(
     corpus_path: str = typer.Argument(..., help="Path to the corpus directory"),
     output_dir: str = typer.Option("llvm_tokenizer", "--output-dir", "-o", help="Output directory for tokenizer"),
-    vocab_size: int = typer.Option(50000, "--vocab-size", "-v", help="Vocabulary size"),
-    min_freq: int = typer.Option(2, "--min-freq", "-f", help="Minimum frequency for tokens"),
+    vocab_size: int = typer.Option(DEFAULT_VOCAB_SIZE, "--vocab-size", "-v", help="Vocabulary size"),
+    min_freq: int = typer.Option(DEFAULT_MIN_FREQUENCY, "--min-freq", "-f", help="Minimum frequency for tokens"),
+    sample_fraction: float = typer.Option(1.0, "--sample-fraction", help="Train on a uniform sample; needed when a pair count would pass 2**31"),
+    seed: int = typer.Option(0, "--seed", help="Seed of the sample"),
     name: str = typer.Option("llvm_ir_bpe", "--name", "-n", help="Name for the tokenizer"),
     workers: Optional[int] = typer.Option(None, "--workers", "-w", help="Number of workers for multiprocessing (default: auto)"),
     corpus_name: str = typer.Option("ir_corpus", "--corpus-name", "-cn", help="Name for the corpus directory")
@@ -451,7 +442,9 @@ def train(
         )
         trainer.vocab_size = vocab_size
         trainer.min_frequency = min_freq
-        
+        trainer.sample_fraction = sample_fraction
+        trainer.seed = seed
+
         # Train tokenizer
         tokenizer, tokenizer_path = trainer.train_full_pipeline(name)
         
