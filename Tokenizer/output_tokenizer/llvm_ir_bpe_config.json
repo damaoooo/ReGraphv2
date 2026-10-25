@@ -11,8 +11,32 @@
     "<func>",
     "<bb>",
     "<var>",
-    "<const>"
+    "<const>",
+    "<MED_INT>",
+    "<LARGE_INT>",
+    "<HUGE_INT>",
+    "<HEX_CONST>",
+    "<FLOAT_CONST>",
+    "<STRING_CONST>"
   ],
-  "tokenizer_path": "output_tokenizer/llvm_ir_bpe.json",
-  "vocab_path": "output_tokenizer/llvm_ir_bpe_vocab.json"
+  "pre_tokenizer": "Whitespace",
+  "tokenizer_path": "tokenizer_staging/llvm_ir_bpe.json",
+  "vocab_path": "tokenizer_staging/llvm_ir_bpe_vocab.json",
+  "corpus": {
+    "source": "Dataset-1 train split (clamav, curl, openssl, unrar), purified + normalize_file text",
+    "levels": [
+      "O0",
+      "O1",
+      "O2",
+      "O3",
+      "Os",
+      "Oz",
+      "Oc"
+    ],
+    "functions": 43614226,
+    "function_markers": false,
+    "sample_fraction": 0.25,
+    "sample_seed": 0,
+    "sample_reason": "tokenizers BpeTrainer pair counts are int32; full-corpus '%.' count ~3.7e9 overflows"
+  }
 }
