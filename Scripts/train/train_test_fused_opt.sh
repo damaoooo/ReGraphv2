@@ -24,7 +24,7 @@ Usage:
   bash Scripts/train/train_test_fused_opt.sh OPT_LEVEL [OPTIONS]
 
 OPT_LEVEL:
-  O0, O1, O2, O3, Os, Og, Oc, or aliases 0/1/2/3/s/g/c.
+  O0, O1, O2, O3, Os, Og, Oz, Oc, or aliases 0/1/2/3/s/g/z/c.
 
 What it does:
   1. Train with CFG+DDG on IR/Dataset-1-OPT-fused/train_final_set.
@@ -78,9 +78,10 @@ case "${opt_level}" in
 	3|O3|o3) opt_level="O3" ;;
 	s|S|Os|os|OS) opt_level="Os" ;;
 	g|G|Og|og|OG) opt_level="Og" ;;
+	z|Z|Oz|oz|OZ) opt_level="Oz" ;;
 	c|C|Oc|oc|OC) opt_level="Oc" ;;
 	*)
-		echo "Error: OPT_LEVEL must be one of O0/O1/O2/O3/Os/Og/Oc or 0/1/2/3/s/g/c."
+		echo "Error: OPT_LEVEL must be one of O0/O1/O2/O3/Os/Og/Oz/Oc or 0/1/2/3/s/g/z/c."
 		exit 1
 		;;
 esac
