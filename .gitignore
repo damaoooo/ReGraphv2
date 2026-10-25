@@ -32,6 +32,12 @@ __pycache__/
 **/build
 
 logs/
+# Slurm job output
+slurm_logs/
+slurm-*.out
+*.err
+# Local backups of regenerated artifacts (the previous version stays in git history)
+Tokenizer/output_tokenizer.bak*/
 
 .idea/
 .vscode/
