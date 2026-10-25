@@ -6,6 +6,8 @@
 from typing import Optional, Any, Dict
 from transformers import ModernBertConfig
 
+from Utils.utils import DEFAULT_TOKENIZER_PATH
+
 
 class PretrainConfig(ModernBertConfig):
     def __setattr__(self, name: str, value: Any):
@@ -31,7 +33,7 @@ class PretrainConfig(ModernBertConfig):
         # === 序列长度配置 ===
         max_seq_length: int = 2048,
         # === 路径配置 ===
-        tokenizer_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json",
+        tokenizer_path: str = DEFAULT_TOKENIZER_PATH,
         train_dataset_dir: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set",
         train_dataset_pool_path: Optional[str] = None,
         train_dataset_idx_path: Optional[str] = None,

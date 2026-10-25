@@ -55,3 +55,41 @@ Scripts/build_db2.sh <task3 输出目录> <输出目录> [workers]
 ```bash
 uv run --locked --extra pipeline python -m pytest tests/test_dataprocess_hf.py -q
 ```
+# Optional Selection and Qwen Export
+
+The existing `python -m DataProcess INPUT OUTPUT` build command is unchanged.
+The following explicit commands port the portable parts of cluster commit `52face1`;
+they do not enable new filtering rules by default or require Slurm.
+
+```bash
+uv run --locked --extra pipeline python -m DataProcess select \
+  --naming dataset1-xm --output-dir IR/selected \
+  --split train=IR/train_raw --split validation=IR/validation_raw --split test=IR/test_raw
+
+uv run --locked --extra pipeline python -m Pretrain.split_train_validation \
+  IR/selected/train --naming dataset1-xm --train-ratio 1.0 --output-dir IR/train_final_set
+
+uv run --locked --extra pipeline python -m DataProcess export-qwen \
+  --level-dir IR/Dataset-1-Oc-fused --split test \
+  --text-roots /path/to/corpus/Oc --qwen-tokenizer /path/to/Qwen-tokenizer \
+  --out IR/Dataset-1-Oc-qwen --workers 4
+```
+
+Selection runs on untruncated raw datasets before wash and positive pairing. It deduplicates
+token sequences globally (split-name then file-path order), removes cross-split names, and
+removes singleton groups. All inputs must use the same tokenizer. `dataset1-xm` groups
+across architectures and compilers; the old `dataset1` grouping remains available.
+Run wash on selected data before pairing when sequence truncation is needed.
+
+Qwen export requires corpus Parquet files `<split>/<project>/<binary>.parquet` with
+`function_name` and `text`. Pool paths must contain `/functions/` as in the fused output.
+Text is purified/normalized IR, NOT untouched LLVM source. Pool row order, task indices
+and the positive map are retained; existing output directories are rejected. No graphs
+or IR BPE IDs are exported. Qwen token lengths are measured without truncation.
+
+For pre-extraction selection, `Scripts/ida_flowchart.py` writes JSON statistics;
+`Scripts/select_functions.py` consumes either these `<binary>.flowchart.json` files or
+Parquet statistics (`ea`, `bb_num`, `hashopcodes`) and lift states, then
+`Scripts/split_functions.py --select FILE` applies the selection. Preserve the same
+binary-relative directory layout under the statistics and lift roots. Opcode dedup ignores operands;
+use it explicitly for the benchmark protocol, not as proof of semantic equality.

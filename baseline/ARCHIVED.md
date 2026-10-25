@@ -30,3 +30,11 @@ The archive restores all three directories and the `CLAP/jina -> ../DEJINA` comp
 These are historical experiment artifacts. At least 1,518 groups of HermesSim binary inputs were byte-identical to explicit `.re` outputs in `binary_function_similarity/Binaries/Dataset-1-origin`. Removing the suffix did not remove their dependency on custom lifting/reoptimization. Results produced from those binaries need regeneration for the new lifter. CLAP and DEJINA input provenance and evaluation-pool alignment must also be checked before reuse.
 
 The remaining local `binary_function_similarity` and `ReLL` projects, including their explicit `.re` files, were not removed by this archival operation.
+
+## Old-Lifter Data (2026-10-25)
+
+The old-lifter data in `binary_function_similarity` and `ReLL` was archived to
+`/mnt/nas/ReLL-archives/2026-10-25-baseline-old-ir/` and removed locally. That covers the
+`.re`/`.ll`/`.bc` inputs, IDBs, DBs, large Models results, `ReLL/data` datasets and
+`ReLL/experiments`. Code, `.git`, uncommitted edits, `Dataset-Vulnerability` and the Qwen
+models stay here. See that directory's README for package contents and restore commands.

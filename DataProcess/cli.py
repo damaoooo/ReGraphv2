@@ -10,7 +10,8 @@ import typer
 from Utils.utils import DEFAULT_TOKENIZER_PATH
 from .builder import DatasetBuilder
 
-app = typer.Typer(help="Build a Hugging Face dataset from generated IR graphs.", add_completion=False)
+app = typer.Typer(help="Build a Hugging Face dataset from generated IR graphs. "
+                 "Additional package commands: select --help; export-qwen --help.", add_completion=False)
 
 
 @app.command()

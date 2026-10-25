@@ -24,6 +24,10 @@ NAMING_CONVENTIONS = {
     # <arch>-<compiler>-<version>-<opt>_<binary>, e.g. arm32-gcc-4.8-O0_clambc
     'dataset1': (re.compile(rf'^(?P<config>[A-Za-z0-9_]+-[A-Za-z]+-[0-9.]+)-(?P<variant>{OPT_LEVEL})_(?P<binary>.+)$'),
                  '{config}_{binary}'),
+    # Dataset-1 for the XM task (Marcelli et al.): one origin per binary over all architectures, compilers,
+    # versions and optimizations
+    'dataset1-xm': (re.compile(rf'^(?P<config>[A-Za-z0-9_]+-[A-Za-z]+-[0-9.]+)-(?P<variant>{OPT_LEVEL})_(?P<binary>.+)$'),
+                    '{binary}'),
     # <arch>-<bits>_<project>-<version>-<opt or obfuscation>_<binary>, e.g. x86-64_coreutils-8.32-subobf_join
     'dataset2': (re.compile(r'^(?P<config>[A-Za-z0-9]+-(?:32|64)_.+?-[0-9][0-9.]*)-(?P<variant>[A-Za-z0-9]+)_(?P<binary>.+)$'),
                  '{config}_{binary}'),
