@@ -1,10 +1,12 @@
 """Two-level function extraction; standard-library-only command-line driver.
 
 usage: split_functions.py INPUT.ll|INPUT.bc OUTPUT_DIR (--lift-state X.ll.lift.json | --no-segment-filter)
+                          [--select X.ll.select.json]
 
 Functions the lifter recorded in EXCLUDED_SEGMENTS are not extracted: PLT stubs only forward to an
 imported symbol, and .init/.fini hold compiler-generated startup/teardown code. Only the samples leave
 them out; the .ll/.bc modules stay as lifted, since other functions there still call these definitions.
+A selection file (Scripts/select_functions.py) further restricts the samples to the functions it lists.
 """
 import argparse
 import csv
@@ -123,10 +125,17 @@ def _excluded_function_names(functions: list, state_path: Path, module_path: Pat
     return {record['llvm_name'] for record in lifted if record['segment'] in EXCLUDED_SEGMENTS}
 
 
-def extract_functions(input_path: Path, output_directory: Path, lift_state: Path | None) -> None:
+def load_selection(path: Path) -> set[str]:
+    """LLVM names listed in a select_functions.py selection file."""
+    return set(json.loads(path.read_text())['functions'])
+
+
+def extract_functions(input_path: Path, output_directory: Path, lift_state: Path | None,
+                      selection: set[str] | None = None) -> None:
     """Write one `<sha1(name)>.ll` per sample function and `function_map.csv` into an empty directory.
 
     `lift_state` is the Task 1 state used to leave out EXCLUDED_SEGMENTS; None keeps every function.
+    `selection`, if given, keeps only the functions it names.
     """
     if output_directory.exists() and any(output_directory.iterdir()):
         # Files of an earlier run (e.g. functions excluded now) would otherwise stay next to the new set
@@ -149,6 +158,10 @@ def extract_functions(input_path: Path, output_directory: Path, lift_state: Path
         if excluded:
             print(f'Skipped {len(defined) - len(names)} functions in excluded segments in {input_path}',
                   file=sys.stderr)
+        if selection is not None:
+            unselected = len(names)
+            names = [name for name in names if name in selection]
+            print(f'Skipped {unselected - len(names)} unselected functions in {input_path}', file=sys.stderr)
         if not names:
             print(f'Warning: no functions to extract in {input_path}', file=sys.stderr)
         output_directory.mkdir(parents=True, exist_ok=True)
@@ -185,6 +198,8 @@ def parse_arguments() -> argparse.Namespace:
                                 help='Task 1 state file of the module; leaves out EXCLUDED_SEGMENTS')
     segment_filter.add_argument('--no-segment-filter', action='store_true',
                                 help='keep every function (no lift state, e.g. the Ghidra backend)')
+    parser.add_argument('--select', type=Path,
+                        help='selection file (select_functions.py); extract only the functions it lists')
     return parser.parse_args()
 
 
@@ -192,6 +207,7 @@ if __name__ == '__main__':
     arguments = parse_arguments()
     try:
         extract_functions(arguments.input.resolve(), arguments.output.resolve(),
-                          arguments.lift_state.resolve() if arguments.lift_state else None)
+                          arguments.lift_state.resolve() if arguments.lift_state else None,
+                          load_selection(arguments.select) if arguments.select else None)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         sys.exit(str(error))
