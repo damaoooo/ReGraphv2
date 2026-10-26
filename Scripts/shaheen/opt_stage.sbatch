@@ -30,6 +30,8 @@ BC_ROOT=${BC_ROOT:-$OUT/bc}  # retok reads the .bc of an earlier run of the same
 CORPUS_ROOT=${CORPUS_ROOT:-/scratch/zhoul0e/bpe-corpus}  # corpus phase: lists/<OPT>/part_<K>.txt in, <OPT>/ out
 SELECT_ROOT=${SELECT_ROOT:-}  # select_functions.py output: shard/retok extract only the selected functions
 NAMING=${NAMING:-dataset1}  # split_train_validation naming of select and final (dataset1-xm: XM positives)
+MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-2048}  # final: wash truncation length
+FINAL_SUFFIX=${FINAL_SUFFIX:-}  # final: publish <out>/<split>_final_set<suffix>, e.g. _4096
 
 REPO=/scratch/zhoul0e/ReGraphv2
 SIF=/scratch/zhoul0e/regraph-data-env-llvm18.1.3.sif
@@ -42,7 +44,7 @@ echo "node=$(hostname) phase=$PHASE task=$TASK opt=$OPT ll_root=$LL_ROOT out=$OU
 
 singularity exec --bind /scratch/zhoul0e:/scratch/zhoul0e --bind /tmp:/tmp "$SIF" \
     env PHASE="$PHASE" OPT="$OPT" LL_ROOT="$LL_ROOT" OUT="$OUT" TASK="$TASK" WORKERS="$WORKERS" BC_ROOT="$BC_ROOT" CORPUS_ROOT="$CORPUS_ROOT" \
-        SELECT_ROOT="$SELECT_ROOT" NAMING="$NAMING" \
+        SELECT_ROOT="$SELECT_ROOT" NAMING="$NAMING" MAX_SEQ_LENGTH="$MAX_SEQ_LENGTH" FINAL_SUFFIX="$FINAL_SUFFIX" \
         CMD_TIMEOUT="$CMD_TIMEOUT" REPO="$REPO" LOCAL="$LOCAL" TMPDIR="$LOCAL" \
         HF_DATASETS_CACHE="$LOCAL/hf_cache" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
     bash -euo pipefail -c '
@@ -91,7 +93,7 @@ final)
     KEEP=""
     [ -d "$OUT/selection" ] && KEEP="--keep $OUT/selection/$split.txt"
     $PY Scripts/shaheen/build_split.py --out "$OUT" --split "$split" --local "$LOCAL/final" --workers "$WORKERS" \
-        --naming "$NAMING" $KEEP
+        --naming "$NAMING" --max-seq-length "$MAX_SEQ_LENGTH" --suffix "$FINAL_SUFFIX" $KEEP
     ;;
 *) echo "unknown phase $PHASE" >&2; exit 2 ;;
 esac

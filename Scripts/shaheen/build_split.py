@@ -34,6 +34,8 @@ def main():
     ap.add_argument("--workers", type=int, default=os.cpu_count())
     ap.add_argument("--naming", default="dataset1")
     ap.add_argument("--keep", help="file of the file_paths to keep (select_level.py output)")
+    ap.add_argument("--max-seq-length", type=int, default=2048, help="wash truncation length")
+    ap.add_argument("--suffix", default="", help="publish <out>/<split>_final_set<suffix>, e.g. _4096")
     args = ap.parse_args()
 
     import datasets
@@ -67,13 +69,13 @@ def main():
 
     py = sys.executable
     run([py, "-m", "DataProcess.wash", "--dataset-path", local / "raw", "--output-path", local / "wash",
-         "--num-proc", args.workers])
+         "--num-proc", args.workers, "--max-seq-length", args.max_seq_length])
     shutil.rmtree(local / "raw")
     final_local = local / f"{args.split}_final_set"
     run([py, "-m", "Pretrain.split_train_validation", local / "wash", "--naming", args.naming,
          "--train-ratio", "1.0", "--output-dir", final_local])
 
-    target = out / f"{args.split}_final_set"
+    target = out / f"{args.split}_final_set{args.suffix}"
     shutil.rmtree(str(target) + ".part", ignore_errors=True)
     shutil.copytree(final_local, str(target) + ".part")
     shutil.rmtree(target, ignore_errors=True)
