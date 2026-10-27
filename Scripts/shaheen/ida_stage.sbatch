@@ -53,7 +53,11 @@ zstd -dc -T0 "$IDA_TAR" | tar -C "$STAGE" -xf -
 
 export IDADIR=$STAGE/ida-pro-9.4
 export PYTHONPATH=$IDADIR/idalib/python  # idapro is not in the uv lock; load it from the IDA install
-export IDAUSR=/scratch/zhoul0e/iops/idapro  # license, EULA, offline TlmHost (see SHAHEEN_IDA_UV_NOTES.md)
+# license, EULA, offline TlmHost (see SHAHEEN_IDA_UV_NOTES.md). Every IDA process locks IDAUSR/ida.reg; with
+# many nodes on one Lustre copy the locks fail (EAGAIN, "ida.reg: Resource temporarily unavailable"), so each
+# node works on its own copy.
+cp -r /scratch/zhoul0e/iops/idapro "$STAGE/idausr"
+export IDAUSR=$STAGE/idausr
 export TMPDIR=$STAGE/work
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 
