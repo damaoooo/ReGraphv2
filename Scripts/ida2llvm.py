@@ -1291,6 +1291,55 @@ def _entry_register_reads(mba):
     return exposed
 
 
+_insn_ea_collector_class = None
+
+
+def _microcode_eas(mba) -> set:
+    """mba 中所有 microcode 指令（含嵌套子指令）的地址。"""
+    global _insn_ea_collector_class
+    if _insn_ea_collector_class is None:
+        class Collector(ida_hexrays.minsn_visitor_t):
+            def __init__(self):
+                ida_hexrays.minsn_visitor_t.__init__(self)
+                self.eas = set()
+
+            def visit_minsn(self):
+                self.eas.add(int(self.curins.ea))
+                return 0
+
+        _insn_ea_collector_class = Collector
+    collector = _insn_ea_collector_class()
+    for index in range(mba.qty):
+        ins = mba.get_mblock(index).head
+        while ins is not None:
+            ins.for_all_insns(collector)
+            ins = ins.next
+    return collector.eas
+
+
+def _check_mips_jtbl_delay_slots(mba):
+    """
+    MIPS 的 switch 跳转 `jr $at` 的延迟槽指令在跳转前执行，例如 clang -O2 的 c_ispunct 在
+    `jr $at` 的延迟槽里 `li $v0, 1`，所有 case 共用这个返回值。Hex-Rays 生成 jtbl 时把它丢掉，
+    伪代码返回的是此前 $v0 里的跳转表地址常量。延迟槽不是 nop、而 microcode 中没有任何指令来自
+    该地址时，按丢失处理并拒绝（延迟槽结果确实无用而被删除的情形也会被拒绝，这是保守的）。
+    """
+    if source_family != "mips":
+        return
+    eas = None
+    for index in range(mba.qty):
+        tail = mba.get_mblock(index).tail
+        if tail is None or tail.opcode != ida_hexrays.m_jtbl:
+            continue
+        slot = tail.ea + 4
+        if idc.get_item_size(tail.ea) != 4 or idc.print_insn_mnem(slot).lower() in ("nop", ""):
+            continue
+        if eas is None:
+            eas = _microcode_eas(mba)
+        if slot not in eas:
+            raise UnsupportedMicrocode("mips_jtbl_delay_slot_dropped", f"{slot:#x} {idc.GetDisasm(slot)}")
+
+
 def _init_entry_register_reads(func, lvars, entry_reads, builder):
     """
     入口处未赋值就读取的寄存器 lvar：
@@ -1379,6 +1428,7 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
                 return res
         
         mba = pfunc.mba
+        _check_mips_jtbl_delay_slots(mba)
         if isinstance(typ.return_type, ir.VoidType):
             inferred_ret = _infer_return_type_from_mba(mba)
             if inferred_ret is not None:
