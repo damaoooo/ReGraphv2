@@ -2005,7 +2005,14 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
     elif tif.is_func() or tif.is_funcptr():
         function_signature_cache[func_ea] = tif
 
-    typ = lift_tif(tif) 
+    if tif.is_funcptr():
+        tif = tif.get_ptrarr_object()
+    if not tif.is_func():
+        # 没有函数类型的调用目标（如 thunk 跳到 ARM kuser helper 0xffff0fa0，该地址不在任何段中）：
+        # 按无类型信息的外部函数声明。不能用非函数类型构造 ir.Function——名字已注册而对象没有加入模块，
+        # 之后每个引用它的函数都会因 DuplicatedNameError 失败
+        tif = _default_function_tinfo()
+    typ = lift_tif(tif)
     state_key = _function_state_key(func_name, func_ea)
 
     existing = None
