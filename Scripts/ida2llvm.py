@@ -859,6 +859,11 @@ def _local_storage_type(typ: ir.Type) -> ir.Type:
     return typ
 
 
+def _lvar_key(idx: int, lvar) -> object:
+    """lvar 存储槽在 func.lvars 中的键：result 共用 funcresult，其余按 mba.vars 下标。"""
+    return "funcresult" if lvar.is_result_var else ("lvar", int(idx))
+
+
 def storecast(src, dst, builder):
     """
     将目标的类型转换为源的指针类型。
@@ -1254,24 +1259,24 @@ def _init_entry_register_reads(func, lvars, entry_reads, builder):
     - 某条路径上寄存器已被调用 / 其他写入破坏（"被污染"）：机器值是被调函数留下的内容（Hex-Rays 丢失的
       返回值、变参调用的垃圾实参等），无法可靠恢复，拒绝整个函数，不输出已知错误的值。
     """
-    def slot_of(lvar):
-        return func.lvars.get("funcresult" if lvar.is_result_var else lvar.name)
+    def slot_of(idx):
+        return func.lvars.get(_lvar_key(idx, lvars[idx]))
 
     # 没有存储槽的 lvar（如 void 返回函数的 result）不会出现在 IR 里，不必因它拒绝
-    dirty = sorted(lvars[idx].name for idx, is_dirty in entry_reads.items()
-                   if is_dirty and slot_of(lvars[idx]) is not None)
+    dirty = sorted(lvars[idx].name or f"lv{idx}" for idx, is_dirty in entry_reads.items()
+                   if is_dirty and slot_of(idx) is not None)
     if dirty:
         raise UnsupportedMicrocode("register_reuse_unrecoverable", ", ".join(dirty[:8]))
     args = {}
     for idx in range(lvars.size()):
         lvar = lvars[idx]
         if lvar.is_arg_var and lvar.location.is_reg1():
-            name = "funcresult" if lvar.is_result_var else lvar.name
-            if name in func.lvars:
-                args[int(lvar.location.reg1())] = (lvar.width, func.lvars[name])
+            key = _lvar_key(idx, lvar)
+            if key in func.lvars:
+                args[int(lvar.location.reg1())] = (lvar.width, func.lvars[key])
     for idx in sorted(entry_reads):
         lvar = lvars[idx]
-        slot = slot_of(lvar)
+        slot = slot_of(idx)
         if slot is None:
             continue
         source = args.get(int(lvar.location.reg1()))
@@ -1371,15 +1376,17 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
                 res.lvars["funcresult"] = builder.alloca(typ.return_type, name = "funcresult")
                 builder.store(_zero_initializer_for_type(typ.return_type), res.lvars["funcresult"])
 
-            for lvar in list(pfunc.lvars): 
+            for idx, lvar in enumerate(list(pfunc.lvars)):
                 if lvar.is_result_var:
                     if lvar.is_arg_var and "funcresult" in res.lvars:
                         names.append("funcresult")
                     continue
+                # 按 lvar 下标区分存储槽：Hex-Rays 不在伪代码中出现的 lvar 名字为空，按名字会让它们共用一个槽
+                key = _lvar_key(idx, lvar)
                 arg_t = _local_storage_type(lift_tif(lvar.tif))
-                res.lvars[lvar.name] = builder.alloca(arg_t, name = lvar.name)
+                res.lvars[key] = builder.alloca(arg_t, name = lvar.name or f"lv{idx}")
                 if lvar.is_arg_var:
-                    names.append(lvar.name)
+                    names.append(key)
 
             # if function is variadic, declare va_start intrinsic
             if tif.is_vararg_cc() and typ.var_arg:  
@@ -2063,8 +2070,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
     if t == ida_hexrays.mop_l: # 局部变量
         lvar_ref = mop.l
         lvar = lvar_ref.var()
-        name = "funcresult" if lvar.is_result_var else lvar.name
-        llvm_arg = blk.parent.lvars[name]
+        llvm_arg = blk.parent.lvars[_lvar_key(lvar_ref.idx, lvar)]
         llvm_arg = get_offset_to(builder, llvm_arg, lvar_ref.off)
         llvm_arg = _cast_slot(llvm_arg, mop.size, knowntyp, builder)
         return llvm_arg if dest else builder.load(llvm_arg)
