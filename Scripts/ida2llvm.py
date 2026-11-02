@@ -901,9 +901,16 @@ def _register_view_offset(lvar, slot: ir.Value, off: int, size: int) -> int:
     if off < 0 or off + size > slot_size:
         raise UnsupportedMicrocode("lvar_access_out_of_bounds",
                                    f"{lvar.name} off {off} size {size} slot {slot_size}")
-    if (is_big_endian and size < slot_size and not lvar.location.is_stkoff()
-            and isinstance(pointee, (ir.IntType, ir.PointerType, ir.FloatType, ir.DoubleType))):
-        return slot_size - off - size
+    if is_big_endian and size < slot_size and not lvar.location.is_stkoff():
+        floating = True
+        with suppress(Exception):
+            floating = lvar.tif.is_floating()
+        if floating:
+            # 浮点寄存器（对）的部分访问（ppc32 IBM long double 的 f1:f2 两半等）：两半在数值中的
+            # 顺序没有核实，不猜测
+            raise UnsupportedMicrocode("big_endian_fp_register_subview", f"{lvar.name} off {off} size {size}")
+        if isinstance(pointee, (ir.IntType, ir.PointerType)):
+            return slot_size - off - size
     return off
 
 
