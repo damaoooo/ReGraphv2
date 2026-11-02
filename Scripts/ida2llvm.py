@@ -12,6 +12,7 @@ import ida_segment
 import ida_nalt
 import ida_hexrays
 import ida_auto
+import ida_ua
 import idaapi
 import logging
 import array
@@ -264,6 +265,7 @@ def _reset_lift_state():
     function_records.clear()
     unresolved_data_items.clear()
     a64_rewritten_divisions.clear()
+    native_divisions_pending.clear()
     _set_sizing_layout(None)
     target_data = None
     llvm_context = ir.Context()
@@ -2736,6 +2738,9 @@ def _shift_count_rule(width: int):
 # 改写后的除数在任何输入下都不为 0（有符号时也不是 INT_MIN / -1），Hex-Rays 只能推出恒真的事实：
 #   q = (x / (y + (y == 0) [+ 2 * (x == INT_MIN && y == -1)])) & ((y == 0) - 1)
 a64_rewritten_divisions = set()  # 被改写的原生除法指令地址；只有这些除法不需要"控制流未验证"标记
+# 当前函数中（AArch64 以外）原生除法指令地址 -> 除数操作数位宽；只允许以非异常常量为除数、
+# 且与原指令同宽的 microcode 除法，提升后仍未被这样的除法覆盖的地址使整个函数被拒绝
+native_divisions_pending = {}
 
 
 def _mc_number(value, size):
@@ -3324,6 +3329,27 @@ def _constant_int_bits(value, depth=4):
     return bits & mask
 
 
+_NATIVE_DIVISION_MNEMONICS = ("udiv", "sdiv", "div", "idiv", "divu", "ddiv", "ddivu")
+
+
+def _has_native_division(func_ea) -> bool:
+    if source_family == "arm" and ptrsize == 64:
+        return False
+    return any(idc.print_insn_mnem(item).lower() in _NATIVE_DIVISION_MNEMONICS for item in idautils.FuncItems(func_ea))
+
+
+def _native_division_width(ea, mnemonic):
+    """原生除法指令的除数位宽；无法确定时返回 -1（microcode 宽度永远不会与之相等，即拒绝）。"""
+    if source_family == "mips":
+        return 64 if mnemonic.startswith("dd") else 32
+    if source_family == "x86":
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, ea) and insn.ops[0].type != ida_ua.o_void:
+            # div/idiv r/m：唯一显式操作数是除数，被除数是两倍宽的 (e/r)dx:(e/r)ax
+            return ida_ua.get_dtype_size(insn.ops[0].dtype) * 8
+    return -1
+
+
 def _lift_division(op, lhs, rhs, builder, ea):
     # Hex-Rays reconstructs / and % from multiply/shift sequences. For these
     # non-exceptional constants, LLVM arithmetic is defined on every input and
@@ -3331,6 +3357,15 @@ def _lift_division(op, lhs, rhs, builder, ea):
     bits = _constant_int_bits(rhs)
     if (op in ("udiv", "sdiv", "urem", "srem") and bits is not None and bits != 0
             and not (op.startswith("s") and bits == (1 << rhs.type.width) - 1)):
+        width = native_divisions_pending.get(ea)
+        if width is not None:
+            # 原生除法指令（x86 div/idiv、MIPS div/ddiv 等）：除数为非零、（有符号时）非 -1 的常量，
+            # 商不会溢出且没有除零，任何目标上结果都与 LLVM 运算相同；但 microcode 的宽度必须与原指令
+            # 的除数宽度一致（x86 的 edx:eax / r32 若被表示成 64 位除法，商溢出时机器会异常）
+            if lhs.type.width != width:
+                raise UnsupportedMicrocode("division_machine_semantics_unresolved",
+                                           f"constant divisor at {ea:#x}: width {lhs.type.width} vs native {width}")
+            native_divisions_pending[ea] = 0
         return getattr(builder, op)(lhs, ir.Constant(rhs.type, bits))
     # LVARS may already have discarded guards using C undefined-behaviour
     # assumptions, unless the early A64 hook rewrote this native division.
@@ -3935,7 +3970,16 @@ class BIN2LLVMController():
         翻译为LLVM IR表示。
         """
         function_eas = self._function_eas or list(idautils.Functions())
+        # 含原生除法指令的函数（AArch64 以外）放到最后：反编译一个函数会改变 IDA 中保存的原型，
+        # 影响之后反编译的调用者。这些函数以前在反编译前就被拒绝，放到最后使其他函数的反编译
+        # 状态与此前一致，它们本身是否可提升由 _lift_division 按除数决定
+        deferred = []
         for f_ea in function_eas:
+            if _has_native_division(f_ea):
+                deferred.append(f_ea)
+                continue
+            self.insertFunctionAtEa(f_ea)
+        for f_ea in deferred:
             self.insertFunctionAtEa(f_ea)
 
     def _decompile_function(self, ea):
@@ -3980,11 +4024,14 @@ class BIN2LLVMController():
             # Scan original instructions, including ones that disappear before
             # LVARS. Linear in function size; retain no per-instruction cache.
             native_divisions = []
+            native_divisions_pending.clear()
             for item in idautils.FuncItems(ea):
-                if idc.print_insn_mnem(item).lower() in ("udiv", "sdiv", "div", "idiv", "divu", "ddiv", "ddivu"):
+                mnemonic = idc.print_insn_mnem(item).lower()
+                if mnemonic in _NATIVE_DIVISION_MNEMONICS:
                     if source_family != "arm" or ptrsize != 64:
-                        raise UnsupportedMicrocode("division_machine_semantics_unresolved",
-                                                   f"native division at {item:#x}")
+                        # 先记录，按 microcode 中的除数决定（见 _lift_division）
+                        native_divisions_pending[item] = _native_division_width(item, mnemonic)
+                        continue
                     native_divisions.append(item)
             pfunc = ptext.get(ea)
             if pfunc is None or getattr(pfunc, "type", None) is None:
@@ -4004,6 +4051,12 @@ class BIN2LLVMController():
             function_signature_cache[ea] = typ
             func_name = self._get_name(ea)
             lifted = lift_function(self.m, func_name, False, ea, typ)
+            unresolved = sorted(item for item, width in native_divisions_pending.items() if width != 0)
+            if unresolved:
+                # 没有被同宽、非异常常量除数的 microcode 除法覆盖的原生除法：除零 / 溢出的机器语义
+                # （x86 异常、MIPS/PPC 结果未定义）无法确定，Hex-Rays 也可能已按 C 的 UB 假设删掉判断
+                raise UnsupportedMicrocode("division_machine_semantics_unresolved",
+                                           f"native division at {unresolved[0]:#x}")
             defined = isinstance(lifted, ir.Function) and not lifted.is_declaration
             self._stream_function_if_enabled(lifted)
             if defined:
