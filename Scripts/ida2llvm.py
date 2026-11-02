@@ -886,7 +886,12 @@ def _lvar_key(idx: int, lvar) -> object:
 
 
 def _register_view_offset(lvar, slot: ir.Value, off: int, size: int) -> int:
-    """越过存储槽的 lvar 访问拒绝，不生成越界的 load/store。"""
+    """
+    寄存器 lvar 的偏移按数值计（off 0 是最低有效字节，与 mreg 编号一致：mips32 的 64 位 lvar
+    $v1.8 中 off 0 是低位字 $v1）。存储槽在内存中按目标字节序排列，大端目标上数值的低位字节在槽的末尾，
+    所以把数值偏移换成内存偏移；栈上 lvar 的偏移本来就是内存偏移，不变。
+    越过存储槽的访问拒绝，不生成越界的 load/store。
+    """
     if size <= 0 or not isinstance(slot.type, ir.PointerType):
         return off
     pointee = slot.type.pointee
@@ -894,6 +899,9 @@ def _register_view_offset(lvar, slot: ir.Value, off: int, size: int) -> int:
     if off < 0 or off + size > slot_size:
         raise UnsupportedMicrocode("lvar_access_out_of_bounds",
                                    f"{lvar.name} off {off} size {size} slot {slot_size}")
+    if (is_big_endian and size < slot_size and not lvar.location.is_stkoff()
+            and isinstance(pointee, (ir.IntType, ir.PointerType, ir.FloatType, ir.DoubleType))):
+        return slot_size - off - size
     return off
 
 
