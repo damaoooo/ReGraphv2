@@ -33,6 +33,7 @@ case "$STAGE_NAME" in
     i64)  ANALYZE=$REPO/Scripts/shaheen/make_i64.py; export I64_IN_ROOT=$IN_ROOT I64_OUT_ROOT=$OUT_ROOT ;;
     lift) ANALYZE=$REPO/Scripts/shaheen/lift_one.py; export LIFT_IN_ROOT=$IN_ROOT LIFT_OUT_ROOT=$OUT_ROOT LIFT_TARGET=${LIFT_TARGET:-} ;;
     bbcount) ANALYZE=$REPO/Scripts/shaheen/bb_count.py; export BB_IN_ROOT=$IN_ROOT BB_OUT_ROOT=$OUT_ROOT BB_LIFT_ROOT=${BB_LIFT_ROOT:?set BB_LIFT_ROOT to the .ll tree} ;;
+    funcflags) ANALYZE=$REPO/Scripts/shaheen/func_flags.py; export FF_IN_ROOT=$IN_ROOT FF_OUT_ROOT=$OUT_ROOT ;;
     *) echo "$USAGE" >&2; exit 2 ;;
 esac
 

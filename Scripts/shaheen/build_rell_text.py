@@ -22,6 +22,49 @@ import pyarrow.parquet as pq
 COLUMNS = ["binary_name", "file_path", "text", "token_len", "original_idx", "function_name", "opt_level", "origin_binary_name"]
 
 
+LONG_TEXT = 1_000_000
+CHUNK = 200_000
+
+
+def chunks(text, size=CHUNK):
+    """Split at a newline that is followed by a non-whitespace character. Qwen's pre-tokenizer ends a piece at
+    such a newline run and BPE never merges across pieces, so the token counts of the chunks add up exactly."""
+    start = 0
+    while len(text) - start > size:
+        cut = start + size
+        while cut < len(text) and not (text[cut - 1] == "\n" and not text[cut].isspace()):
+            cut += 1
+        yield text[start:cut]
+        start = cut
+    yield text[start:]
+
+
+def qwen_len(tok, text):
+    return sum(len(e) for e in tok.backend_tokenizer.encode_batch(list(chunks(text)), add_special_tokens=False))
+
+
+_TOK = None
+
+
+def _init_tok(path):
+    global _TOK
+    from transformers import AutoTokenizer
+
+    _TOK = AutoTokenizer.from_pretrained(path)
+
+
+def _lens(texts):
+    """Qwen token counts, from the Rust encodings; texts over LONG_TEXT characters are counted in chunks."""
+    out = [0] * len(texts)
+    short = [i for i, x in enumerate(texts) if len(x) <= LONG_TEXT]
+    for i, e in zip(short, _TOK.backend_tokenizer.encode_batch([texts[i] for i in short], add_special_tokens=False)):
+        out[i] = len(e)
+    for i, x in enumerate(texts):
+        if len(x) > LONG_TEXT:
+            out[i] = qwen_len(_TOK, x)
+    return out
+
+
 def module_of(file_path):
     """.../functions/<split>/<proj>/<binary>_functions/<sha1>.ll -> <split>/<proj>/<binary>"""
     return file_path.split("/functions/", 1)[1].rsplit("_functions/", 1)[0]
@@ -44,7 +87,8 @@ def main():
     pool = datasets.load_from_disk(os.path.join(src, "train_dataset_pool"))
     pool = pool.remove_columns([c for c in ("input_ids", "cfg_graph", "ddg_graph") if c in pool.column_names])
     needed = {}  # module -> function names in the pool; the corpus text holds every function of a module
-    for path, name in zip(pool["file_path"], pool["function_name"]):
+    # whole Arrow columns: iterating pool["..."] formats row by row from the memory-mapped files (20+ min for 1.4M rows)
+    for path, name in zip(pool.data.column("file_path").to_pylist(), pool.data.column("function_name").to_pylist()):
         needed.setdefault(module_of(path), set()).add(name)
     modules = sorted(needed)
     print(f"{args.split}: {len(pool):,} rows from {len(modules)} binaries", flush=True)
@@ -70,13 +114,17 @@ def main():
     pool = pool.map(add_text, batched=True, batch_size=2000)  # single process: the lookup table is in memory
     del text
 
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(args.qwen_tokenizer)
+    # token_len in a separate spawn pool: forked datasets workers inherited the parent's memory (all O0 texts were
+    # loaded into it above) and copy-on-write ran the node out of memory
+    import multiprocessing
 
-    def add_len(batch):
-        return {"token_len": [len(x) for x in tok(batch["text"], add_special_tokens=False)["input_ids"]]}
-
-    pool = pool.map(add_len, batched=True, batch_size=1000, num_proc=args.workers)
+    col = pool.data.column("text")
+    step = 2000
+    lengths = []
+    with multiprocessing.get_context("spawn").Pool(args.workers, initializer=_init_tok, initargs=(args.qwen_tokenizer,)) as procs:
+        for part in procs.imap(_lens, (col.slice(i, step).to_pylist() for i in range(0, len(pool), step))):
+            lengths += part
+    pool = pool.add_column("token_len", lengths)
     pool = pool.select_columns(COLUMNS)
 
     local = os.path.join(args.local, f"rell_{args.split}_final_set")
@@ -91,7 +139,7 @@ def main():
     shutil.rmtree(target, ignore_errors=True)
     os.replace(target + ".part", target)
     shutil.rmtree(local, ignore_errors=True)
-    L = sorted(pool["token_len"])
+    L = sorted(lengths)
     print(f"{args.split}: published {target}; token_len mean {sum(L) / len(L):.0f} median {L[len(L) // 2]} "
           f"p95 {L[int(len(L) * .95)]} >2048 {sum(x > 2048 for x in L) / len(L):.1%}", flush=True)
 
