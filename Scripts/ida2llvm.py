@@ -1249,8 +1249,12 @@ def _entry_register_reads(mba):
                 location = lvars[idx].location
                 written = own(idx, off, size) if idx in base else 0
                 hit = clobbered(int(location.reg1()) + off, int(location.reg1()) + off + size) if location.is_reg1() else 0
-                # 写入的字节被定义；同一物理位置上其他 lvar 的字节、以及本 lvar 未写到的字节不再是入口值
-                kills.append((written, (hit | (whole[idx] if idx in base else 0)) & ~written))
+                # 写入的字节被定义；同一物理位置上其他 lvar 的字节、以及本 lvar 未写到的字节不再是入口值。
+                # 例外：x86 写 8/16 位子寄存器（setz al、mov ax 等）不改变寄存器的其余字节，
+                # 本 lvar 未写到的字节保持原状态（32 位写会把 x86-64 寄存器高 32 位清零，不在此列）
+                keeps_rest = source_family == "x86" and location.is_reg1() and 0 < size < 4
+                rest = 0 if keeps_rest or idx not in base else whole[idx]
+                kills.append((written, (hit | rest) & ~written))
             for start, end in reg_defs:
                 kills.append((0, clobbered(start, end)))
             seq.append((uses, spoiled_mask(call) if call else 0, kills))
