@@ -3057,6 +3057,8 @@ class _DatabaseGuard(ida_idp.IDB_Hooks):
     def func_added(self, pfn):
         if self._watching():
             self.added_funcs.append(pfn.start_ea)
+            if self.recording_pristine and pfn.start_ea not in self.pristine_names:
+                self.pristine_names[pfn.start_ea] = ida_name.get_name(pfn.start_ea)
         return 0
 
     def frame_udm_changed(self, func_ea, udm_tid, udmold, udmnew):
@@ -3134,6 +3136,8 @@ class _DatabaseGuard(ida_idp.IDB_Hooks):
     def renamed(self, ea, new_name, local_name, old_name):
         if self._watching() and ea not in self.names:
             self.names[ea] = old_name or ""
+            if self.recording_pristine and old_name and ea not in self.pristine_names:
+                self.pristine_names[ea] = old_name
         return 0
 
     def _remember_item(self, ea):
@@ -3178,6 +3182,10 @@ class _DatabaseGuard(ida_idp.IDB_Hooks):
                     pfn.flags = flags
                     ida_funcs.update_func(pfn)
             self.new_local_types += max(ida_typeinf.get_ordinal_limit() - self.ordinal_limit, 0)
+            # 窗口中查询过的名字 / 函数对象可能反映了刚被恢复的改写（被删掉的函数对象不能再用）
+            for ea in set(self.types) | set(self.names) | set(self.items) | set(self.added_funcs) | self.touched_funcs:
+                name_cache.pop(ea, None)
+                func_cache.pop(ea, None)
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
         finally:
