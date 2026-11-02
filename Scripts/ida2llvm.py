@@ -653,6 +653,11 @@ def _lift_tif_uncached(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
         return _lift_udt(tif)
 
     elif tif.is_bool():
+        # Hex-Rays 的 _BOOL2/_BOOL4/_BOOL8 占 2/4/8 字节（整个寄存器 / 内存单元都会被写入），
+        # 映射成 i1 会让 8 字节写入越过 1 字节的存储槽（LLVM 中是未定义行为）
+        size = tif.get_size()
+        if 1 < size <= 16 and size != ida_typeinf.BADSIZE:
+            return ir.IntType(size * 8)
         return ir.IntType(1)
 
     elif tif.is_char():
@@ -853,15 +858,43 @@ def _zero_initializer_for_type(typ: ir.Type):
     return ir.Constant(typ, None)
 
 
-def _local_storage_type(typ: ir.Type) -> ir.Type:
+def _local_storage_type(typ: ir.Type, width: int = 0) -> ir.Type:
+    """
+    lvar 的存储槽类型。width 是 Hex-Rays 给出的 lvar 字节宽度：整数槽至少这么宽，
+    否则按 lvar 宽度写入（如 8 字节的 result 写到 1 字节 bool 槽）会越界。
+    """
     if isinstance(typ, ir.IntType) and typ.width == 1:
-        return ir.IntType(32)
+        typ = ir.IntType(32)
+    if isinstance(typ, ir.IntType) and width * 8 > typ.width:
+        typ = ir.IntType(width * 8)
     return typ
+
+
+def _result_storage_type(ret_type: ir.Type, width: int) -> ir.Type:
+    """
+    funcresult 的存储槽类型：返回类型为整数时至少容纳 result lvar 的宽度（mips64 上 bool 函数的
+    result lvar 是 8 字节的 $v0），i1 按字节存储；返回时整体加载再截断成返回类型。
+    """
+    if isinstance(ret_type, ir.IntType):
+        return ir.IntType(max((ret_type.width + 7) // 8 * 8, width * 8))
+    return ret_type
 
 
 def _lvar_key(idx: int, lvar) -> object:
     """lvar 存储槽在 func.lvars 中的键：result 共用 funcresult，其余按 mba.vars 下标。"""
     return "funcresult" if lvar.is_result_var else ("lvar", int(idx))
+
+
+def _register_view_offset(lvar, slot: ir.Value, off: int, size: int) -> int:
+    """越过存储槽的 lvar 访问拒绝，不生成越界的 load/store。"""
+    if size <= 0 or not isinstance(slot.type, ir.PointerType):
+        return off
+    pointee = slot.type.pointee
+    slot_size = _type_size(pointee)
+    if off < 0 or off + size > slot_size:
+        raise UnsupportedMicrocode("lvar_access_out_of_bounds",
+                                   f"{lvar.name} off {off} size {size} slot {slot_size}")
+    return off
 
 
 def storecast(src, dst, builder):
@@ -1373,8 +1406,10 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
         with builder.goto_entry_block():
             # declare function results as stack variable
             if not isinstance(typ.return_type, ir.VoidType):
-                res.lvars["funcresult"] = builder.alloca(typ.return_type, name = "funcresult")
-                builder.store(_zero_initializer_for_type(typ.return_type), res.lvars["funcresult"])
+                result_width = max((lv.width for lv in pfunc.lvars if lv.is_result_var), default=0)
+                result_t = _result_storage_type(typ.return_type, result_width)
+                res.lvars["funcresult"] = builder.alloca(result_t, name = "funcresult")
+                builder.store(_zero_initializer_for_type(result_t), res.lvars["funcresult"])
 
             for idx, lvar in enumerate(list(pfunc.lvars)):
                 if lvar.is_result_var:
@@ -1383,7 +1418,7 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
                     continue
                 # 按 lvar 下标区分存储槽：Hex-Rays 不在伪代码中出现的 lvar 名字为空，按名字会让它们共用一个槽
                 key = _lvar_key(idx, lvar)
-                arg_t = _local_storage_type(lift_tif(lvar.tif))
+                arg_t = _local_storage_type(lift_tif(lvar.tif), lvar.width)
                 res.lvars[key] = builder.alloca(arg_t, name = lvar.name or f"lv{idx}")
                 if lvar.is_arg_var:
                     names.append(key)
@@ -1429,7 +1464,8 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
                 if isinstance(typ.return_type, ir.VoidType):
                     builder.ret_void()
                 else:
-                    builder.ret(builder.load(res.lvars["funcresult"]))
+                    # 存储槽可能比返回类型宽：整体加载后按数值截断（大端上同样取低位）
+                    builder.ret(typecast(builder.load(res.lvars["funcresult"]), typ.return_type, builder))
         _finalize_nodefault_switches(res, builder)
         _require_terminated_blocks(res)
         stack_slot = res.lvars.get("stack")
@@ -2071,7 +2107,8 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
         lvar_ref = mop.l
         lvar = lvar_ref.var()
         llvm_arg = blk.parent.lvars[_lvar_key(lvar_ref.idx, lvar)]
-        llvm_arg = get_offset_to(builder, llvm_arg, lvar_ref.off)
+        off = _register_view_offset(lvar, llvm_arg, int(lvar_ref.off), mop.size)
+        llvm_arg = get_offset_to(builder, llvm_arg, off)
         llvm_arg = _cast_slot(llvm_arg, mop.size, knowntyp, builder)
         return llvm_arg if dest else builder.load(llvm_arg)
     elif t == ida_hexrays.mop_n: # 立即数
