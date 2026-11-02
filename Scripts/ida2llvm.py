@@ -3983,12 +3983,23 @@ class BIN2LLVMController():
             self.insertFunctionAtEa(f_ea)
 
     def _decompile_function(self, ea):
+        # 反编译会把推导出的原型存进数据库，之后反编译的调用者按它传参。PLT 等 thunk 的函数体只是一次
+        # 跳转，IDA 类型库里没有的导入（reallocarray、arm32 的 __fstat64_time64 等）会被存成 `int()`，
+        # 此后调用它的函数不再传实参，实参计算成为死代码：ireallocarray 被提升成 `return reallocarray()`。
+        # thunk 原本没有类型时，反编译后删除这个推导出的原型
+        func = self._get_func(ea)
+        untyped_thunk = (func is not None and func.flags & ida_funcs.FUNC_THUNK
+                         and not ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), ea))
         no_cache = ea in refreshed_funcs
-        if no_cache:
-            ida_hf = ida_hexrays.hexrays_failure_t()
-            pfunc = ida_hexrays.decompile(ea, ida_hf, ida_hexrays.DECOMP_NO_CACHE)
-        else:
-            pfunc = ida_hexrays.decompile(ea)
+        try:
+            if no_cache:
+                ida_hf = ida_hexrays.hexrays_failure_t()
+                pfunc = ida_hexrays.decompile(ea, ida_hf, ida_hexrays.DECOMP_NO_CACHE)
+            else:
+                pfunc = ida_hexrays.decompile(ea)
+        finally:
+            if untyped_thunk and ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), ea):
+                ida_nalt.del_tinfo(ea)
         if pfunc is not None and getattr(pfunc, "type", None) is not None:
             ptext[ea] = pfunc
             function_signature_cache[ea] = pfunc.type
