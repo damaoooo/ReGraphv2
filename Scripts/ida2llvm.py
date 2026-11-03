@@ -3096,6 +3096,15 @@ class _DatabaseGuard(ida_idp.IDB_Hooks):
         for off, sz, name, tif, special in self._frame_members(pfn) or ():
             if not special:
                 ida_frame.delete_frame_members(pfn, off, off + max(sz, 1))
+        # 特殊成员不能直接添加：ARM 变参函数反编译后 Hex-Rays 会删掉 __saved_registers（frsize / frregs /
+        # argsize 不变）。把 frregs 置 0 再设回，IDA 按原大小重建保存寄存器区。只在特殊成员对不上时执行，
+        # 此时普通成员已删除，不会被移动
+        special_key = lambda members: [m for m in self._members_key(members) or () if m[4]]
+        if special_key(self._frame_members(pfn)) != special_key(old) and size[1]:
+            ida_frame.set_frame_size(pfn, size[0], 0, size[2])
+            pfn = ida_funcs.get_func(func_ea)
+            ida_frame.set_frame_size(pfn, *size)
+            pfn = ida_funcs.get_func(func_ea)
         for off, sz, name, tif, special in old:
             if not special:
                 ida_frame.add_frame_member(pfn, name, off, tif)
