@@ -58,6 +58,7 @@ test.py
 *.i64
 *.eps
 runs/
+wandb/
 /data/
 .venv/
 tmp/
