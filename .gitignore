@@ -64,3 +64,6 @@ tmp/
 
 # Local deduplication records, not source artifacts.
 .dedup*
+
+# Weights & Biases run directories
+wandb/
