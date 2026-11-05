@@ -3845,7 +3845,7 @@ def _native_division_ea(ea):
     Walk back over straight-line code (no jump target, no other HI/LO writer) to the division that
     set HI/LO; anything else keeps `ea`, which leaves the native division unresolved (rejected).
     """
-    if ea in native_divisions_pending or source_family != "mips":
+    if not native_divisions_pending or ea in native_divisions_pending or source_family != "mips":
         return ea
     if idc.print_insn_mnem(ea).lower() not in ("mflo", "mfhi"):
         return ea

@@ -33,7 +33,12 @@ def test_arm_linked_abi(L, flags, abi):
 
 
 @pytest.mark.parametrize("flags,kind", [(0x05000600, 3), (0x04000400, 3), (0x05000000, 1), (0x05000000, 2), (0x05000000, 3)])
-def test_arm_ambiguous_abi_rejected(L, flags, kind):
+def test_arm_ambiguous_abi_rejected(L, flags, kind, monkeypatch):
+    # With neither float bit set the lifter consults .ARM.attributes of the verified source file;
+    # without that evidence (source unavailable here) the ABI must still be rejected, not guessed.
+    def unavailable():
+        raise L.UnsupportedTarget("source ELF unavailable; cannot determine ABI")
+    monkeypatch.setattr(L, "_verified_source_path", unavailable)
     with pytest.raises(L.UnsupportedTarget):
         L._apply_source_abi(L.source_target_spec("ARM", 32, False), L._parse_elf_header(header(flags=flags, kind=kind)))
 

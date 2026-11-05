@@ -16,7 +16,7 @@ from llvmlite import binding, ir
 SCRIPT = Path(__file__).resolve().parents[1] / "Scripts" / "ida2llvm.py"
 IDA_MODULES = (
     "idapro idc ida_idaapi ida_kernwin idautils ida_name ida_bytes ida_ida ida_funcs "
-    "ida_typeinf ida_segment ida_nalt ida_hexrays ida_auto idaapi"
+    "ida_typeinf ida_segment ida_nalt ida_hexrays ida_auto ida_ua ida_idp ida_frame idaapi"
 ).split()
 
 
@@ -28,6 +28,11 @@ class _StubIdaModule(types.ModuleType):
     def __getattr__(self, name):
         if name.startswith("__"):
             raise AttributeError(name)
+        if name.endswith("_Hooks"):  # IDA hook base classes are subclassed at import time
+            hooks = type(name, (), {"__init__": lambda self, *a, **k: None,
+                                    "hook": lambda self: True, "unhook": lambda self: True})
+            setattr(self, name, hooks)
+            return hooks
         _StubIdaModule._counter[0] += 1
         setattr(self, name, _StubIdaModule._counter[0])
         return getattr(self, name)
