@@ -4,7 +4,7 @@ Writes <out>/shards/shard_<k>.txt with .ll paths relative to <ll_root>. Each opt
 shard job runs task2 and task3 on exactly one list, so a node never waits on another.
 Existing lists are kept unless --force, so a resubmitted run sees the same partition.
 
-    python Scripts/shaheen/plan_shards.py /scratch/zhoul0e/Dataset-1-ll /scratch/zhoul0e/Dataset-1-O2-fused 6
+    python Scripts/shaheen/plan_shards.py $DATA/Dataset-1-ll $DATA/Dataset-1-O2-fused 6
 """
 import heapq
 import os

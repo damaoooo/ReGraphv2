@@ -3,7 +3,7 @@
 Reads <out>/parquet/<split>/**.parquet (file_path, untruncated input_ids), runs IR dedup, Step 5 and
 Step 6, and writes the kept file paths to <out>/selection/<split>.txt, which build_split.py --keep reads.
 
-    python Scripts/shaheen/select_level.py --out /scratch/zhoul0e/Dataset-1-Oc-sel --naming dataset1-xm
+    python Scripts/shaheen/select_level.py --out $DATA/Dataset-1-Oc-sel --naming dataset1-xm
 """
 import argparse
 import glob

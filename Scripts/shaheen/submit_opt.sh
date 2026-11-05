@@ -1,6 +1,7 @@
 #!/bin/bash
 # Submit steps 3-6 for one or more opt levels: N shard nodes, then 3 final nodes (one per split).
-#   Scripts/shaheen/submit_opt.sh /scratch/zhoul0e/Dataset-1-ll /scratch/zhoul0e/Dataset-1-{OPT}-fused 8 O0 O1 O2 O3 Os Og Oz Oc
+#   Scripts/shaheen/submit_opt.sh $DATA/Dataset-1-ll $DATA/Dataset-1-{OPT}-fused 8 O0 O1 O2 O3 Os Og Oz Oc
+# Needs the site settings of Scripts/shaheen/cluster_env.sh in the environment (sbatch passes it on).
 # {OPT} in the out pattern is replaced by each opt level. Extra sbatch args go in SBATCH_ARGS
 # (e.g. SBATCH_ARGS="-t 01:00:00"). Rerunning resumes; it keeps each level's shard plan.
 set -euo pipefail
@@ -8,7 +9,7 @@ LL_ROOT=${1:?usage: submit_opt.sh ll_root out_pattern nshards OPT...}
 OUT_PATTERN=${2:?}
 NSHARDS=${3:?}
 shift 3
-REPO=/scratch/zhoul0e/ReGraphv2
+REPO=${REGRAPH_REPO:?set REGRAPH_REPO (Scripts/shaheen/cluster_env.sh)}
 SB="$REPO/Scripts/shaheen/opt_stage.sbatch"
 
 for OPT in "$@"; do

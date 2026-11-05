@@ -8,14 +8,13 @@
 #                         (only the selected rows when <out>/selection exists)
 # Every phase resumes: shards skip finished modules (task2 outputs, fused manifest); final redoes a split.
 #SBATCH --job-name=regraph-opt
-#SBATCH --partition=workq
 #SBATCH --exclusive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=384
 #SBATCH --mem=0
 #SBATCH --time=24:00:00
-#SBATCH --output=/scratch/zhoul0e/iops/projects/ida-batch/logs/%x-%A_%a.out
+#SBATCH --output=logs/%x-%A_%a.out
 
 set -euo pipefail
 USAGE="usage: opt_stage.sbatch {shard|select|final|recompile|corpus|retok} OPT_LEVEL ll_root out_root"
@@ -27,22 +26,23 @@ TASK=${SLURM_ARRAY_TASK_ID:-0}
 WORKERS=${WORKERS:-384}
 CMD_TIMEOUT=${CMD_TIMEOUT:-28800}
 BC_ROOT=${BC_ROOT:-$OUT/bc}  # retok reads the .bc of an earlier run of the same level
-CORPUS_ROOT=${CORPUS_ROOT:-/scratch/zhoul0e/bpe-corpus}  # corpus phase: lists/<OPT>/part_<K>.txt in, <OPT>/ out
+CORPUS_ROOT=${CORPUS_ROOT:-}  # corpus phase (required there): lists/<OPT>/part_<K>.txt in, <OPT>/ out
 SELECT_ROOT=${SELECT_ROOT:-}  # select_functions.py output: shard/retok extract only the selected functions
 NAMING=${NAMING:-dataset1}  # split_train_validation naming of select and final (dataset1-xm: XM positives)
 MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-2048}  # final: wash truncation length
 FINAL_SUFFIX=${FINAL_SUFFIX:-}  # final: publish <out>/<split>_final_set<suffix>, e.g. _4096
 
-REPO=/scratch/zhoul0e/ReGraphv2
-SIF=/scratch/zhoul0e/regraph-data-env-llvm18.1.3.sif
+source "${REGRAPH_REPO:?set REGRAPH_REPO}/Scripts/shaheen/cluster_env.sh"  # site settings
+REPO=$REGRAPH_REPO
+SIF=$REGRAPH_SIF
 LOCAL=/tmp/regraph-opt.${SLURM_JOB_ID}.${TASK}
 mkdir -p "$OUT" "$LOCAL"
 trap 'rm -rf "$LOCAL"' EXIT
 
-module load singularity >/dev/null 2>&1
 echo "node=$(hostname) phase=$PHASE task=$TASK opt=$OPT ll_root=$LL_ROOT out=$OUT workers=$WORKERS"
 
-singularity exec --bind /scratch/zhoul0e:/scratch/zhoul0e --bind /tmp:/tmp "$SIF" \
+# shellcheck disable=SC2086
+singularity exec $SINGULARITY_BINDS "$SIF" \
     env PHASE="$PHASE" OPT="$OPT" LL_ROOT="$LL_ROOT" OUT="$OUT" TASK="$TASK" WORKERS="$WORKERS" BC_ROOT="$BC_ROOT" CORPUS_ROOT="$CORPUS_ROOT" \
         SELECT_ROOT="$SELECT_ROOT" NAMING="$NAMING" MAX_SEQ_LENGTH="$MAX_SEQ_LENGTH" FINAL_SUFFIX="$FINAL_SUFFIX" \
         CMD_TIMEOUT="$CMD_TIMEOUT" REPO="$REPO" LOCAL="$LOCAL" TMPDIR="$LOCAL" \
@@ -84,6 +84,7 @@ select)
 corpus)
     K=$(printf "%03d" "$TASK")
     stage "bpe corpus part $K start"
+    : "${CORPUS_ROOT:?set CORPUS_ROOT for the corpus phase}"
     $PY Scripts/shaheen/corpus_text.py --bc-root "$OUT/bc" --list "$CORPUS_ROOT/lists/$OPT/part_$K.txt" \
         --out "$CORPUS_ROOT/$OPT" --workers "$WORKERS" --tag "$K"
     ;;

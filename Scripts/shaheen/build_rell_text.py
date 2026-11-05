@@ -7,9 +7,9 @@ dropped. Row order is kept, so train_task_dataset and train_positive_map.pkl are
 Columns as in the earlier qwen-text final sets: binary_name, file_path, text, token_len, original_idx,
 function_name, opt_level, origin_binary_name.
 
-    python Scripts/shaheen/build_rell_text.py --level-dir /scratch/zhoul0e/Dataset-1-Oc-fused --split test \
-        --text-roots /scratch/zhoul0e/bpe-corpus/Oc /scratch/zhoul0e/rell-text/Oc \
-        --qwen-tokenizer /scratch/zhoul0e/iops/hf/Qwen3-Embedding-0.6B-tokenizer --out /scratch/zhoul0e/Dataset-1-Oc-rell
+    python Scripts/shaheen/build_rell_text.py --level-dir $DATA/Dataset-1-Oc-fused --split test \
+        --text-roots $DATA/bpe-corpus/Oc $DATA/rell-text/Oc \
+        --qwen-tokenizer $MODELS/Qwen3-Embedding-0.6B-tokenizer --out $DATA/Dataset-1-Oc-rell
 """
 import argparse
 import os

@@ -3,17 +3,16 @@
 # Runs on the host (the SIF has no zstd). Submit after that level's `opt_stage.sbatch recompile` shards.
 #   sbatch --dependency=afterok:<recompile job> Scripts/shaheen/re_pack.sbatch O2
 #SBATCH --job-name=re-pack
-#SBATCH --partition=workq
 #SBATCH --exclusive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=192
 #SBATCH --time=06:00:00
-#SBATCH --output=/scratch/zhoul0e/iops/projects/ida-batch/logs/%x-%j.out
+#SBATCH --output=logs/%x-%j.out
 
 set -euo pipefail
 OPT=${1:?usage: sbatch re_pack.sbatch OPT_LEVEL}
-BIN=/scratch/zhoul0e/ReGraphv2/Binaries
+BIN=${REGRAPH_REPO:?set REGRAPH_REPO (Scripts/shaheen/cluster_env.sh)}/Binaries
 DIR=Dataset-1-$OPT-re
 n=$(find "$BIN/$DIR" -name '*.re' | wc -l)
 echo "$(date '+%F %T') packing $DIR ($n .re files)"

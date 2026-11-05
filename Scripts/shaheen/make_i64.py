@@ -1,7 +1,7 @@
 """Build the IDA database (.i64) for ONE binary with idalib; print one JSON line (driver.py contract).
 
 Equivalent of task1_lift.py step 1 (`idat -A -B`), without idat. Run by
-/scratch/zhoul0e/iops/projects/ida-batch/driver.py with cwd = a private node-local
+Scripts/shaheen/ida_driver.py with cwd = a private node-local
 temp dir. Output mirrors the input tree: <I64_OUT_ROOT>/<rel path>.i64
 Env: I64_IN_ROOT, I64_OUT_ROOT.
 """

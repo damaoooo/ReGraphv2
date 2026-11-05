@@ -1,6 +1,6 @@
 """Lift ONE binary to LLVM IR with ida2llvm.py; print one JSON line (driver.py contract).
 
-Run by /scratch/zhoul0e/iops/projects/ida-batch/driver.py with cwd = a private
+Run by Scripts/shaheen/ida_driver.py with cwd = a private
 node-local temp dir. Output mirrors task1_lift.py: <LIFT_OUT_ROOT>/<rel dir>/<name>.ll plus the lifter's <name>.ll.lift.json,
 which Task 3 needs next to the module (segment filter, bound to the .ll by checksum).
 Input may be a binary or <name>.i64. ida2llvm verifies with llvm-as: run inside the LLVM 18 SIF.

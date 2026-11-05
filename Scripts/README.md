@@ -21,11 +21,14 @@ Scripts/
 │   ├── train_test_fused_opt.sh
 │   ├── train_test_oc_graph_ablation.sh
 │   └── run_modernbert_comparison.sh
-└── benchmarks/
-    └── speedtest.py       # 模型吞吐/显存测速
+├── benchmarks/
+│   └── speedtest.py       # 模型吞吐/显存测速
+├── shaheen/               # Slurm 多机数据管线（Shaheen III），见下文“Slurm 多机数据管线”
+│   ├── coreutils/         # coreutils 测试集 finalize 与 ReLL 文本
+│   ├── irsim/             # IR 编辑距离（配对、文本、距离、汇总）
+│   └── eir/               # rev.ng EIR 消融：lift、.re、rell 文本、bodyfirst/noisa fused、门槛统计
+└── lifter_regress/        # 修改 lifter 后的回归与差分测试工具
 ```
-
-大规模 fused 数据（Ray / Slurm 多机预处理）不在本分支，见 `rope-gnn-cluster` 分支。
 
 ## 数据管线（task1 ~ task4）
 
@@ -92,6 +95,43 @@ python Scripts/ida2llvm.py -f <file.i64> -o <out.ll>
 ```
 
 `ida2llvm.py` 关闭数据库时不保存，输入的 `.i64` 不会被修改，同一个 `.i64` 重复运行结果一致；结束时在 stderr 打印 `lift stats: defined=… failed=… no_decompile=…`。
+
+## Slurm 多机数据管线（`Scripts/shaheen/`）
+
+在 Slurm 集群上按节点分片跑 task1~4 与 fused/final_set 构建，一个作业占一个独占节点。所有作业脚本先 source `Scripts/shaheen/cluster_env.sh`，站点相关的设置都用环境变量给出，脚本里不写死路径、账户或分区：
+
+| 变量 | 含义 |
+|---|---|
+| `REGRAPH_REPO` | 本仓库的 checkout（sbatch 运行的是脚本的副本，脚本自己找不到仓库） |
+| `REGRAPH_SIF` | 管线运行用的 LLVM 18 Singularity 镜像 |
+| `REGRAPH_BIND` | 绑定进镜像的目录，逗号分隔（至少包含数据根目录和仓库） |
+| `REGRAPH_DATA` | 数据与各阶段工作目录的根（`eir/`、`coreutils/`、`irsim/` 下的脚本用它拼默认路径） |
+| `IDA_TAR`、`IDAUSR_TEMPLATE` | IDA Pro 9.4 安装包（.tar.zst，每个作业解到节点本地 /tmp）和 IDAUSR 模板（许可、EULA、关闭 Lumina 的 ida.reg），IDA 阶段需要 |
+| `REVNG_TAR` | rev.ng c865bc3d1d83 安装包（.tar.zst），EIR 阶段需要 |
+| `IRSIM_PY` | irsim 用的 Python（需要 pandas、rapidfuzz） |
+
+作业日志写到提交目录的 `logs/`（先建好）；分区、账户等用 `sbatch -p … -A …` 在提交时给。
+
+- `ida_stage.sbatch {i64|lift|bbcount|funcflags}`：IDA 阶段（idalib 建库、`ida2llvm.py` lift、基本块数、函数属性），由 `ida_driver.py` 在每个节点上并行处理一个输入分片，可续跑；输入清单用 `make_lift_list.py` 生成。
+- `submit_opt.sh` → `opt_stage.sbatch {shard|select|final|recompile|corpus|retok}`：每个优化级别的 task2（`task2_bc.py`）、fused 提取与建图（`fused_task3.py`）、样本选择（`select_level.py`）、`build_split.py` 生成 final_set；`task4_re.py` + `re_pack.sbatch` 生成并打包 `.re`。
+- `build_rell_text.py`：与 final_set 逐行对齐的 ReLL（Qwen）文本。
+- `coreutils/`：coreutils 测试集的 `build_split`（`cu_final.sbatch`）、finalize（加 binary_name/fva，`finalize_cu.py`）、不截断的 ReLL 文本（`build_cu_rell.py`）。
+- `irsim/`：IR 编辑距离研究：`irsim_text.py`（规范化文本）、`build_pairs.py`、`compute_dist.py`、`summarize.py`，作业脚本 `irsim_text/irsim_cu/irsim_d1.sbatch`。
+- `eir/`：rev.ng EIR 消融（只做 coreutils）：
+  - `revng_shard.sbatch`：rev.ng isolate lift；
+  - `eir_transform.py`：全部形式转换规则（块标签、辅助函数改 declare、删元数据、text_main 删除规则、bodyfirst、noisa、按地址改回 IDA 名）；
+  - `eir_re.py`：每个构建合成一个 EIR `.re`；
+  - `eir_text_b.py` + `build_eir_rell_b.py`：rell 文本 `text_main` / `text_b` / `text_b_bodyfirst`；
+  - `eir_bf.py`（`--noisa`）+ `finalize_eir.py`：函数体在前的 fused 测试集；
+  - `gate_bf.py`、`gate_bfn.py`、`token_lens.py`：与 O0 同行比较的门槛统计；
+  - `feas_bf.py`：30 个函数的快速检查；
+  - `make_manifests_eir.py`、`make_plans_eir.py`：IDA 特征和 CLAP/DEJINA 导出计划；
+  - `make_pairs_eir.py`、`summarize_eir.py`、`text_b_view.py`：EIR 档的规范化 IR 距离；
+  - `o0_index.py`、`ida_names.py`：O0 行索引和 IDA 函数名。
+
+## 修改 lifter 后的回归（`Scripts/lifter_regress/`）
+
+`runlift.py` 用指定 lifter 批量 lift 一组样本（`sample_builds.txt` 列出 111 个构建），`compare.py` / `ircmp.py` 比较两次 lift 的结果与 IR，`difftest.py` / `dt_all.py` 做执行差分，`order_lift.py` / `order_cmp.py` 检查函数顺序无关性，`rr_*.py` 汇总回归分类。需要 `IDADIR`（IDA 安装目录），`LIFT_PY` 默认用当前 Python。
 
 ## 训练和评估
 
