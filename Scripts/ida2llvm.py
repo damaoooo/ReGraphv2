@@ -188,6 +188,8 @@ lifting_funcs = set()  # 正在定义函数体的函数，防止递归重入
 lifted_funcs = set()  # 已经完成函数体定义的函数
 function_signature_cache = {}  # 缓存函数签名: {地址: ida_typeinf.tinfo_t}
 functions_without_stored_type = set()  # 反编译之前数据库中没有存储类型的本地函数
+# warm_up() 中每个函数自身反编译给出的 (固定参数寄存器（处理器寄存器号）, 是否变参)；参数位置无法确定的不记录
+callee_arg_regs = {}
 name_cache = {}
 func_cache = {}
 segtype_cache = {}
@@ -255,6 +257,7 @@ def _reset_lift_state():
     lifted_funcs.clear()
     function_signature_cache.clear()
     functions_without_stored_type.clear()
+    callee_arg_regs.clear()
     name_cache.clear()
     func_cache.clear()
     segtype_cache.clear()
@@ -1323,9 +1326,94 @@ def _collect_lvar_accesses(ins, lvars):
     return collector.uses, collector.call, collector.defs, collector.reg_defs
 
 
+def _record_arg_regs(ea, cfunc):
+    """
+    warm_up(): the registers a function reads as fixed arguments, and whether it is variadic, from its own
+    decompilation with the pristine database (so independent of lifting order). Hex-Rays makes every
+    register live at entry an argument.
+    """
+    fi = ida_typeinf.func_type_data_t()
+    if cfunc is None or not cfunc.type.get_func_details(fi):
+        return
+    regs = set()
+    for arg in fi:
+        loc = arg.argloc
+        if loc.is_reg1():
+            regs.add(int(loc.reg1()))
+        elif loc.is_reg2():
+            regs.update((int(loc.reg1()), int(loc.reg2())))
+        elif not loc.is_stkoff():
+            return
+    callee_arg_regs[ea] = (frozenset(regs), bool(cfunc.type.is_vararg_cc()))
+
+
+_ABI_RETURN_REG_NAMES = {
+    ("x86", 64): ("rax", "rdx"), ("x86", 32): ("eax", "edx"), ("arm", 32): ("R0", "R1", "R2", "R3"),
+    ("arm", 64): tuple(f"X{i}" for i in range(9)), ("mips", 32): ("$v0", "$v1"), ("mips", 64): ("$v0", "$v1"),
+}
+
+
+def _abi_return_regs():
+    """Processor registers that can carry a call's return value on the source ABI, or None if unknown."""
+    names = _ABI_RETURN_REG_NAMES.get((source_family, ptrsize))
+    regs = {ida_idp.str2reg(name) for name in names} if names else {-1}
+    return None if -1 in regs else regs
+
+
+_unread_arg_collector_class = None
+
+
+def _unread_call_args(ins, lvars):
+    """
+    Register lvars passed directly as arguments of direct calls outside the callee's fixed parameters,
+    as {(idx, off, size): kind}. A callee without a stored type gets an argument list guessed at the call
+    site, which can include registers the caller never set (e.g. sk_num(a1, a2..a5) for int
+    sk_num(const _STACK *)). kind 1: the callee is not variadic and never reads the register. kind 2:
+    a variadic slot (BIO_snprintf(buf, n, "%019lu", x, r8...)), not a return-value register; the callee
+    can only read it through va_arg, see _entry_register_reads for when that is accepted.
+    """
+    global _unread_arg_collector_class
+    if _unread_arg_collector_class is None:
+        class Collector(ida_hexrays.minsn_visitor_t):
+            def __init__(self, lvars):
+                ida_hexrays.minsn_visitor_t.__init__(self)
+                self.lvars, self.found = lvars, []
+
+            def visit_minsn(self):
+                call = self.curins
+                if (call.opcode != ida_hexrays.m_call or call.l.t != ida_hexrays.mop_v
+                        or call.d.t != ida_hexrays.mop_f):
+                    return 0
+                info = callee_arg_regs.get(int(call.l.g))
+                if info is None:
+                    return 0
+                read, variadic = info
+                returns = _abi_return_regs() if variadic else None
+                for arg in call.d.f.args:
+                    if arg.t != ida_hexrays.mop_l or not arg.argloc.is_reg1() or int(arg.argloc.reg1()) in read:
+                        continue
+                    if variadic and (returns is None or int(arg.argloc.reg1()) in returns):
+                        continue
+                    width = self.lvars[arg.l.idx].width
+                    self.found.append(((arg.l.idx, int(arg.l.off), arg.size if arg.size > 0 else width), 2 if variadic else 1))
+                return 0
+
+        _unread_arg_collector_class = Collector
+    collector = _unread_arg_collector_class(lvars)
+    ins.for_all_insns(collector)
+    return collector.found
+
+
+_ENTRY_READ_RANK = [False, None, (), True]  # _entry_register_reads 的结果，按"更污染"排序
+
+
 def _entry_register_reads(mba):
     """
     找出在入口处尚未赋值就可能被读取的寄存器 lvar，返回 {lvar 下标: 是否被污染}。
+    被污染的值只流入被调函数不读的实参（见 _unread_call_args）时不拒绝，机器上这些寄存器里的值
+    对被调函数没有影响：非变参被调函数不读的寄存器记为 None；变参位置记为 ()，只在该路径上的值是
+    调用留下的（按 spoiled 列表，不是返回值寄存器），而不是别的 lvar / 原始寄存器写入的值时接受
+    （后者可能是 Hex-Rays 拆分出的、程序确实要传的实参）。
 
     Hex-Rays 按生存期把同一物理寄存器拆成多个 lvar。例如 `cbz x1,1f; ret; 1: mov x0,#-1; ret`
     中返回值 result 与参数 a1 都在 x0，cbz 不成立的路径不写 result 就返回，机器返回的是入口 x0。
@@ -1381,7 +1469,15 @@ def _entry_register_reads(mba):
         ins = blk.head
         while ins is not None:
             uses, call, defs, reg_defs = _collect_lvar_accesses(ins, lvars)
-            uses = [(idx, own(idx, off, size)) for idx, off, size in uses if idx in base]
+            unread = _unread_call_args(ins, lvars) if callee_arg_regs else []
+            tagged = []
+            for use in uses:
+                if use[0] in base:
+                    kind = next((k for u, k in unread if u == use), 0)
+                    if kind:
+                        unread.remove((use, kind))
+                    tagged.append((use[0], own(*use), kind))
+            uses = tagged
             kills = []
             for idx, off, size in defs:
                 location = lvars[idx].location
@@ -1398,33 +1494,43 @@ def _entry_register_reads(mba):
             seq.append((uses, spoiled_mask(call) if call else 0, kills))
             ins = ins.next
         if blk.type == ida_hexrays.BLT_STOP and results:
-            seq.append(([(idx, own(idx, off, size)) for idx, off, size in results if idx in base], 0, []))
+            seq.append(([(idx, own(idx, off, size), 0) for idx, off, size in results if idx in base], 0, []))
         events.append(seq)
 
     exposed = {}
     states = [None] * mba.qty
-    states[0] = (everything, 0)  # (入口值仍完好的未赋值字节, 入口值已被破坏的未赋值字节)
+    # (入口值仍完好的未赋值字节, 入口值已被破坏的未赋值字节, 其中被写入（而不是被调用）破坏的字节)
+    states[0] = (everything, 0, 0)
     work, queued = [0], {0}
     while work:
         index = work.pop()
         queued.discard(index)
-        clean, dirty = states[index]
+        clean, dirty, wdirty = states[index]
         for uses, spoiled, kills in events[index]:
-            for idx, mask in uses:
+            for idx, mask, kind in uses:
                 if (clean | dirty) & mask:
-                    exposed[idx] = exposed.get(idx, False) or bool(dirty & mask)
+                    previous = exposed.get(idx, False)
+                    if not dirty & mask:
+                        exposed[idx] = previous
+                    elif kind == 1 or (kind == 2 and not wdirty & mask):
+                        mark = None if kind == 1 else ()
+                        exposed[idx] = max(previous, mark, key=_ENTRY_READ_RANK.index)
+                    else:
+                        exposed[idx] = True
             if spoiled:
                 moved = clean & spoiled
                 clean, dirty = clean & ~moved, dirty | moved
+                wdirty &= ~spoiled
             for written, broken in kills:
                 clean, dirty = clean & ~written, dirty & ~written
+                wdirty = (wdirty & ~written) | ((clean | dirty) & broken)
                 moved = clean & broken
                 clean, dirty = clean & ~moved, dirty | moved
         blk = mba.get_mblock(index)
         for k in range(blk.nsucc()):
             succ = blk.succ(k)
             old = states[succ]
-            new = (clean, dirty) if old is None else (old[0] | clean, old[1] | dirty)
+            new = (clean, dirty, wdirty) if old is None else (old[0] | clean, old[1] | dirty, old[2] | wdirty)
             if new != old:
                 states[succ] = new
                 if succ not in queued:
@@ -1511,6 +1617,10 @@ def _init_entry_register_reads(func, lvars, entry_reads, builder):
         slot = slot_of(idx)
         if slot is None:
             continue
+        if entry_reads[idx] is None:
+            _note_approx("register_garbage_to_unread_call_arg")
+        elif entry_reads[idx] == ():
+            _note_approx("register_garbage_to_vararg_slot")
         source = args.get(int(lvar.location.reg1()))
         if source is not None and (source[0] == lvar.width or (source[0] > lvar.width and not is_big_endian)):
             value = typecast(builder.load(source[1]), ir.IntType(lvar.width * 8), builder)
@@ -3724,6 +3834,34 @@ def _native_division_width(ea, mnemonic):
     return -1
 
 
+_MIPS_HILO_WRITER = re.compile(
+    r"(d?divu?|d?multu?|maddu?|msubu?|mt(hi|lo)|mthlip|shilov?|dp|mulsa|maq_|madd_|msub_)")
+
+
+def _native_division_ea(ea):
+    """
+    The native division a microcode division at `ea` stands for. MIPS div/divu only set HI/LO;
+    after optimization Hex-Rays may attribute the division to the mflo/mfhi that reads the result.
+    Walk back over straight-line code (no jump target, no other HI/LO writer) to the division that
+    set HI/LO; anything else keeps `ea`, which leaves the native division unresolved (rejected).
+    """
+    if ea in native_divisions_pending or source_family != "mips":
+        return ea
+    if idc.print_insn_mnem(ea).lower() not in ("mflo", "mfhi"):
+        return ea
+    cur = ea
+    for _ in range(16):
+        if not ida_bytes.is_flow(ida_bytes.get_flags(cur)) or any(True for _ in idautils.CodeRefsTo(cur, 0)):
+            return ea
+        cur = idc.prev_head(cur, 0)
+        if cur == idc.BADADDR:
+            return ea
+        mnemonic = idc.print_insn_mnem(cur).lower()
+        if _MIPS_HILO_WRITER.match(mnemonic) or "$ac" in idc.GetDisasm(cur).lower():
+            return cur if cur in native_divisions_pending else ea
+    return ea
+
+
 def _lift_division(op, lhs, rhs, builder, ea):
     # Hex-Rays reconstructs / and % from multiply/shift sequences. For these
     # non-exceptional constants, LLVM arithmetic is defined on every input and
@@ -3731,7 +3869,8 @@ def _lift_division(op, lhs, rhs, builder, ea):
     bits = _constant_int_bits(rhs)
     if (op in ("udiv", "sdiv", "urem", "srem") and bits is not None and bits != 0
             and not (op.startswith("s") and bits == (1 << rhs.type.width) - 1)):
-        width = native_divisions_pending.get(ea)
+        native = _native_division_ea(ea)
+        width = native_divisions_pending.get(native)
         if width is not None:
             # 原生除法指令（x86 div/idiv、MIPS div/ddiv 等）：除数为非零、（有符号时）非 -1 的常量，
             # 商不会溢出且没有除零，任何目标上结果都与 LLVM 运算相同；但 microcode 的宽度必须与原指令
@@ -3739,7 +3878,7 @@ def _lift_division(op, lhs, rhs, builder, ea):
             if lhs.type.width != width:
                 raise UnsupportedMicrocode("division_machine_semantics_unresolved",
                                            f"constant divisor at {ea:#x}: width {lhs.type.width} vs native {width}")
-            native_divisions_pending[ea] = 0
+            native_divisions_pending[native] = 0
         return getattr(builder, op)(lhs, ir.Constant(rhs.type, bits))
     # LVARS may already have discarded guards using C undefined-behaviour
     # assumptions, unless the early A64 hook rewrote this native division.
@@ -4365,7 +4504,7 @@ class BIN2LLVMController():
                 continue
             database_guard.begin()
             try:
-                ida_hexrays.decompile(ea)
+                _record_arg_regs(ea, ida_hexrays.decompile(ea))
             except Exception as e:
                 logging.debug(f"warm-up decompile {ea:#x}: {e}")
             finally:
