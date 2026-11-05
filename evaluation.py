@@ -365,6 +365,39 @@ def _load_dataset(dataset_source: Union[Path, HFDataset]) -> HFDataset:
     return load_from_disk(str(dataset_source))
 
 
+def _sequence_lengths(dataset: HFDataset, max_length: int) -> Optional[np.ndarray]:
+    """Token count of each row after truncation, read from Arrow without decoding rows; None without input_ids."""
+    import pyarrow.compute as pc
+    if "input_ids" not in dataset.column_names:
+        return None
+    column = dataset.select_columns(["input_ids"]).with_format("arrow")
+    lengths = np.empty(len(dataset), dtype=np.int64)
+    for start in range(0, len(dataset), 200_000):
+        chunk = column[start:start + 200_000]["input_ids"]
+        lengths[start:start + len(chunk)] = pc.list_value_length(chunk).to_numpy(zero_copy_only=False)
+    return np.minimum(lengths, max_length)
+
+
+def _length_bucketed_batches(lengths: np.ndarray, max_batch_tokens: int, max_batch_rows: int) -> List[List[int]]:
+    """
+    Group rows of similar length so short functions are not padded to the longest one in a batch.
+    Longest first, so the peak-memory batch comes first; a batch's padded tokens never exceed
+    max_batch_tokens (the old worst case batch_size * max_length) nor max_batch_rows rows.
+    """
+    batches, current, current_max = [], [], 0
+    for idx in np.argsort(-lengths, kind="stable"):
+        padded = -(-max(int(lengths[idx]), 1) // 8) * 8  # the collator pads to a multiple of 8
+        width = max(current_max, padded)
+        if current and (width * (len(current) + 1) > max_batch_tokens or len(current) >= max_batch_rows):
+            batches.append(current)
+            current, width = [], padded
+        current.append(int(idx))
+        current_max = width
+    if current:
+        batches.append(current)
+    return batches
+
+
 def get_dataloader(
     dataset_source: Union[Path, HFDataset],
     tokenizer,
@@ -372,7 +405,10 @@ def get_dataloader(
     max_length: int = 2048,
     use_cfg: bool = True,
     use_ddg: bool = True,
+    num_workers: int = 8,
+    batches: Optional[List[List[int]]] = None,
 ) -> DataLoader:
+    """batches: explicit row groups (length bucketing); None keeps dataset order in fixed batch_size."""
     dataset = _load_dataset(dataset_source)
     collator = FunctionDataCollator(
         tokenizer,
@@ -380,16 +416,14 @@ def get_dataloader(
         use_cfg=use_cfg,
         use_ddg=use_ddg,
     )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        collate_fn=collator,
-        num_workers=0,  # 禁用多进程避免数据缓冲
-        pin_memory=False,  # 禁用pin_memory减少内存占用
-        persistent_workers=False,
-        shuffle=False,
-    )
-    return dataloader
+    # Collation (Arrow decode, padding, CFG/DDG span tensors) runs in worker processes, not between GPU batches.
+    loader_args = dict(collate_fn=collator, num_workers=num_workers, pin_memory=num_workers > 0,
+                       persistent_workers=False)
+    if num_workers > 0:
+        loader_args["prefetch_factor"] = 4
+    if batches is not None:
+        return DataLoader(dataset, batch_sampler=batches, **loader_args)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, **loader_args)
     
 
 
@@ -403,11 +437,17 @@ def generate_embeddings_with_model(
     use_cfg: bool = True,
     use_ddg: bool = True,
     output_torch_dtype: Optional[torch.dtype] = None,
+    num_workers: int = 8,
+    length_bucketing: bool = True,
+    max_batch_tokens: int = 0,
+    max_batch_rows: int = 256,
 ) -> Union[np.ndarray, torch.Tensor]:
     """
     使用本地模型为整个数据集生成嵌入向量。
     使用CUDA和bf16精度进行推理。
     默认使用memmap避免内存爆炸；如果 output_torch_dtype 非空，直接返回CPU torch Tensor。
+    length_bucketing：按 token 长度分组成批（每批 padding 后的 token 数不超过 max_batch_tokens，
+    默认 batch_size * max_length，即原来最坏的一批），结果按原行号写回，行序与数据集一致。
     """
     import psutil
     import os
@@ -431,14 +471,25 @@ def generate_embeddings_with_model(
     use_bf16 = device.type == "cuda"
     
     # 创建DataLoader
+    dataset = _load_dataset(dataset_source)
+    lengths = _sequence_lengths(dataset, max_length) if length_bucketing else None
+    batches = None
+    if lengths is not None:
+        batches = _length_bucketed_batches(lengths, max_batch_tokens or batch_size * max_length, max_batch_rows)
+        console.print(f"Length bucketing: {len(batches):,} batches (fixed batch_size would be "
+                      f"{-(-len(dataset) // batch_size):,}), {num_workers} loader workers")
     dataloader = get_dataloader(
-        dataset_source,
+        dataset,
         tokenizer,
         batch_size=batch_size,
         max_length=max_length,
         use_cfg=use_cfg,
         use_ddg=use_ddg,
+        num_workers=num_workers,
+        batches=batches,
     )
+    # 每个 batch 的原行号：分桶时来自 batches，否则按数据集顺序连续
+    batch_rows = iter(batches) if batches is not None else None
 
     # 计算总样本数和embedding维度，提前创建memmap
     total_samples = len(dataloader.dataset)
@@ -494,10 +545,11 @@ def generate_embeddings_with_model(
         
         for batch in dataloader:
             batch_idx += 1
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
+            rows = next(batch_rows) if batch_rows is not None else None
+            input_ids = batch['input_ids'].to(device, non_blocking=True)
+            attention_mask = batch['attention_mask'].to(device, non_blocking=True)
             graph_inputs = {
-                key: batch[key].to(device) if batch.get(key) is not None else None
+                key: batch[key].to(device, non_blocking=True) if batch.get(key) is not None else None
                 for key in graph_tensor_keys
             }
             
@@ -528,7 +580,12 @@ def generate_embeddings_with_model(
                     batch_size_actual = len(batch_embeddings)
                     
                     # 直接写入预分配缓存，不保留batch中间结果
-                    all_embeddings[current_idx:current_idx + batch_size_actual] = batch_embeddings
+                    if rows is None:
+                        all_embeddings[current_idx:current_idx + batch_size_actual] = batch_embeddings
+                    else:
+                        assert len(rows) == batch_size_actual
+                        index = np.asarray(rows, dtype=np.int64)
+                        all_embeddings[torch.from_numpy(index) if use_torch_output else index] = batch_embeddings
                     current_idx += batch_size_actual
                     
                     # 更新进度条和速度统计
@@ -578,6 +635,8 @@ def generate_embeddings_with_model(
     if device.type == "cuda":
         torch.cuda.empty_cache()
     
+    if batch_rows is not None and current_idx != total_samples:
+        raise RuntimeError(f"length bucketing wrote {current_idx} of {total_samples} rows")
     if current_idx == 0:
         console.print("[bold red]ERROR: 没有成功的batch，无法返回结果[/bold red]")
         # 清理临时文件
@@ -769,6 +828,10 @@ def main(
     paired_baseline: Optional[Path] = typer.Option(None, "--paired-baseline", help="Baseline .npy cache to score with identical candidate pools."),
     baseline_label: str = typer.Option("Baseline", "--baseline-label", help="Paired comparison baseline display name."),
     comparison_note: str = typer.Option("", "--comparison-note", help="Provenance and limitations for the paired comparison report."),
+    num_workers: int = typer.Option(8, "--num-workers", help="DataLoader worker processes for collation (0 = main thread)."),
+    length_bucketing: bool = typer.Option(True, "--length-bucketing/--no-length-bucketing", help="Batch rows of similar token length; embeddings keep dataset row order."),
+    max_batch_tokens: int = typer.Option(0, "--max-batch-tokens", help="Padded tokens per bucketed batch; 0 = batch_size * max_length."),
+    max_batch_rows: int = typer.Option(256, "--max-batch-rows", help="Rows per bucketed batch at most."),
 ):
     """
     在验证集上评估模型的函数检索性能 (Recall@K)。
@@ -798,7 +861,7 @@ def main(
                 dataset=validation_dataset_pool_path, model=model_path,
                 tokenizer=tokenizer_path, output=embeddings_path,
                 batch_size=batch_size, max_length=max_length,
-                use_cfg=use_cfg, use_ddg=use_ddg,
+                use_cfg=use_cfg, use_ddg=use_ddg, num_workers=num_workers,
             ))
         return
 
@@ -902,6 +965,10 @@ def main(
             use_cfg=use_cfg,
             use_ddg=use_ddg,
             output_torch_dtype=torch_cache_dtype,
+            num_workers=num_workers,
+            length_bucketing=length_bucketing,
+            max_batch_tokens=max_batch_tokens,
+            max_batch_rows=max_batch_rows,
         )
         logging.info(f"嵌入向量生成完毕: [green]{_embedding_shape_dtype(all_embeddings)}[/green]")
 
@@ -1099,8 +1166,10 @@ def export_resumable_embeddings(args):
     flags = {"use_cfg": use_cfg, "use_ddg": use_ddg}
     model = get_model(str(args.model), max_seq_length=max_length,
                       tokenizer_path=str(args.tokenizer), **flags).cuda().eval()
+    # Resumable export writes rows in dataset order (resume offset), so no length bucketing here.
     loader = get_dataloader(dataset.select(range(offset, len(dataset))), tokenizer,
-                            batch_size=args.batch_size, max_length=max_length, **flags)
+                            batch_size=args.batch_size, max_length=max_length,
+                            num_workers=getattr(args, "num_workers", 8), **flags)
     initial_offset = offset
     started = time.monotonic()
     with torch.inference_mode():
