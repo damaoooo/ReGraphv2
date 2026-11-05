@@ -66,6 +66,9 @@ def test_signature_tracks_backend_binary(bitcode, tmp_path, monkeypatch):
     binary.write_bytes(b'build one')
     first_build = build_extraction_signature(str(bitcode))
     binary.write_bytes(b'build two')
+    # Same size within one mtime tick would look unchanged to a path/size/mtime signature: move mtime on.
+    stat = binary.stat()
+    os.utime(binary, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
     second_build = build_extraction_signature(str(bitcode))
     assert fallback != first_build != second_build
 
