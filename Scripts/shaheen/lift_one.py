@@ -4,7 +4,8 @@ Run by /scratch/zhoul0e/iops/projects/ida-batch/driver.py with cwd = a private
 node-local temp dir. Output mirrors task1_lift.py: <LIFT_OUT_ROOT>/<rel dir>/<name>.ll plus the lifter's <name>.ll.lift.json,
 which Task 3 needs next to the module (segment filter, bound to the .ll by checksum).
 Input may be a binary or <name>.i64. ida2llvm verifies with llvm-as: run inside the LLVM 18 SIF.
-Env: LIFT_IN_ROOT, LIFT_OUT_ROOT, optional LIFT_TARGET (passed as ida2llvm --target; unset = its default).
+Env: LIFT_IN_ROOT, LIFT_OUT_ROOT, optional LIFT_TARGET (passed as ida2llvm --target; unset = its default),
+optional LIFT_SOURCE_ROOT (original binaries mirroring LIFT_IN_ROOT, passed as ida2llvm --source-elf).
 """
 import json
 import os
@@ -40,6 +41,8 @@ def main():
     cmd = [sys.executable, LIFTER, "-f", local, "-o", local_ll]
     if os.environ.get("LIFT_TARGET"):
         cmd += ["--target", os.environ["LIFT_TARGET"]]  # unset: ida2llvm's default (source)
+    if os.environ.get("LIFT_SOURCE_ROOT"):  # an .i64's recorded input path is the temp dir it was built in
+        cmd += ["--source-elf", os.path.join(os.environ["LIFT_SOURCE_ROOT"], rel)]
     p = subprocess.run(cmd, capture_output=True, text=True)
     m = re.search(r"lift stats: (.*)", p.stderr)
     if m:  # "status=ok defined=12 failed=0 approx=0 ... unsupported=none no_decompile=3"

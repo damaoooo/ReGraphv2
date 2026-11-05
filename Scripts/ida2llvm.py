@@ -299,6 +299,9 @@ SOURCE_TARGETS = {
 # host = 旧行为的兼容模式：宿主 triple/layout，但类型大小按源指针宽度计算，二者不一致，不做内存语义转换
 TARGET_MODES = ("source", "host")
 MEMORY_CONTRACTS = {"source": "source-layout", "host": "host-compat-unconverted"}
+# --source-elf: where the input binary lives when the IDB's recorded input path is stale
+# (databases built in a temp dir). Still checked against the IDB's sha256 before use.
+source_elf_path = None
 # 计算类型大小所用的 layout；None 表示 host 兼容模式下沿用旧的 "e/E[-p:32:32]" 计算方式
 sizing_layout = None
 int_alloc_size_cache = {}
@@ -365,21 +368,103 @@ def _source_elf_header() -> dict:
         raw = ida_bytes.get_bytes(ida_nalt.get_imagebase(), 64)
         header = _parse_elf_header(raw or b"")
         return {**header, "evidence": "idb-image-header"}
-    path = ida_nalt.get_input_file_path()
+    # For relocatable objects the header may not be mapped.
+    with open(_verified_source_path(), "rb") as handle:
+        header = _parse_elf_header(handle.read(64))
+    return {**header, "evidence": "verified-source-file"}
+
+
+def _verified_source_path() -> str:
+    """The input file, only if it matches the fingerprint IDA stored when it loaded it."""
+    path = source_elf_path or ida_nalt.get_input_file_path()
     try:
-        # For relocatable objects the header may not be mapped. Verify the source
-        # against the fingerprint stored by IDA before trusting its ABI flags.
         expected = ida_nalt.retrieve_input_file_sha256()
         if not expected:
             raise UnsupportedTarget("no IDB source fingerprint for ELF ABI verification")
         expected = expected.hex() if isinstance(expected, bytes) else str(expected)
         if _LiftArtifactState.sha256_file(path) != expected.lower():
             raise UnsupportedTarget("source ELF fingerprint differs from IDB")
-        with open(path, "rb") as handle:
-            header = _parse_elf_header(handle.read(64))
-        return {**header, "evidence": "verified-source-file"}
+        return path
     except OSError as exc:
         raise UnsupportedTarget(f"source ELF unavailable; cannot determine ABI: {path}") from exc
+
+
+def _uleb128(data: bytes, pos: int) -> tuple:
+    value = shift = 0
+    while True:
+        if pos >= len(data):
+            raise UnsupportedTarget("truncated ULEB128 in .ARM.attributes")
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return value, pos
+
+
+def _ntbs_end(data: bytes, pos: int) -> int:
+    end = data.find(b"\0", pos)
+    if end < 0:
+        raise UnsupportedTarget("unterminated string in .ARM.attributes")
+    return end + 1
+
+
+def _arm_vfp_args(raw: bytes, endian: str):
+    """
+    File-scope Tag_ABI_VFP_args (28) from the aeabi subsection of .ARM.attributes
+    (ARM IHI 0045), or None when the file has no such section. An absent tag means
+    its default 0, i.e. base AAPCS.
+    """
+    order = "<" if endian == "little" else ">"
+    if raw[4] != 1:
+        raise UnsupportedTarget("ARM float ABI unknown: .ARM.attributes parsing needs ELF32")
+    shoff, = struct.unpack_from(order + "I", raw, 32)
+    shentsize, shnum, shstrndx = struct.unpack_from(order + "HHH", raw, 46)
+    if shoff == 0 or shentsize < 40 or shstrndx >= shnum or shoff + shnum * shentsize > len(raw):
+        raise UnsupportedTarget("ARM float ABI unknown: no usable section headers")
+    sections = [struct.unpack_from(order + "IIIIII", raw, shoff + i * shentsize) for i in range(shnum)]
+    names_off = sections[shstrndx][4]
+    attrs = None
+    for name, sh_type, _, _, offset, size in sections:
+        if raw[names_off + name:_ntbs_end(raw, names_off + name) - 1] == b".ARM.attributes":
+            if sh_type != 0x70000003 or offset + size > len(raw):  # SHT_ARM_ATTRIBUTES
+                raise UnsupportedTarget("malformed .ARM.attributes section")
+            attrs = raw[offset:offset + size]
+    if attrs is None:
+        return None
+    if attrs[:1] != b"A":
+        raise UnsupportedTarget("unknown .ARM.attributes format version")
+    pos, vfp_args = 1, 0
+    while pos < len(attrs):
+        length, = struct.unpack_from(order + "I", attrs, pos)
+        sub_end, vendor_end = pos + length, _ntbs_end(attrs, pos + 4)
+        if length < 5 or sub_end > len(attrs):
+            raise UnsupportedTarget("malformed .ARM.attributes subsection")
+        if attrs[pos + 4:vendor_end - 1] == b"aeabi":
+            p = vendor_end
+            while p < sub_end:
+                scope, body = _uleb128(attrs, p)
+                size, = struct.unpack_from(order + "I", attrs, body)
+                if size < 5 or p + size > sub_end:
+                    raise UnsupportedTarget("malformed .ARM.attributes scope")
+                if scope != 1:  # Tag_Section / Tag_Symbol override per section or symbol
+                    raise UnsupportedTarget("ARM float ABI unknown: section/symbol-scoped build attributes")
+                q = body + 4
+                while q < p + size:
+                    tag, q = _uleb128(attrs, q)
+                    if tag in (4, 5, 65, 67):  # CPU_raw_name, CPU_name, also_compatible_with, conformance
+                        q = _ntbs_end(attrs, q)
+                    elif tag == 32:  # Tag_compatibility: flag then vendor name
+                        q = _ntbs_end(attrs, _uleb128(attrs, q)[1])
+                    elif tag < 32 or tag % 2 == 0:
+                        value, q = _uleb128(attrs, q)
+                        if tag == 28:
+                            vfp_args = value
+                    else:
+                        q = _ntbs_end(attrs, q)
+                p += size
+        pos = sub_end
+    return vfp_args
 
 
 def _apply_source_abi(spec: dict, elf: dict) -> dict:
@@ -402,7 +487,16 @@ def _apply_source_abi(spec: dict, elf: dict) -> dict:
             raise UnsupportedTarget("ARM relocatable ABI requires Tag_ABI_VFP_args; use a linked ELF")
         float_flags = flags & 0x600
         if float_flags == 0:
-            raise UnsupportedTarget("ARM float ABI unknown: Tag_ABI_VFP_args parsing is required")
+            # Neither header bit is set (e.g. vendor toolchains): Tag_ABI_VFP_args decides.
+            with open(_verified_source_path(), "rb") as handle:
+                vfp_args = _arm_vfp_args(handle.read(), elf["endian"])
+            if vfp_args is None:
+                raise UnsupportedTarget("ARM float ABI unknown: no header flags and no .ARM.attributes")
+            if vfp_args == 2:
+                raise UnsupportedTarget("ARM float ABI is toolchain-specific (Tag_ABI_VFP_args=2)")
+            # 3 = no floating-point arguments or results: both conventions agree.
+            float_flags = 0x400 if vfp_args == 1 else 0x200
+            elf = {**elf, "float_abi_evidence": f"Tag_ABI_VFP_args={vfp_args}"}
         if float_flags == 0x600:
             raise UnsupportedTarget("contradictory ARM soft/hard-float ABI flags")
         hard = float_flags == 0x400
@@ -4948,6 +5042,11 @@ def main(
         help="source (default): source binary triple/data layout; host: legacy host-layout compatibility "
              "mode without memory-semantics conversion",
     ),
+    source_elf: str = typer.Option(
+        None, "--source-elf",
+        help="Original binary for an .i64 whose recorded input path no longer exists; read only when the ELF "
+             "header cannot decide the ABI (ARM float ABI from .ARM.attributes), after a sha256 check",
+    ),
 ):
     """
     作为独立应用程序运行（使用 IDA Pro 9+ idalib）。
@@ -4962,6 +5061,8 @@ def main(
     else:
         logging.basicConfig(level=logging.INFO)
 
+    global source_elf_path
+    source_elf_path = os.path.abspath(source_elf) if source_elf else None
     result = run_lift(file, output, target)
     print(
         f"lift stats: status={result['status']} defined={lift_stats['defined']} failed={lift_stats['failed']} "
