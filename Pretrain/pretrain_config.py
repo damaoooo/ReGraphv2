@@ -3,8 +3,11 @@
 包含所有预训练相关的硬编码配置项
 """
 
+from pathlib import Path
 from typing import Optional, Any, Dict
 from transformers import ModernBertConfig
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class PretrainConfig(ModernBertConfig):
@@ -31,8 +34,8 @@ class PretrainConfig(ModernBertConfig):
         # === 序列长度配置 ===
         max_seq_length: int = 2048,
         # === 路径配置 ===
-        tokenizer_path: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json",
-        train_dataset_dir: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set",
+        tokenizer_path: str = str(_REPO_ROOT / "IR/dataset-1/train_corpus_tokenizer/llvm_ir_bpe.json"),
+        train_dataset_dir: str = str(_REPO_ROOT / "IR/dataset-1/train_final_set"),
         train_dataset_pool_path: Optional[str] = None,
         train_dataset_idx_path: Optional[str] = None,
         train_dataset_map_path: Optional[str] = None,

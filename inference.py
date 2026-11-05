@@ -81,7 +81,7 @@ class FunctionGraphJson:
 
 @dataclass
 class InferencePipelineConfig:
-    repo_root: str = "/home/damaoooo/Downloads/regraphv2"
+    repo_root: str = os.path.dirname(os.path.abspath(__file__))
     tokenizer_path: str = DEFAULT_TOKENIZER_PATH
     python_path: str = "python"
     workers: int = os.cpu_count() or 1

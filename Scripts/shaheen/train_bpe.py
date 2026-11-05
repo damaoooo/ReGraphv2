@@ -4,7 +4,7 @@ Tokenizer, trainer and special tokens come from Tokenizer/bpe_tokenizer.py; this
 parquet corpus (instead of one in-memory list) and samples it reproducibly. On the Dataset-1 train corpus
 use --sample-fraction 0.25: tokenizers counts pairs in 32 bits and "%." would overflow (see bpe_tokenizer.py).
 
-    python Scripts/shaheen/train_bpe.py --corpus /scratch/zhoul0e/bpe-corpus --levels O0 O1 O2 O3 Os Oz Oc \
+    python Scripts/shaheen/train_bpe.py --corpus $DATA/bpe-corpus --levels O0 O1 O2 O3 Os Oz Oc \
         --out <dir> --sample-fraction 0.25 --seed 0
 """
 import argparse

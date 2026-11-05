@@ -80,7 +80,7 @@ cmake --build LLVMTools/build -j 4
 uv run --locked --extra pipeline python -m pytest tests/test_function_extraction.py -q
 ```
 
-需要 LLVM 18.1 和 OpenSSL 开发包。这一次构建同时生成 CFG/DDG、MetaRemover 插件（`LLVMTools/build/lib/`）和 `split_funcs`（`LLVMTools/build/bin/`）。源码分别放在 `LLVMTools/cfg_exporter/`、`ddg_exporter/`、`meta_remover/`、`split_functions/`；Python 图解析仍在 `GraphBuilder/`，提取驱动在 `Scripts/split_functions.py`。两个历史 DDG 实验源码保留，但不加入默认构建。
+需要 LLVM 18.1 和 OpenSSL 开发包。这一次构建同时生成 CFG/DDG、MetaRemover 插件（`LLVMTools/build/lib/`）和 `split_funcs`（`LLVMTools/build/bin/`）。源码分别放在 `LLVMTools/cfg_exporter/`、`ddg_exporter/`、`meta_remover/`、`split_functions/`；Python 图解析仍在 `GraphBuilder/`，提取驱动在 `Scripts/split_functions.py`。
 
 请在实际运行环境（例如 Shaheen 的 LLVM 容器）内构建，二进制不会提交到 Git。`split_funcs` 与 PATH 中 `llvm-extract` 的版本必须一致；缺失时自动警告并回退到纯 CLI 两级分块，已有工具损坏或版本不一致则报错，不静默降级。
 

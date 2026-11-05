@@ -211,21 +211,3 @@ class DataDependencyGraphBuilder:
         self.clear_cache()
         
         return self.matrix_edges
-
-
-def main():
-    dot_file = "/home/damaoooo/Downloads/regraphv2/DataProcess/ddg_exporter/build/id_graph.movelim.dot"
-    instrumented = "/home/damaoooo/Downloads/regraphv2/DataProcess/ddg_exporter/build/instrumented.ll"
-    origin_ir = "/home/damaoooo/Downloads/regraphv2/DataProcess/ddg_exporter/test.ll"
-    tokenizer_path = "/home/damaoooo/Downloads/regraphv2/DataProcess/output_tokenizer/llvm_ir_bpe.json"
-
-    tokenizer = load_tokenizer(tokenizer_path)
-
-    builder = DataDependencyGraphBuilder(tokenizer)
-    matrix_edges = builder.generate_ddg_matrix(dot_file, instrumented, origin_ir)
-    
-    print(f"Generated {len(matrix_edges)} matrix edges")
-
-
-if __name__ == "__main__":
-    main()

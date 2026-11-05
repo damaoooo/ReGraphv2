@@ -17,8 +17,8 @@ uv run --locked --extra fa2 python ...
 优先使用 LSP 读取代码结构。Python 和 Bash LSP 已配置；在新会话里进入本 repo 后，可以先启动：
 
 ```text
-lsp_start_server(server_id="python", workspace_root="/home/damaoooo/Downloads/regraphv2")
-lsp_start_server(server_id="bash", workspace_root="/home/damaoooo/Downloads/regraphv2")
+lsp_start_server(server_id="python", workspace_root="<repo root>")
+lsp_start_server(server_id="bash", workspace_root="<repo root>")
 ```
 
 建议先用 `lsp_document_symbols` / `lsp_goto_definition` / `lsp_find_references` 看关键文件。`lsp_file_exports(include_signatures=true)` 在本项目的一些重型模块上可能超时，必要时改用 `lsp_document_symbols` 加定向读取。

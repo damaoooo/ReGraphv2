@@ -194,19 +194,3 @@ def compute_group_ids(data: Dict[int, List[int]]) -> Dict[int, int]:
             key_to_group_id[anchor_key] = anchor_key
             
     return key_to_group_id
-
-
-if __name__ == "__main__":
-    # 测试代码
-    import pickle
-    tokenizer = load_tokenizer("/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json")
-    dataset_pool = load_dataset("/home/damaoooo/Downloads/regraphv2/IR/train_dataset_pool")
-    dataset = load_dataset("/home/damaoooo/Downloads/regraphv2/IR/train_task_dataset")
-    with open("/home/damaoooo/Downloads/regraphv2/IR/train_positive_map.pkl", "rb") as f:
-        map_file = pickle.load(f)
-    
-    group_id_mapping = compute_group_ids(map_file)
-    
-    collator = MoCoDataCollator(tokenizer=tokenizer, dataset_pool=dataset_pool, map_file=map_file, group_id_mapping=group_id_mapping)
-    batch = collator(dataset[:2])  # 取前两个样本进行测试
-    print(batch)
