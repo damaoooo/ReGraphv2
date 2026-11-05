@@ -1,6 +1,7 @@
 # 111-build regression sample (copy into <work>/sample/ and list as sample/<name> in <work>/sample.txt)
-# coreutils 9.5: /home/damaoooo/Dataset-1-ReGraphv2/coreutils_from_shaheen/orig/coreutils/<name>
-# Dataset-1:     /mnt/nas/Dataset-1/{zlib,curl}/<name>
+# All 111 binaries are kept ready-made in workspace/exp/lifter_regress_sample/sample/ (+ sample.txt).
+# Origins: coreutils 9.5 = workspace/data/binaries/coreutils/orig/coreutils/<name>;
+# Dataset-1 zlib/curl = the old Talos release (originals deleted 2026-11-05; only the sample copies remain).
 arm32-clang-19-O0_date
 arm32-clang-19-O0_ls
 arm32-clang-19-O0_tail
