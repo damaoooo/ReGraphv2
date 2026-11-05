@@ -21,7 +21,7 @@ LOGGER = logging.getLogger("pcode2llvm")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 GHIDRA_SCRIPT_DIR = SCRIPT_DIR / "ghidra"
-DEFAULT_GHIDRA_HEADLESS = Path("/home/damaoooo/Downloads/ghidra_12.0/support/analyzeHeadless")
+DEFAULT_GHIDRA_HEADLESS = Path(os.environ.get("GHIDRA_HEADLESS", "analyzeHeadless"))  # Ghidra support/analyzeHeadless
 
 LLVM_TERMINATOR_PREFIXES = (
     "br ",

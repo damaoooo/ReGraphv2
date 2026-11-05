@@ -12,6 +12,9 @@ import ida_segment
 import ida_nalt
 import ida_hexrays
 import ida_auto
+import ida_ua
+import ida_idp
+import ida_frame
 import idaapi
 import logging
 import array
@@ -184,6 +187,9 @@ rotate_rewrites = {}  # RotateFix 每个函数改写的移位数: {函数地址:
 lifting_funcs = set()  # 正在定义函数体的函数，防止递归重入
 lifted_funcs = set()  # 已经完成函数体定义的函数
 function_signature_cache = {}  # 缓存函数签名: {地址: ida_typeinf.tinfo_t}
+functions_without_stored_type = set()  # 反编译之前数据库中没有存储类型的本地函数
+# warm_up() 中每个函数自身反编译给出的 (固定参数寄存器（处理器寄存器号）, 是否变参)；参数位置无法确定的不记录
+callee_arg_regs = {}
 name_cache = {}
 func_cache = {}
 segtype_cache = {}
@@ -205,7 +211,6 @@ llvm_context = ir.Context()
 # 全局数据项地址 -> ir.GlobalVariable，用于把指针初始值解析成符号引用
 global_by_ea = {}
 # microcode 字符串常量的独立编号，不受模块中其他全局对象数量影响
-cstr_counter = [0]
 # 新建、尚未输出声明的结构体类型（流式输出时只处理新增部分）
 pending_type_decls = []
 _CACHE_MISS = object()
@@ -251,6 +256,8 @@ def _reset_lift_state():
     lifting_funcs.clear()
     lifted_funcs.clear()
     function_signature_cache.clear()
+    functions_without_stored_type.clear()
+    callee_arg_regs.clear()
     name_cache.clear()
     func_cache.clear()
     segtype_cache.clear()
@@ -264,11 +271,11 @@ def _reset_lift_state():
     function_records.clear()
     unresolved_data_items.clear()
     a64_rewritten_divisions.clear()
+    native_divisions_pending.clear()
     _set_sizing_layout(None)
     target_data = None
     llvm_context = ir.Context()
     global_by_ea.clear()
-    cstr_counter[0] = 0
     pending_type_decls.clear()
 
 
@@ -295,6 +302,9 @@ SOURCE_TARGETS = {
 # host = 旧行为的兼容模式：宿主 triple/layout，但类型大小按源指针宽度计算，二者不一致，不做内存语义转换
 TARGET_MODES = ("source", "host")
 MEMORY_CONTRACTS = {"source": "source-layout", "host": "host-compat-unconverted"}
+# --source-elf: where the input binary lives when the IDB's recorded input path is stale
+# (databases built in a temp dir). Still checked against the IDB's sha256 before use.
+source_elf_path = None
 # 计算类型大小所用的 layout；None 表示 host 兼容模式下沿用旧的 "e/E[-p:32:32]" 计算方式
 sizing_layout = None
 int_alloc_size_cache = {}
@@ -361,21 +371,103 @@ def _source_elf_header() -> dict:
         raw = ida_bytes.get_bytes(ida_nalt.get_imagebase(), 64)
         header = _parse_elf_header(raw or b"")
         return {**header, "evidence": "idb-image-header"}
-    path = ida_nalt.get_input_file_path()
+    # For relocatable objects the header may not be mapped.
+    with open(_verified_source_path(), "rb") as handle:
+        header = _parse_elf_header(handle.read(64))
+    return {**header, "evidence": "verified-source-file"}
+
+
+def _verified_source_path() -> str:
+    """The input file, only if it matches the fingerprint IDA stored when it loaded it."""
+    path = source_elf_path or ida_nalt.get_input_file_path()
     try:
-        # For relocatable objects the header may not be mapped. Verify the source
-        # against the fingerprint stored by IDA before trusting its ABI flags.
         expected = ida_nalt.retrieve_input_file_sha256()
         if not expected:
             raise UnsupportedTarget("no IDB source fingerprint for ELF ABI verification")
         expected = expected.hex() if isinstance(expected, bytes) else str(expected)
         if _LiftArtifactState.sha256_file(path) != expected.lower():
             raise UnsupportedTarget("source ELF fingerprint differs from IDB")
-        with open(path, "rb") as handle:
-            header = _parse_elf_header(handle.read(64))
-        return {**header, "evidence": "verified-source-file"}
+        return path
     except OSError as exc:
         raise UnsupportedTarget(f"source ELF unavailable; cannot determine ABI: {path}") from exc
+
+
+def _uleb128(data: bytes, pos: int) -> tuple:
+    value = shift = 0
+    while True:
+        if pos >= len(data):
+            raise UnsupportedTarget("truncated ULEB128 in .ARM.attributes")
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return value, pos
+
+
+def _ntbs_end(data: bytes, pos: int) -> int:
+    end = data.find(b"\0", pos)
+    if end < 0:
+        raise UnsupportedTarget("unterminated string in .ARM.attributes")
+    return end + 1
+
+
+def _arm_vfp_args(raw: bytes, endian: str):
+    """
+    File-scope Tag_ABI_VFP_args (28) from the aeabi subsection of .ARM.attributes
+    (ARM IHI 0045), or None when the file has no such section. An absent tag means
+    its default 0, i.e. base AAPCS.
+    """
+    order = "<" if endian == "little" else ">"
+    if raw[4] != 1:
+        raise UnsupportedTarget("ARM float ABI unknown: .ARM.attributes parsing needs ELF32")
+    shoff, = struct.unpack_from(order + "I", raw, 32)
+    shentsize, shnum, shstrndx = struct.unpack_from(order + "HHH", raw, 46)
+    if shoff == 0 or shentsize < 40 or shstrndx >= shnum or shoff + shnum * shentsize > len(raw):
+        raise UnsupportedTarget("ARM float ABI unknown: no usable section headers")
+    sections = [struct.unpack_from(order + "IIIIII", raw, shoff + i * shentsize) for i in range(shnum)]
+    names_off = sections[shstrndx][4]
+    attrs = None
+    for name, sh_type, _, _, offset, size in sections:
+        if raw[names_off + name:_ntbs_end(raw, names_off + name) - 1] == b".ARM.attributes":
+            if sh_type != 0x70000003 or offset + size > len(raw):  # SHT_ARM_ATTRIBUTES
+                raise UnsupportedTarget("malformed .ARM.attributes section")
+            attrs = raw[offset:offset + size]
+    if attrs is None:
+        return None
+    if attrs[:1] != b"A":
+        raise UnsupportedTarget("unknown .ARM.attributes format version")
+    pos, vfp_args = 1, 0
+    while pos < len(attrs):
+        length, = struct.unpack_from(order + "I", attrs, pos)
+        sub_end, vendor_end = pos + length, _ntbs_end(attrs, pos + 4)
+        if length < 5 or sub_end > len(attrs):
+            raise UnsupportedTarget("malformed .ARM.attributes subsection")
+        if attrs[pos + 4:vendor_end - 1] == b"aeabi":
+            p = vendor_end
+            while p < sub_end:
+                scope, body = _uleb128(attrs, p)
+                size, = struct.unpack_from(order + "I", attrs, body)
+                if size < 5 or p + size > sub_end:
+                    raise UnsupportedTarget("malformed .ARM.attributes scope")
+                if scope != 1:  # Tag_Section / Tag_Symbol override per section or symbol
+                    raise UnsupportedTarget("ARM float ABI unknown: section/symbol-scoped build attributes")
+                q = body + 4
+                while q < p + size:
+                    tag, q = _uleb128(attrs, q)
+                    if tag in (4, 5, 65, 67):  # CPU_raw_name, CPU_name, also_compatible_with, conformance
+                        q = _ntbs_end(attrs, q)
+                    elif tag == 32:  # Tag_compatibility: flag then vendor name
+                        q = _ntbs_end(attrs, _uleb128(attrs, q)[1])
+                    elif tag < 32 or tag % 2 == 0:
+                        value, q = _uleb128(attrs, q)
+                        if tag == 28:
+                            vfp_args = value
+                    else:
+                        q = _ntbs_end(attrs, q)
+                p += size
+        pos = sub_end
+    return vfp_args
 
 
 def _apply_source_abi(spec: dict, elf: dict) -> dict:
@@ -398,7 +490,16 @@ def _apply_source_abi(spec: dict, elf: dict) -> dict:
             raise UnsupportedTarget("ARM relocatable ABI requires Tag_ABI_VFP_args; use a linked ELF")
         float_flags = flags & 0x600
         if float_flags == 0:
-            raise UnsupportedTarget("ARM float ABI unknown: Tag_ABI_VFP_args parsing is required")
+            # Neither header bit is set (e.g. vendor toolchains): Tag_ABI_VFP_args decides.
+            with open(_verified_source_path(), "rb") as handle:
+                vfp_args = _arm_vfp_args(handle.read(), elf["endian"])
+            if vfp_args is None:
+                raise UnsupportedTarget("ARM float ABI unknown: no header flags and no .ARM.attributes")
+            if vfp_args == 2:
+                raise UnsupportedTarget("ARM float ABI is toolchain-specific (Tag_ABI_VFP_args=2)")
+            # 3 = no floating-point arguments or results: both conventions agree.
+            float_flags = 0x400 if vfp_args == 1 else 0x200
+            elf = {**elf, "float_abi_evidence": f"Tag_ABI_VFP_args={vfp_args}"}
         if float_flags == 0x600:
             raise UnsupportedTarget("contradictory ARM soft/hard-float ABI flags")
         hard = float_flags == 0x400
@@ -502,6 +603,9 @@ def _type_size(typ: ir.Type) -> int:
 
 
 def _get_name_cached(ea):
+    if database_guard is not None and ea in database_guard.pristine_names:
+        # 反编译会改变该处的数据项和占位名：用 warm_up() 记录的原名，与提升顺序无关
+        return database_guard.pristine_names[ea]
     name = name_cache.get(ea)
     if name is None:
         name = ida_name.get_name(ea)
@@ -653,6 +757,11 @@ def _lift_tif_uncached(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
         return _lift_udt(tif)
 
     elif tif.is_bool():
+        # Hex-Rays 的 _BOOL2/_BOOL4/_BOOL8 占 2/4/8 字节（整个寄存器 / 内存单元都会被写入），
+        # 映射成 i1 会让 8 字节写入越过 1 字节的存储槽（LLVM 中是未定义行为）
+        size = tif.get_size()
+        if 1 < size <= 16 and size != ida_typeinf.BADSIZE:
+            return ir.IntType(size * 8)
         return ir.IntType(1)
 
     elif tif.is_char():
@@ -853,10 +962,58 @@ def _zero_initializer_for_type(typ: ir.Type):
     return ir.Constant(typ, None)
 
 
-def _local_storage_type(typ: ir.Type) -> ir.Type:
+def _local_storage_type(typ: ir.Type, width: int = 0) -> ir.Type:
+    """
+    lvar 的存储槽类型。width 是 Hex-Rays 给出的 lvar 字节宽度：整数槽至少这么宽，
+    否则按 lvar 宽度写入（如 8 字节的 result 写到 1 字节 bool 槽）会越界。
+    """
     if isinstance(typ, ir.IntType) and typ.width == 1:
-        return ir.IntType(32)
+        typ = ir.IntType(32)
+    if isinstance(typ, ir.IntType) and width * 8 > typ.width:
+        typ = ir.IntType(width * 8)
     return typ
+
+
+def _result_storage_type(ret_type: ir.Type, width: int) -> ir.Type:
+    """
+    funcresult 的存储槽类型：返回类型为整数时至少容纳 result lvar 的宽度（mips64 上 bool 函数的
+    result lvar 是 8 字节的 $v0），i1 按字节存储；返回时整体加载再截断成返回类型。
+    """
+    if isinstance(ret_type, ir.IntType):
+        return ir.IntType(max((ret_type.width + 7) // 8 * 8, width * 8))
+    return ret_type
+
+
+def _lvar_key(idx: int, lvar) -> object:
+    """lvar 存储槽在 func.lvars 中的键：result 共用 funcresult，其余按 mba.vars 下标。"""
+    return "funcresult" if lvar.is_result_var else ("lvar", int(idx))
+
+
+def _register_view_offset(lvar, slot: ir.Value, off: int, size: int) -> int:
+    """
+    寄存器 lvar 的偏移按数值计（off 0 是最低有效字节，与 mreg 编号一致：mips32 的 64 位 lvar
+    $v1.8 中 off 0 是低位字 $v1）。存储槽在内存中按目标字节序排列，大端目标上数值的低位字节在槽的末尾，
+    所以把数值偏移换成内存偏移；栈上 lvar 的偏移本来就是内存偏移，不变。
+    越过存储槽的访问拒绝，不生成越界的 load/store。
+    """
+    if size <= 0 or not isinstance(slot.type, ir.PointerType):
+        return off
+    pointee = slot.type.pointee
+    slot_size = _type_size(pointee)
+    if off < 0 or off + size > slot_size:
+        raise UnsupportedMicrocode("lvar_access_out_of_bounds",
+                                   f"{lvar.name} off {off} size {size} slot {slot_size}")
+    if is_big_endian and size < slot_size and not lvar.location.is_stkoff():
+        floating = True
+        with suppress(Exception):
+            floating = lvar.tif.is_floating()
+        if floating:
+            # 浮点寄存器（对）的部分访问（ppc32 IBM long double 的 f1:f2 两半等）：两半在数值中的
+            # 顺序没有核实，不猜测
+            raise UnsupportedMicrocode("big_endian_fp_register_subview", f"{lvar.name} off {off} size {size}")
+        if isinstance(pointee, (ir.IntType, ir.PointerType)):
+            return slot_size - off - size
+    return off
 
 
 def storecast(src, dst, builder):
@@ -962,36 +1119,66 @@ def _default_function_tinfo() -> ida_typeinf.tinfo_t:
     return function_tinfo
 
 
+def _declared_function_type(ea: int):
+    """
+    调用点使用的函数类型：只取数据库原有的类型信息（不含任何反编译结果）。数据库中没有存储类型的本地
+    函数返回 None：IDA 对它的猜测不可靠（如把返回 double 的 c_strtod 猜成返回整数），调用点改用
+    Hex-Rays 对该次调用的调用信息（_lift_call），它同样不依赖处理顺序。
+    """
+    if ea in functions_without_stored_type:
+        return None
+    if _get_func_cached(ea) is not None and _is_extern_segment(ea):
+        # 导入函数：用 IDA 类型库给出的原型（如变参的 snprintf），与 initialize() 中建立的声明一致
+        tif = function_signature_cache.get(ea) or _default_function_tinfo()
+        if not (tif.is_func() or tif.is_funcptr()):
+            tif = _default_function_tinfo()
+    else:
+        tif = _stored_function_tinfo(ea)
+    if tif.is_funcptr():
+        tif = tif.get_ptrarr_object()
+    if not tif.is_func():
+        tif = _default_function_tinfo()
+    return lift_tif(tif)
+
+
+def _stored_function_tinfo(ea: int):
+    """
+    数据库原有的类型：函数的类型在 initialize() 中、任何反编译之前取得（见 function_signature_cache），
+    之后的反编译改写不影响它；被反编译改写过类型的其他地址取 warm_up() 记录的原类型；其余按当前数据库查询。
+    """
+    if _get_func_cached(ea) is not None and _is_extern_segment(ea):
+        # 假设这是一个返回void且接受可变参数的函数
+        return _default_function_tinfo()
+    cached_tif = function_signature_cache.get(ea)
+    if cached_tif is not None:
+        return cached_tif
+    if database_guard is not None and ea in database_guard.pristine:
+        return database_guard.pristine[ea]
+    tif = ida_typeinf.tinfo_t()
+    if not ida_nalt.get_tinfo(tif, ea):
+        ida_typeinf.guess_tinfo(tif, ea)
+    return tif
+
+
 def lift_type_from_address(ea: int, pfunc=None):
     """从地址获取类型信息。"""
     if _get_func_cached(ea) != None and _is_extern_segment(ea):
-        # 假设这是一个返回void且接受可变参数的函数
         return _default_function_tinfo()
 
+    # 反编译得到的原型只用于该函数自身（正在提升的函数在 ptext 中）；其他函数看到的始终是数据库原有的
+    # 类型，与哪些函数先被提升无关
     if pfunc is not None and getattr(pfunc, "type", None) is not None:
-        function_signature_cache[ea] = pfunc.type
         return pfunc.type
 
     if ea in ptext:
         pfunc_cached = ptext.get(ea)
         if pfunc_cached is not None and getattr(pfunc_cached, "type", None) is not None:
-            function_signature_cache[ea] = pfunc_cached.type
             return pfunc_cached.type
         # Stale or invalid cache entry, drop and fall back to IDA type info.
         with suppress(KeyError):
             del ptext[ea]
 
-    cached_tif = function_signature_cache.get(ea)
-    if cached_tif is not None:
-        return cached_tif
-            
-    tif = ida_typeinf.tinfo_t()
-    has_tinfo = ida_nalt.get_tinfo(tif, ea)
-    if not has_tinfo:
-        ida_typeinf.guess_tinfo(tif, ea)
-    if tif.is_func() or tif.is_funcptr():
-        function_signature_cache[ea] = tif
-    return tif
+    return _stored_function_tinfo(ea)
 
 def analyze_insn(module, ida_insn, ea):
     """
@@ -1139,9 +1326,94 @@ def _collect_lvar_accesses(ins, lvars):
     return collector.uses, collector.call, collector.defs, collector.reg_defs
 
 
+def _record_arg_regs(ea, cfunc):
+    """
+    warm_up(): the registers a function reads as fixed arguments, and whether it is variadic, from its own
+    decompilation with the pristine database (so independent of lifting order). Hex-Rays makes every
+    register live at entry an argument.
+    """
+    fi = ida_typeinf.func_type_data_t()
+    if cfunc is None or not cfunc.type.get_func_details(fi):
+        return
+    regs = set()
+    for arg in fi:
+        loc = arg.argloc
+        if loc.is_reg1():
+            regs.add(int(loc.reg1()))
+        elif loc.is_reg2():
+            regs.update((int(loc.reg1()), int(loc.reg2())))
+        elif not loc.is_stkoff():
+            return
+    callee_arg_regs[ea] = (frozenset(regs), bool(cfunc.type.is_vararg_cc()))
+
+
+_ABI_RETURN_REG_NAMES = {
+    ("x86", 64): ("rax", "rdx"), ("x86", 32): ("eax", "edx"), ("arm", 32): ("R0", "R1", "R2", "R3"),
+    ("arm", 64): tuple(f"X{i}" for i in range(9)), ("mips", 32): ("$v0", "$v1"), ("mips", 64): ("$v0", "$v1"),
+}
+
+
+def _abi_return_regs():
+    """Processor registers that can carry a call's return value on the source ABI, or None if unknown."""
+    names = _ABI_RETURN_REG_NAMES.get((source_family, ptrsize))
+    regs = {ida_idp.str2reg(name) for name in names} if names else {-1}
+    return None if -1 in regs else regs
+
+
+_unread_arg_collector_class = None
+
+
+def _unread_call_args(ins, lvars):
+    """
+    Register lvars passed directly as arguments of direct calls outside the callee's fixed parameters,
+    as {(idx, off, size): kind}. A callee without a stored type gets an argument list guessed at the call
+    site, which can include registers the caller never set (e.g. sk_num(a1, a2..a5) for int
+    sk_num(const _STACK *)). kind 1: the callee is not variadic and never reads the register. kind 2:
+    a variadic slot (BIO_snprintf(buf, n, "%019lu", x, r8...)), not a return-value register; the callee
+    can only read it through va_arg, see _entry_register_reads for when that is accepted.
+    """
+    global _unread_arg_collector_class
+    if _unread_arg_collector_class is None:
+        class Collector(ida_hexrays.minsn_visitor_t):
+            def __init__(self, lvars):
+                ida_hexrays.minsn_visitor_t.__init__(self)
+                self.lvars, self.found = lvars, []
+
+            def visit_minsn(self):
+                call = self.curins
+                if (call.opcode != ida_hexrays.m_call or call.l.t != ida_hexrays.mop_v
+                        or call.d.t != ida_hexrays.mop_f):
+                    return 0
+                info = callee_arg_regs.get(int(call.l.g))
+                if info is None:
+                    return 0
+                read, variadic = info
+                returns = _abi_return_regs() if variadic else None
+                for arg in call.d.f.args:
+                    if arg.t != ida_hexrays.mop_l or not arg.argloc.is_reg1() or int(arg.argloc.reg1()) in read:
+                        continue
+                    if variadic and (returns is None or int(arg.argloc.reg1()) in returns):
+                        continue
+                    width = self.lvars[arg.l.idx].width
+                    self.found.append(((arg.l.idx, int(arg.l.off), arg.size if arg.size > 0 else width), 2 if variadic else 1))
+                return 0
+
+        _unread_arg_collector_class = Collector
+    collector = _unread_arg_collector_class(lvars)
+    ins.for_all_insns(collector)
+    return collector.found
+
+
+_ENTRY_READ_RANK = [False, None, (), True]  # _entry_register_reads 的结果，按"更污染"排序
+
+
 def _entry_register_reads(mba):
     """
     找出在入口处尚未赋值就可能被读取的寄存器 lvar，返回 {lvar 下标: 是否被污染}。
+    被污染的值只流入被调函数不读的实参（见 _unread_call_args）时不拒绝，机器上这些寄存器里的值
+    对被调函数没有影响：非变参被调函数不读的寄存器记为 None；变参位置记为 ()，只在该路径上的值是
+    调用留下的（按 spoiled 列表，不是返回值寄存器），而不是别的 lvar / 原始寄存器写入的值时接受
+    （后者可能是 Hex-Rays 拆分出的、程序确实要传的实参）。
 
     Hex-Rays 按生存期把同一物理寄存器拆成多个 lvar。例如 `cbz x1,1f; ret; 1: mov x0,#-1; ret`
     中返回值 result 与参数 a1 都在 x0，cbz 不成立的路径不写 result 就返回，机器返回的是入口 x0。
@@ -1197,52 +1469,123 @@ def _entry_register_reads(mba):
         ins = blk.head
         while ins is not None:
             uses, call, defs, reg_defs = _collect_lvar_accesses(ins, lvars)
-            uses = [(idx, own(idx, off, size)) for idx, off, size in uses if idx in base]
+            unread = _unread_call_args(ins, lvars) if callee_arg_regs else []
+            tagged = []
+            for use in uses:
+                if use[0] in base:
+                    kind = next((k for u, k in unread if u == use), 0)
+                    if kind:
+                        unread.remove((use, kind))
+                    tagged.append((use[0], own(*use), kind))
+            uses = tagged
             kills = []
             for idx, off, size in defs:
                 location = lvars[idx].location
                 written = own(idx, off, size) if idx in base else 0
                 hit = clobbered(int(location.reg1()) + off, int(location.reg1()) + off + size) if location.is_reg1() else 0
-                # 写入的字节被定义；同一物理位置上其他 lvar 的字节、以及本 lvar 未写到的字节不再是入口值
-                kills.append((written, (hit | (whole[idx] if idx in base else 0)) & ~written))
+                # 写入的字节被定义；同一物理位置上其他 lvar 的字节、以及本 lvar 未写到的字节不再是入口值。
+                # 例外：x86 写 8/16 位子寄存器（setz al、mov ax 等）不改变寄存器的其余字节，
+                # 本 lvar 未写到的字节保持原状态（32 位写会把 x86-64 寄存器高 32 位清零，不在此列）
+                keeps_rest = source_family == "x86" and location.is_reg1() and 0 < size < 4
+                rest = 0 if keeps_rest or idx not in base else whole[idx]
+                kills.append((written, (hit | rest) & ~written))
             for start, end in reg_defs:
                 kills.append((0, clobbered(start, end)))
             seq.append((uses, spoiled_mask(call) if call else 0, kills))
             ins = ins.next
         if blk.type == ida_hexrays.BLT_STOP and results:
-            seq.append(([(idx, own(idx, off, size)) for idx, off, size in results if idx in base], 0, []))
+            seq.append(([(idx, own(idx, off, size), 0) for idx, off, size in results if idx in base], 0, []))
         events.append(seq)
 
     exposed = {}
     states = [None] * mba.qty
-    states[0] = (everything, 0)  # (入口值仍完好的未赋值字节, 入口值已被破坏的未赋值字节)
+    # (入口值仍完好的未赋值字节, 入口值已被破坏的未赋值字节, 其中被写入（而不是被调用）破坏的字节)
+    states[0] = (everything, 0, 0)
     work, queued = [0], {0}
     while work:
         index = work.pop()
         queued.discard(index)
-        clean, dirty = states[index]
+        clean, dirty, wdirty = states[index]
         for uses, spoiled, kills in events[index]:
-            for idx, mask in uses:
+            for idx, mask, kind in uses:
                 if (clean | dirty) & mask:
-                    exposed[idx] = exposed.get(idx, False) or bool(dirty & mask)
+                    previous = exposed.get(idx, False)
+                    if not dirty & mask:
+                        exposed[idx] = previous
+                    elif kind == 1 or (kind == 2 and not wdirty & mask):
+                        mark = None if kind == 1 else ()
+                        exposed[idx] = max(previous, mark, key=_ENTRY_READ_RANK.index)
+                    else:
+                        exposed[idx] = True
             if spoiled:
                 moved = clean & spoiled
                 clean, dirty = clean & ~moved, dirty | moved
+                wdirty &= ~spoiled
             for written, broken in kills:
                 clean, dirty = clean & ~written, dirty & ~written
+                wdirty = (wdirty & ~written) | ((clean | dirty) & broken)
                 moved = clean & broken
                 clean, dirty = clean & ~moved, dirty | moved
         blk = mba.get_mblock(index)
         for k in range(blk.nsucc()):
             succ = blk.succ(k)
             old = states[succ]
-            new = (clean, dirty) if old is None else (old[0] | clean, old[1] | dirty)
+            new = (clean, dirty, wdirty) if old is None else (old[0] | clean, old[1] | dirty, old[2] | wdirty)
             if new != old:
                 states[succ] = new
                 if succ not in queued:
                     queued.add(succ)
                     work.append(succ)
     return exposed
+
+
+_insn_ea_collector_class = None
+
+
+def _microcode_eas(mba) -> set:
+    """mba 中所有 microcode 指令（含嵌套子指令）的地址。"""
+    global _insn_ea_collector_class
+    if _insn_ea_collector_class is None:
+        class Collector(ida_hexrays.minsn_visitor_t):
+            def __init__(self):
+                ida_hexrays.minsn_visitor_t.__init__(self)
+                self.eas = set()
+
+            def visit_minsn(self):
+                self.eas.add(int(self.curins.ea))
+                return 0
+
+        _insn_ea_collector_class = Collector
+    collector = _insn_ea_collector_class()
+    for index in range(mba.qty):
+        ins = mba.get_mblock(index).head
+        while ins is not None:
+            ins.for_all_insns(collector)
+            ins = ins.next
+    return collector.eas
+
+
+def _check_mips_jtbl_delay_slots(mba):
+    """
+    MIPS 的 switch 跳转 `jr $at` 的延迟槽指令在跳转前执行，例如 clang -O2 的 c_ispunct 在
+    `jr $at` 的延迟槽里 `li $v0, 1`，所有 case 共用这个返回值。Hex-Rays 生成 jtbl 时把它丢掉，
+    伪代码返回的是此前 $v0 里的跳转表地址常量。延迟槽不是 nop、而 microcode 中没有任何指令来自
+    该地址时，按丢失处理并拒绝（延迟槽结果确实无用而被删除的情形也会被拒绝，这是保守的）。
+    """
+    if source_family != "mips":
+        return
+    eas = None
+    for index in range(mba.qty):
+        tail = mba.get_mblock(index).tail
+        if tail is None or tail.opcode != ida_hexrays.m_jtbl:
+            continue
+        slot = tail.ea + 4
+        if idc.get_item_size(tail.ea) != 4 or idc.print_insn_mnem(slot).lower() in ("nop", ""):
+            continue
+        if eas is None:
+            eas = _microcode_eas(mba)
+        if slot not in eas:
+            raise UnsupportedMicrocode("mips_jtbl_delay_slot_dropped", f"{slot:#x} {idc.GetDisasm(slot)}")
 
 
 def _init_entry_register_reads(func, lvars, entry_reads, builder):
@@ -1254,26 +1597,30 @@ def _init_entry_register_reads(func, lvars, entry_reads, builder):
     - 某条路径上寄存器已被调用 / 其他写入破坏（"被污染"）：机器值是被调函数留下的内容（Hex-Rays 丢失的
       返回值、变参调用的垃圾实参等），无法可靠恢复，拒绝整个函数，不输出已知错误的值。
     """
-    def slot_of(lvar):
-        return func.lvars.get("funcresult" if lvar.is_result_var else lvar.name)
+    def slot_of(idx):
+        return func.lvars.get(_lvar_key(idx, lvars[idx]))
 
     # 没有存储槽的 lvar（如 void 返回函数的 result）不会出现在 IR 里，不必因它拒绝
-    dirty = sorted(lvars[idx].name for idx, is_dirty in entry_reads.items()
-                   if is_dirty and slot_of(lvars[idx]) is not None)
+    dirty = sorted(lvars[idx].name or f"lv{idx}" for idx, is_dirty in entry_reads.items()
+                   if is_dirty and slot_of(idx) is not None)
     if dirty:
         raise UnsupportedMicrocode("register_reuse_unrecoverable", ", ".join(dirty[:8]))
     args = {}
     for idx in range(lvars.size()):
         lvar = lvars[idx]
         if lvar.is_arg_var and lvar.location.is_reg1():
-            name = "funcresult" if lvar.is_result_var else lvar.name
-            if name in func.lvars:
-                args[int(lvar.location.reg1())] = (lvar.width, func.lvars[name])
+            key = _lvar_key(idx, lvar)
+            if key in func.lvars:
+                args[int(lvar.location.reg1())] = (lvar.width, func.lvars[key])
     for idx in sorted(entry_reads):
         lvar = lvars[idx]
-        slot = slot_of(lvar)
+        slot = slot_of(idx)
         if slot is None:
             continue
+        if entry_reads[idx] is None:
+            _note_approx("register_garbage_to_unread_call_arg")
+        elif entry_reads[idx] == ():
+            _note_approx("register_garbage_to_vararg_slot")
         source = args.get(int(lvar.location.reg1()))
         if source is not None and (source[0] == lvar.width or (source[0] > lvar.width and not is_big_endian)):
             value = typecast(builder.load(source[1]), ir.IntType(lvar.width * 8), builder)
@@ -1333,6 +1680,7 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
                 return res
         
         mba = pfunc.mba
+        _check_mips_jtbl_delay_slots(mba)
         if isinstance(typ.return_type, ir.VoidType):
             inferred_ret = _infer_return_type_from_mba(mba)
             if inferred_ret is not None:
@@ -1368,18 +1716,22 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
         with builder.goto_entry_block():
             # declare function results as stack variable
             if not isinstance(typ.return_type, ir.VoidType):
-                res.lvars["funcresult"] = builder.alloca(typ.return_type, name = "funcresult")
-                builder.store(_zero_initializer_for_type(typ.return_type), res.lvars["funcresult"])
+                result_width = max((lv.width for lv in pfunc.lvars if lv.is_result_var), default=0)
+                result_t = _result_storage_type(typ.return_type, result_width)
+                res.lvars["funcresult"] = builder.alloca(result_t, name = "funcresult")
+                builder.store(_zero_initializer_for_type(result_t), res.lvars["funcresult"])
 
-            for lvar in list(pfunc.lvars): 
+            for idx, lvar in enumerate(list(pfunc.lvars)):
                 if lvar.is_result_var:
                     if lvar.is_arg_var and "funcresult" in res.lvars:
                         names.append("funcresult")
                     continue
-                arg_t = _local_storage_type(lift_tif(lvar.tif))
-                res.lvars[lvar.name] = builder.alloca(arg_t, name = lvar.name)
+                # 按 lvar 下标区分存储槽：Hex-Rays 不在伪代码中出现的 lvar 名字为空，按名字会让它们共用一个槽
+                key = _lvar_key(idx, lvar)
+                arg_t = _local_storage_type(lift_tif(lvar.tif), lvar.width)
+                res.lvars[key] = builder.alloca(arg_t, name = lvar.name or f"lv{idx}")
                 if lvar.is_arg_var:
-                    names.append(lvar.name)
+                    names.append(key)
 
             # if function is variadic, declare va_start intrinsic
             if tif.is_vararg_cc() and typ.var_arg:  
@@ -1422,7 +1774,8 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
                 if isinstance(typ.return_type, ir.VoidType):
                     builder.ret_void()
                 else:
-                    builder.ret(builder.load(res.lvars["funcresult"]))
+                    # 存储槽可能比返回类型宽：整体加载后按数值截断（大端上同样取低位）
+                    builder.ret(typecast(builder.load(res.lvars["funcresult"]), typ.return_type, builder))
         _finalize_nodefault_switches(res, builder)
         _require_terminated_blocks(res)
         stack_slot = res.lvars.get("stack")
@@ -1950,11 +2303,16 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
 
     assert func_ea != ida_idaapi.BADADDR
     if tif is None:
-        tif = lift_type_from_address(func_ea) 
-    elif tif.is_func() or tif.is_funcptr():
-        function_signature_cache[func_ea] = tif
+        tif = lift_type_from_address(func_ea)
 
-    typ = lift_tif(tif) 
+    if tif.is_funcptr():
+        tif = tif.get_ptrarr_object()
+    if not tif.is_func():
+        # 没有函数类型的调用目标（如 thunk 跳到 ARM kuser helper 0xffff0fa0，该地址不在任何段中）：
+        # 按无类型信息的外部函数声明。不能用非函数类型构造 ir.Function——名字已注册而对象没有加入模块，
+        # 之后每个引用它的函数都会因 DuplicatedNameError 失败
+        tif = _default_function_tinfo()
+    typ = lift_tif(tif)
     state_key = _function_state_key(func_name, func_ea)
 
     existing = None
@@ -1984,6 +2342,8 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
             logging.debug(f"Unexpected pointer type for function {func_name}: {typ}")
         res = ir.Function(module, typ, func_name)
         res._source_ea = func_ea
+        # 调用点使用的类型：数据库原有的原型，不随该函数是否已按反编译签名定义而变化
+        res._decl_ftype = _declared_function_type(func_ea)
 
     if str(module.triple).endswith("gnueabihf"):
         # A generic `arm` triple otherwise selects a pre-VFP CPU, and llc can
@@ -2063,9 +2423,9 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
     if t == ida_hexrays.mop_l: # 局部变量
         lvar_ref = mop.l
         lvar = lvar_ref.var()
-        name = "funcresult" if lvar.is_result_var else lvar.name
-        llvm_arg = blk.parent.lvars[name]
-        llvm_arg = get_offset_to(builder, llvm_arg, lvar_ref.off)
+        llvm_arg = blk.parent.lvars[_lvar_key(lvar_ref.idx, lvar)]
+        off = _register_view_offset(lvar, llvm_arg, int(lvar_ref.off), mop.size)
+        llvm_arg = get_offset_to(builder, llvm_arg, off)
         llvm_arg = _cast_slot(llvm_arg, mop.size, knowntyp, builder)
         return llvm_arg if dest else builder.load(llvm_arg)
     elif t == ida_hexrays.mop_n: # 立即数
@@ -2124,6 +2484,14 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
     elif t == ida_hexrays.mop_v: # 全局变量
         module = blk.parent.parent
         ea = mop.g
+        # thunk 一律解析到真实目标（与 _declare_function_at 一致）。先查模块再解析会让结果依赖 thunk 本身
+        # 是否已被提升过（调用 `.__assert_fail` 还是 `__assert_fail`）
+        via_thunk = False
+        func = _get_func_cached(ea)
+        if func is not None and func.start_ea == ea and func.flags & ida_funcs.FUNC_THUNK:
+            tfunc_ea, ptr = ida_funcs.calc_thunk_func_target(func)
+            if tfunc_ea != ida_idaapi.BADADDR:
+                ea, via_thunk = tfunc_ea, True
         name = _get_name_cached(ea)
         if name == "":
             name = f"data_{hex(ea)[2:]}"
@@ -2137,23 +2505,13 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
             is_func_start = func is not None and func.start_ea == ea
             is_xtrn = _is_extern_segment(ea)
             # 函数指针变量（非导入）按数据处理：作为调用目标时先加载其值再间接调用
-            if tif.is_func() or is_func_start or (tif.is_funcptr() and is_xtrn):
+            if via_thunk or tif.is_func() or is_func_start or (tif.is_funcptr() and is_xtrn):
                 if tif.is_funcptr():
                     tif = tif.get_ptrarr_object()
                 if not tif.is_func():
                     # 函数起始地址但 IDA 没有给出函数类型（如作为回调被取地址），
                     # 仍按函数处理，避免生成同名数据全局变量而丢掉函数定义
                     tif = _default_function_tinfo()
-                # if function is a thunk function, define the actual function instead
-                if ((func is not None)
-                and (func.flags & ida_funcs.FUNC_THUNK)):
-                    tfunc_ea, ptr = ida_funcs.calc_thunk_func_target(func)
-                    if tfunc_ea != ida_idaapi.BADADDR:
-                        ea = tfunc_ea
-                        name = _get_name_cached(ea)
-                        if name == "":
-                            name = f"data_{hex(ea)[2:]}"
-                        tif = lift_type_from_address(ea)
                 # 这里只需要确保函数符号存在。函数体统一在 insertAllFunctions() 中定义，
                 # 避免在提升调用点时递归进入被调函数体，导致深调用链压垮 Python 栈。
                 return lift_function(module, name, True, ea, tif)
@@ -2267,11 +2625,16 @@ def _make_cstr_global(module: ir.Module, text: str) -> ir.GlobalVariable:
         raw = text.encode("utf-8", "replace")
     raw += b"\x00"  # C 字符串字面量，原始二进制中以 \0 结尾
     str_type = ir.ArrayType(i8, len(raw))
-    while True:
-        name = f"cstr_{cstr_counter[0]}"
-        cstr_counter[0] += 1
-        if name not in module.globals:
-            break
+    # 名字取自内容（而非全局计数器），同一字符串在任何提升顺序下都得到同一个符号
+    digest = hashlib.sha1(raw).hexdigest()[:16]
+    name = f"cstr_{digest}"
+    existing = module.globals.get(name)
+    if isinstance(existing, ir.GlobalVariable) and existing.type.pointee == str_type:
+        return existing
+    k = 0
+    while name in module.globals:
+        k += 1
+        name = f"cstr_{digest}_{k}"
     g = ir.GlobalVariable(module, str_type, name=name)
     g.initializer = ir.Constant(str_type, bytearray(raw))
     g.linkage = "private"
@@ -2408,7 +2771,7 @@ def _store_to_address(value: ir.Value, address: ir.Value, builder: ir.IRBuilder)
     _set_conservative_alignment(store)
     return store
 
-def create_intrinsic_function(module: ir.Module, func_name: str, ftif):
+def create_intrinsic_function(module: ir.Module, func_name: str, ftif, builder: ir.IRBuilder = None):
     """
     为IDA辅助函数创建内置函数。
     """
@@ -2417,9 +2780,14 @@ def create_intrinsic_function(module: ir.Module, func_name: str, ftif):
     if var_arg:
         argtypes = argtypes[:int(ftif.solid_args)]
     rettype = lift_tif(ftif.return_type)
-    # 签名完全来自调用信息（宽度正确，void 就是 void），不再把 void 改成 i8*；
-    # 同名 helper 已按另一组调用信息声明过时，由 _lift_call 在调用点转换类型
-    return module.declare_intrinsic(func_name, fnty=ir.FunctionType(rettype, argtypes, var_arg=var_arg))
+    # 签名完全来自调用信息（宽度正确，void 就是 void），不再把 void 改成 i8*。
+    # 同名 helper 只声明一次（第一次见到的签名）；签名不同的调用点按本处的调用信息转换类型，
+    # 否则调用点的类型取决于哪个函数先被提升
+    fnty = ir.FunctionType(rettype, argtypes, var_arg=var_arg)
+    func = module.declare_intrinsic(func_name, fnty=fnty)
+    if builder is not None and func.type.pointee != fnty:
+        return builder.bitcast(func, fnty.as_pointer())
+    return func
 
 def float_type(size: int) -> ir.Type:
     """
@@ -2624,6 +2992,9 @@ def _shift_count_rule(width: int):
 # 改写后的除数在任何输入下都不为 0（有符号时也不是 INT_MIN / -1），Hex-Rays 只能推出恒真的事实：
 #   q = (x / (y + (y == 0) [+ 2 * (x == INT_MIN && y == -1)])) & ((y == 0) - 1)
 a64_rewritten_divisions = set()  # 被改写的原生除法指令地址；只有这些除法不需要"控制流未验证"标记
+# 当前函数中（AArch64 以外）原生除法指令地址 -> 除数操作数位宽；只允许以非异常常量为除数、
+# 且与原指令同宽的 microcode 除法，提升后仍未被这样的除法覆盖的地址使整个函数被拒绝
+native_divisions_pending = {}
 
 
 def _mc_number(value, size):
@@ -2803,12 +3174,248 @@ def _install_arm_carry_fix():
 
 
 # ============================================================================
+# 与处理顺序无关：每个函数都在反编译之前的数据库状态下反编译和提升。
+# ============================================================================
+
+class _DatabaseGuard(ida_idp.IDB_Hooks):
+    """
+    让每个函数都在同一个数据库状态下反编译。
+
+    Hex-Rays 反编译时会改写数据库：把推导出的原型存到本函数和被调函数上（PLT thunk 被存成 `int()`
+    后，之后反编译的调用者不再传实参）、给全局数据设类型 / 建数据项、改函数标志、改名等。这些改写
+    会影响之后反编译的其他函数，结果因此依赖处理顺序。begin() 之后记录每处改写之前的状态，restore()
+    按原样恢复（通过正常的 API，Hex-Rays 的缓存随之失效）。IDA 的 undo 不可用：撤销不通知 Hex-Rays，
+    之后的反编译出现 INTERR。
+    局部类型不能删除：Hex-Rays 按需从类型库导入类型（tm、sigset_t、__jmp_buf_tag、gcc_va_list、
+    __m128i 等），其中一部分每个会话只加一次，删除后不再补回（之后反编译出现 INTERR 或结果改变）；
+    而这些类型是否已存在又会改变其他函数的反编译。所以提升之前先用 warm_up() 把每个函数反编译一遍
+    （其余改写照常恢复），让所有需要的局部类型都先存在；提升时新增的局部类型数记在 new_local_types。
+    栈帧也要恢复：Hex-Rays 会按推导结果改写函数栈帧中的成员（如把 4 字节的栈上参数 arg_0 改成 8 字节），
+    之后反编译调用者时按被调函数的栈帧确定栈上实参。栈帧在 snapshot() 中（任何反编译之前）整体记录，
+    被改过的栈帧整体恢复；函数的 flags / 结束地址同样按 snapshot() 恢复，反编译中新建的函数删除。
+    已知残留：Hex-Rays 自身的内存状态不在数据库中，无法恢复（13 个测试 build × 3 种顺序中只见到一处，
+    mips64 curl 的 .MIPS.stubs 跳板 .__fdelt_chk）。
+    """
+
+    def __init__(self):
+        ida_idp.IDB_Hooks.__init__(self)
+        self.active = False
+        self.restoring = False
+        self.types = {}      # ea -> (tinfo 或 None, aflags)：aflags 含 Hex-Rays 的"类型已推导"标记
+        self.op_types = {}   # (ea, n) -> tinfo 或 None
+        self.names = {}      # ea -> 原名
+        self.items = {}      # ea -> flags：被改成数据项之前的状态
+        self.frames = {}     # 函数起始地址 -> 反编译之前的栈帧成员 [(偏移, 大小, 名字, tinfo, 是否特殊成员)]
+        self.frame_sizes = {}
+        self.touched_frames = set()
+        self.func_state = {}     # 函数起始地址 -> 反编译之前的 (flags, end_ea)
+        self.touched_funcs = set()
+        self.added_funcs = []    # 窗口中新建的函数（如 ppc64 上反编译时识别出的 thunk）
+        self.ordinal_limit = 0
+        self.new_local_types = 0
+        # warm_up() 中记录：被某次反编译改写过类型的地址 -> 改写之前的类型（没有则为 IDA 的猜测）。
+        # 提升时在函数窗口内新建的全局变量按这份类型，而不是按当前函数反编译后改写的类型
+        self.pristine = {}
+        self.pristine_names = {}
+        self.recording_pristine = False
+        self.error = None
+
+    @staticmethod
+    def _frame_members(pfn):
+        frame = ida_typeinf.tinfo_t()
+        if pfn is None or not frame.get_func_frame(pfn):
+            return None
+        udt = ida_typeinf.udt_type_data_t()
+        if not frame.get_udt_details(udt):
+            return None
+        out = []
+        for i in range(udt.size()):
+            m = udt[i]
+            out.append((m.offset // 8, m.size // 8, m.name, ida_typeinf.tinfo_t(m.type),
+                        ida_frame.is_special_frame_member(frame.get_udm_tid(i))))
+        return out
+
+    @staticmethod
+    def _members_key(members):
+        return None if members is None else [(o, n, sz, str(t), sp) for o, sz, n, t, sp in members]
+
+    def snapshot(self, func_eas):
+        for ea in func_eas:
+            pfn = ida_funcs.get_func(ea)
+            if pfn is None:
+                continue
+            self.frames[ea] = self._frame_members(pfn)
+            self.frame_sizes[ea] = (pfn.frsize, pfn.frregs, pfn.argsize)
+            self.func_state[ea] = (pfn.flags, pfn.end_ea)
+
+    def _frame_event(self, func_ea):
+        if self._watching():
+            self.touched_frames.add(func_ea)
+        return 0
+
+    def func_updated(self, pfn):
+        if self._watching():
+            self.touched_funcs.add(pfn.start_ea)
+        return 0
+
+    def func_added(self, pfn):
+        if self._watching():
+            self.added_funcs.append(pfn.start_ea)
+            if self.recording_pristine and pfn.start_ea not in self.pristine_names:
+                self.pristine_names[pfn.start_ea] = ida_name.get_name(pfn.start_ea)
+        return 0
+
+    def frame_udm_changed(self, func_ea, udm_tid, udmold, udmnew):
+        return self._frame_event(func_ea)
+
+    def frame_udm_created(self, func_ea, udm):
+        return self._frame_event(func_ea)
+
+    def frame_udm_deleted(self, func_ea, udm_tid, udm):
+        return self._frame_event(func_ea)
+
+    def frame_udm_renamed(self, func_ea, udm, oldname):
+        return self._frame_event(func_ea)
+
+    def frame_created(self, func_ea):
+        return self._frame_event(func_ea)
+
+    def frame_expanded(self, func_ea, udm_tid, delta):
+        return self._frame_event(func_ea)
+
+    def _restore_frame(self, func_ea):
+        pfn = ida_funcs.get_func(func_ea)
+        if pfn is None or func_ea not in self.frames:
+            return
+        old = self.frames[func_ea]
+        if old is None:
+            if self._frame_members(pfn) is not None:
+                ida_frame.del_frame(pfn)
+            return
+        if self._members_key(self._frame_members(pfn)) == self._members_key(old):
+            return
+        size = self.frame_sizes[func_ea]
+        if (pfn.frsize, pfn.frregs, pfn.argsize) != size:
+            ida_frame.set_frame_size(pfn, *size)
+        for off, sz, name, tif, special in self._frame_members(pfn) or ():
+            if not special:
+                ida_frame.delete_frame_members(pfn, off, off + max(sz, 1))
+        # 特殊成员不能直接添加：ARM 变参函数反编译后 Hex-Rays 会删掉 __saved_registers（frsize / frregs /
+        # argsize 不变）。把 frregs 置 0 再设回，IDA 按原大小重建保存寄存器区。只在特殊成员对不上时执行，
+        # 此时普通成员已删除，不会被移动
+        special_key = lambda members: [m for m in self._members_key(members) or () if m[4]]
+        if special_key(self._frame_members(pfn)) != special_key(old) and size[1]:
+            ida_frame.set_frame_size(pfn, size[0], 0, size[2])
+            pfn = ida_funcs.get_func(func_ea)
+            ida_frame.set_frame_size(pfn, *size)
+            pfn = ida_funcs.get_func(func_ea)
+        for off, sz, name, tif, special in old:
+            if not special:
+                ida_frame.add_frame_member(pfn, name, off, tif)
+        if self._members_key(self._frame_members(pfn)) != self._members_key(old):
+            raise RuntimeError(f"cannot restore the stack frame of {func_ea:#x}")
+
+    def begin(self):
+        self.types.clear(); self.op_types.clear(); self.names.clear(); self.items.clear()
+        self.touched_frames.clear()
+        self.touched_funcs.clear()
+        self.added_funcs.clear()
+        self.ordinal_limit = ida_typeinf.get_ordinal_limit()
+        self.active = True
+
+    def _watching(self):
+        return self.active and not self.restoring
+
+    def changing_ti(self, ea, new_type, new_fnames):
+        if self._watching() and ea not in self.types:
+            tif = ida_typeinf.tinfo_t()
+            has = ida_nalt.get_tinfo(tif, ea)
+            self.types[ea] = (tif if has else None, ida_nalt.get_aflags(ea))
+            self._remember_item(ea)
+            if self.recording_pristine and ea not in self.pristine:
+                # 名字也在改写之前记录：IDA 的占位名随数据项类型变化（unk_X -> byte_X）
+                self.pristine_names[ea] = ida_name.get_name(ea)
+                if not has:
+                    ida_typeinf.guess_tinfo(tif, ea)
+                self.pristine[ea] = tif
+        return 0
+
+    def changing_op_ti(self, ea, n, new_type, new_fnames):
+        if self._watching() and (ea, n) not in self.op_types:
+            tif = ida_typeinf.tinfo_t()
+            self.op_types[(ea, n)] = tif if ida_nalt.get_op_tinfo(tif, ea, n) else None
+        return 0
+
+    def renamed(self, ea, new_name, local_name, old_name):
+        if self._watching() and ea not in self.names:
+            self.names[ea] = old_name or ""
+            if self.recording_pristine and old_name and ea not in self.pristine_names:
+                self.pristine_names[ea] = old_name
+        return 0
+
+    def _remember_item(self, ea):
+        if ea not in self.items:
+            self.items[ea] = ida_bytes.get_flags(ea)
+
+    def restore(self):
+        self.active = False
+        self.restoring = True
+        try:
+            for (ea, n), tif in self.op_types.items():
+                if tif is None:
+                    ida_nalt.del_op_tinfo(ea, n)
+                else:
+                    ida_nalt.set_op_tinfo(ea, n, tif)
+            for ea, (tif, aflags) in self.types.items():
+                if tif is None:
+                    ida_nalt.del_tinfo(ea)
+                else:
+                    ida_nalt.set_tinfo(ea, tif)
+                ida_nalt.set_aflags(ea, aflags)
+            for ea, flags in self.items.items():
+                # 给未定义字节设类型时 IDA 会在该处建立数据项；恢复成未定义
+                if ida_bytes.is_unknown(flags) and not ida_bytes.is_unknown(ida_bytes.get_flags(ea)):
+                    ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, max(ida_bytes.get_item_size(ea), 1))
+            for ea, name in self.names.items():
+                ida_name.set_name(ea, name, ida_name.SN_NOCHECK | ida_name.SN_NOWARN)
+            for func_ea in sorted(self.touched_frames):
+                self._restore_frame(func_ea)
+            for func_ea in self.added_funcs:
+                if func_ea not in self.func_state:
+                    ida_funcs.del_func(func_ea)
+            for func_ea in sorted(self.touched_funcs):
+                pfn = ida_funcs.get_func(func_ea)
+                if pfn is None or func_ea not in self.func_state:
+                    continue
+                flags, end = self.func_state[func_ea]
+                if pfn.end_ea != end:
+                    ida_funcs.set_func_end(func_ea, end)
+                    pfn = ida_funcs.get_func(func_ea)
+                if pfn.flags != flags:
+                    pfn.flags = flags
+                    ida_funcs.update_func(pfn)
+            self.new_local_types += max(ida_typeinf.get_ordinal_limit() - self.ordinal_limit, 0)
+            # 窗口中查询过的名字 / 函数对象可能反映了刚被恢复的改写（被删掉的函数对象不能再用）
+            for ea in set(self.types) | set(self.names) | set(self.items) | set(self.added_funcs) | self.touched_funcs:
+                name_cache.pop(ea, None)
+                func_cache.pop(ea, None)
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self.restoring = False
+
+
+database_guard = None
+
+
+# ============================================================================
 # 循环移位：clang -O0 把 C 的 ROTATE(x, n) 编译成 (x << n) | (x >> (W - n)) 三条指令，不用 rol/ror。
 # Hex-Rays 的局部优化在这种展开的移位链上耗时急剧增长（OpenSSL SM3 的 64 轮展开要数小时以上），
 # 而同样的源码编译成 rol（gcc，或 clang -O1+）只要几秒。在局部优化之前把这种模式改写成 Hex-Rays
 # 自己表示 rol 的 __ROLn__ helper 调用（lift 时翻译成 llvm.fshl），语义不变。
 # 改写会改变 Hex-Rays 对该函数的类型推断（进而影响调用者），所以只对指定的函数启用。
 # ============================================================================
+
 
 def _rotate_fix_from_env() -> frozenset:
     """
@@ -3212,6 +3819,49 @@ def _constant_int_bits(value, depth=4):
     return bits & mask
 
 
+_NATIVE_DIVISION_MNEMONICS = ("udiv", "sdiv", "div", "idiv", "divu", "ddiv", "ddivu")
+
+
+def _native_division_width(ea, mnemonic):
+    """原生除法指令的除数位宽；无法确定时返回 -1（microcode 宽度永远不会与之相等，即拒绝）。"""
+    if source_family == "mips":
+        return 64 if mnemonic.startswith("dd") else 32
+    if source_family == "x86":
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, ea) and insn.ops[0].type != ida_ua.o_void:
+            # div/idiv r/m：唯一显式操作数是除数，被除数是两倍宽的 (e/r)dx:(e/r)ax
+            return ida_ua.get_dtype_size(insn.ops[0].dtype) * 8
+    return -1
+
+
+_MIPS_HILO_WRITER = re.compile(
+    r"(d?divu?|d?multu?|maddu?|msubu?|mt(hi|lo)|mthlip|shilov?|dp|mulsa|maq_|madd_|msub_)")
+
+
+def _native_division_ea(ea):
+    """
+    The native division a microcode division at `ea` stands for. MIPS div/divu only set HI/LO;
+    after optimization Hex-Rays may attribute the division to the mflo/mfhi that reads the result.
+    Walk back over straight-line code (no jump target, no other HI/LO writer) to the division that
+    set HI/LO; anything else keeps `ea`, which leaves the native division unresolved (rejected).
+    """
+    if not native_divisions_pending or ea in native_divisions_pending or source_family != "mips":
+        return ea
+    if idc.print_insn_mnem(ea).lower() not in ("mflo", "mfhi"):
+        return ea
+    cur = ea
+    for _ in range(16):
+        if not ida_bytes.is_flow(ida_bytes.get_flags(cur)) or any(True for _ in idautils.CodeRefsTo(cur, 0)):
+            return ea
+        cur = idc.prev_head(cur, 0)
+        if cur == idc.BADADDR:
+            return ea
+        mnemonic = idc.print_insn_mnem(cur).lower()
+        if _MIPS_HILO_WRITER.match(mnemonic) or "$ac" in idc.GetDisasm(cur).lower():
+            return cur if cur in native_divisions_pending else ea
+    return ea
+
+
 def _lift_division(op, lhs, rhs, builder, ea):
     # Hex-Rays reconstructs / and % from multiply/shift sequences. For these
     # non-exceptional constants, LLVM arithmetic is defined on every input and
@@ -3219,6 +3869,16 @@ def _lift_division(op, lhs, rhs, builder, ea):
     bits = _constant_int_bits(rhs)
     if (op in ("udiv", "sdiv", "urem", "srem") and bits is not None and bits != 0
             and not (op.startswith("s") and bits == (1 << rhs.type.width) - 1)):
+        native = _native_division_ea(ea)
+        width = native_divisions_pending.get(native)
+        if width is not None:
+            # 原生除法指令（x86 div/idiv、MIPS div/ddiv 等）：除数为非零、（有符号时）非 -1 的常量，
+            # 商不会溢出且没有除零，任何目标上结果都与 LLVM 运算相同；但 microcode 的宽度必须与原指令
+            # 的除数宽度一致（x86 的 edx:eax / r32 若被表示成 64 位除法，商溢出时机器会异常）
+            if lhs.type.width != width:
+                raise UnsupportedMicrocode("division_machine_semantics_unresolved",
+                                           f"constant divisor at {ea:#x}: width {lhs.type.width} vs native {width}")
+            native_divisions_pending[native] = 0
         return getattr(builder, op)(lhs, ir.Constant(rhs.type, bits))
     # LVARS may already have discarded guards using C undefined-behaviour
     # assumptions, unless the early A64 hook rewrote this native division.
@@ -3432,11 +4092,16 @@ def _lift_ext(ida_insn, l, r, d, blk, builder):
 def _lift_call(ida_insn, l, d, blk, builder, result_type):
     rets, args = d
     _check_single_retreg(ida_insn)
-    if not isinstance(l.type, ir.PointerType) or not isinstance(l.type.pointee, ir.FunctionType):
-        # 被调目标没有函数类型：签名来自 mcallinfo，不再统一假定返回 i8*
+    if (not isinstance(l.type, ir.PointerType) or not isinstance(l.type.pointee, ir.FunctionType)
+            or (hasattr(l, "_decl_ftype") and l._decl_ftype is None)):
+        # 被调目标没有函数类型、或数据库中原本没有它的类型：签名来自 mcallinfo，不再统一假定返回 i8*
         ftype = _callinfo_signature(ida_insn, args)
         l = typecast(l, ftype.as_pointer(), builder)
     else:
+        declared = getattr(l, "_decl_ftype", None)
+        if declared is not None and declared != l.type.pointee:
+            # 被调函数已按反编译签名定义：调用点仍按声明类型调用，结果与提升顺序无关
+            l = typecast(l, declared.as_pointer(), builder)
         ftype = l.type.pointee
         callinfo_ret = _callinfo_return_type(ida_insn)
         # 调用信息里结果宽度为 0（如 "=> int .0"）表示本调用点不使用返回值，此时返回类型不影响语义
@@ -3537,7 +4202,7 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
                 _store_as(value, rets[0], blk, builder)
             return value
         _note_helper(l_mop.helper)
-        l = create_intrinsic_function(blk.parent.parent, l_mop.helper, d_mop.f)
+        l = create_intrinsic_function(blk.parent.parent, l_mop.helper, d_mop.f, builder)
 
     if next_blk is None:
         next_blk = getattr(blk, "next_blk", None)
@@ -3826,6 +4491,29 @@ class BIN2LLVMController():
         for f_ea in function_eas:
             self.insertFunctionAtEa(f_ea)
 
+    def warm_up(self):
+        """
+        提升前把每个函数反编译一遍，只留下 Hex-Rays 导入的局部类型（其余改写由 database_guard 恢复），
+        使每个函数提升时面对的局部类型集合相同，与处理顺序无关（见 _DatabaseGuard）。
+        """
+        if database_guard is None:
+            return
+        database_guard.recording_pristine = True
+        for ea in sorted(self._function_eas or list(idautils.Functions())):
+            if self._get_name(ea) in decompile_skip:
+                continue
+            database_guard.begin()
+            try:
+                _record_arg_regs(ea, ida_hexrays.decompile(ea))
+            except Exception as e:
+                logging.debug(f"warm-up decompile {ea:#x}: {e}")
+            finally:
+                ida_hexrays.mark_cfunc_dirty(ea, False)
+                database_guard.restore()
+        ida_hexrays.clear_cached_cfuncs()
+        database_guard.recording_pristine = False
+        database_guard.new_local_types = 0
+
     def _decompile_function(self, ea):
         no_cache = ea in refreshed_funcs
         if no_cache:
@@ -3835,7 +4523,6 @@ class BIN2LLVMController():
             pfunc = ida_hexrays.decompile(ea)
         if pfunc is not None and getattr(pfunc, "type", None) is not None:
             ptext[ea] = pfunc
-            function_signature_cache[ea] = pfunc.type
         return pfunc
 
     def _drop_partial_definition(self, ea):
@@ -3861,6 +4548,8 @@ class BIN2LLVMController():
         current_approx.clear()
         # segment 让 Task 3 按段排除非样本函数（PLT 跳板、.init/.fini）；IR 里照常定义，其他函数仍调用它们
         record = {"ea": hex(ea), "name": self._get_name(ea), "segment": _segment_name(ea)}
+        if database_guard is not None:
+            database_guard.begin()
         try:
             if record["name"] in decompile_skip:
                 # decompile() 一旦进入就无法超时或中断，只能在调用前跳过
@@ -3868,11 +4557,14 @@ class BIN2LLVMController():
             # Scan original instructions, including ones that disappear before
             # LVARS. Linear in function size; retain no per-instruction cache.
             native_divisions = []
+            native_divisions_pending.clear()
             for item in idautils.FuncItems(ea):
-                if idc.print_insn_mnem(item).lower() in ("udiv", "sdiv", "div", "idiv", "divu", "ddiv", "ddivu"):
+                mnemonic = idc.print_insn_mnem(item).lower()
+                if mnemonic in _NATIVE_DIVISION_MNEMONICS:
                     if source_family != "arm" or ptrsize != 64:
-                        raise UnsupportedMicrocode("division_machine_semantics_unresolved",
-                                                   f"native division at {item:#x}")
+                        # 先记录，按 microcode 中的除数决定（见 _lift_division）
+                        native_divisions_pending[item] = _native_division_width(item, mnemonic)
+                        continue
                     native_divisions.append(item)
             pfunc = ptext.get(ea)
             if pfunc is None or getattr(pfunc, "type", None) is None:
@@ -3889,9 +4581,14 @@ class BIN2LLVMController():
                 _note_approx("hexrays_division_control_flow_unverified")
 
             typ = pfunc.type
-            function_signature_cache[ea] = typ
             func_name = self._get_name(ea)
             lifted = lift_function(self.m, func_name, False, ea, typ)
+            unresolved = sorted(item for item, width in native_divisions_pending.items() if width != 0)
+            if unresolved:
+                # 没有被同宽、非异常常量除数的 microcode 除法覆盖的原生除法：除零 / 溢出的机器语义
+                # （x86 异常、MIPS/PPC 结果未定义）无法确定，Hex-Rays 也可能已按 C 的 UB 假设删掉判断
+                raise UnsupportedMicrocode("division_machine_semantics_unresolved",
+                                           f"native division at {unresolved[0]:#x}")
             defined = isinstance(lifted, ir.Function) and not lifted.is_declaration
             self._stream_function_if_enabled(lifted)
             if defined:
@@ -3923,6 +4620,8 @@ class BIN2LLVMController():
             self._trim_ptext()
             # 释放 Hex-Rays 内部缓存的 cfunc，不影响后续反编译结果，显著降低峰值内存
             ida_hexrays.mark_cfunc_dirty(ea, False)
+            if database_guard is not None:
+                database_guard.restore()
 
     def create_global(self, ea, width, str_dict, pending):
         """
@@ -4014,13 +4713,17 @@ class BIN2LLVMController():
         Note: Decompilation may fail for some functions (e.g., library stubs,
         corrupted code), which are silently skipped.
         """
-        # 步骤1：收集函数地址和IDA已有签名；函数体按需反编译，避免长期持有所有pfunc/mba。
+        # 步骤1：收集函数地址和反编译之前数据库中的类型（已有的或 IDA 猜测的）。之后其他函数看到的
+        # 都是这份类型，与提升顺序无关；函数体按需反编译，避免长期持有所有pfunc/mba。
         self._function_eas = list(idautils.Functions())
         for func in self._function_eas:
             tif = ida_typeinf.tinfo_t()
             try:
-                if ida_nalt.get_tinfo(tif, func) and (tif.is_func() or tif.is_funcptr()):
-                    function_signature_cache[func] = tif
+                if not ida_nalt.get_tinfo(tif, func):
+                    if not _is_extern_segment(func):
+                        functions_without_stored_type.add(func)
+                    ida_typeinf.guess_tinfo(tif, func)
+                function_signature_cache[func] = tif
             except Exception as e:
                 logging.debug(f"在 {hex(func)} 处获取函数签名失败: {e}")
 
@@ -4270,7 +4973,7 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
     旧 sidecar 的 sha256 不一致，同样被拒绝。返回 sidecar 内容。
     """
     _reset_lift_state()
-    global decompile_skip
+    global decompile_skip, database_guard
     decompile_skip = _decompile_skip_from_env()
     rotate_fix = _rotate_fix_from_env()
     started = time.time()
@@ -4307,6 +5010,10 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
         division_hook = _install_a64_division_fix()
         rotate_hook = _install_rotate_fix(rotate_fix)
         _apply_arm_runtime_types()
+        database_guard = _DatabaseGuard()
+        database_guard.snapshot(idautils.Functions())
+        if not database_guard.hook():
+            raise RuntimeError("cannot install the database guard hook")
         # IDB 中可能保存着以前的反编译结果：直接复用不会触发 microcode 事件（早期 hook 不生效），
         # 且与全新反编译的类型推断不同，使输出依赖 IDB 的缓存状态。清空后每个函数在本次运行中
         # 全新反编译一次（与 task1 新生成、本无缓存的 IDB 相同），运行内仍复用内存缓存
@@ -4329,13 +5036,19 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
         if rotate_fix:
             header.append("rotate_fix=" + ",".join(sorted(rotate_fix)))
         bin2llvm.begin_stream_to_file(tmp, header)
+        warm_started = time.time()
+        bin2llvm.warm_up()
+        result["warm_up_s"] = round(time.time() - warm_started, 3)
         bin2llvm.insertAllFunctions()
+        result["local_types_added_during_lift"] = database_guard.new_local_types
         if carry_hook is not None and carry_hook.error is not None:
             raise RuntimeError("ARM carry normalization failed: " + carry_hook.error)
         if division_hook is not None and division_hook.error is not None:
             raise RuntimeError("AArch64 division normalization failed: " + division_hook.error)
         if rotate_hook is not None and rotate_hook.error is not None:
             raise RuntimeError("rotate normalization failed: " + rotate_hook.error)
+        if database_guard.error is not None:
+            raise RuntimeError("database state restore failed: " + database_guard.error)
         bin2llvm.finish_stream_to_file(fsync=True)
         # 校验前释放 IDA 数据库和 lifter 的模块/缓存：llvm-as 对大模块的峰值内存与 lifter 相当，
         # 避免两者同时驻留（逐函数记录先保存下来）
@@ -4378,6 +5091,9 @@ def run_lift(input_binary: str, output_llvm_ir: str, target_mode: str = "source"
             division_hook.unhook()
         if rotate_hook is not None:
             rotate_hook.unhook()
+        if database_guard is not None:
+            database_guard.unhook()
+            database_guard = None
         if bin2llvm is not None:
             with suppress(Exception):
                 bin2llvm.close_stream()
@@ -4465,6 +5181,11 @@ def main(
         help="source (default): source binary triple/data layout; host: legacy host-layout compatibility "
              "mode without memory-semantics conversion",
     ),
+    source_elf: str = typer.Option(
+        None, "--source-elf",
+        help="Original binary for an .i64 whose recorded input path no longer exists; read only when the ELF "
+             "header cannot decide the ABI (ARM float ABI from .ARM.attributes), after a sha256 check",
+    ),
 ):
     """
     作为独立应用程序运行（使用 IDA Pro 9+ idalib）。
@@ -4479,6 +5200,8 @@ def main(
     else:
         logging.basicConfig(level=logging.INFO)
 
+    global source_elf_path
+    source_elf_path = os.path.abspath(source_elf) if source_elf else None
     result = run_lift(file, output, target)
     print(
         f"lift stats: status={result['status']} defined={lift_stats['defined']} failed={lift_stats['failed']} "

@@ -186,16 +186,3 @@ class CFGGraphBuilder:
             cfg_edges.append((src_start, src_end, dst_start, dst_end, probability))
 
         return cfg_edges
-
-
-# Example usage:
-if __name__ == "__main__":
-    tokenizer_path = "/home/damaoooo/Downloads/regraphv2/Tokenizer/output_tokenizer/llvm_ir_bpe.json"
-    llvm_ir_path = "/home/damaoooo/Downloads/LinkerLocalityTest/code_sample/code_sample/sample_code_functions/792f695c859f77c25bb5261bff3310baf4781796.ll"
-    dot_file_path = "/home/damaoooo/Downloads/LinkerLocalityTest/code_sample/code_sample/sample_code_functions/cfg_a4047ae365ca99672328c618e5b052b8343d31879b0a1090eda19891175de006.dot"
-    tokenizer = load_tokenizer(tokenizer_path)
-    builder = CFGGraphBuilder(tokenizer, llvm_ir_path, dot_file_path)
-    cfg_edges = builder.build_cfg_edges()
-    
-    for edge in cfg_edges:
-        print(f"Source tokens: {edge[0], edge[1]}, Target tokens: {edge[2], edge[3]}, Probability: {edge[4]}")

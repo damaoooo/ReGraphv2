@@ -23,8 +23,10 @@ for rel, info in man["files"].items():
     assert f.stat().st_size == info["bytes"] and sc.sha256(f) == info["sha256"], rel
     if f.suffix == ".npy":
         m = np.load(f, mmap_mode="r"); assert str(m.dtype) == info["dtype"] and list(m.shape) == info["shape"], rel
-MOVED = {"/home/damaoooo/Dataset-1-R2-exp": "/home/damaoooo/Downloads/regraphv2/workspace/exp",
-         "/home/damaoooo/ReLL-exp": "/home/damaoooo/Downloads/regraphv2/workspace/exp"}  # frozen MANIFESTs keep old paths
+# Frozen MANIFESTs record absolute input paths. If the data moved, map old prefixes to new ones with
+# REGRAPH_PATH_MAP="old1=new1;old2=new2".
+import os
+MOVED = dict(kv.split("=", 1) for kv in os.environ.get("REGRAPH_PATH_MAP", "").split(";") if "=" in kv)
 
 
 def local(path):

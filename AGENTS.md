@@ -17,8 +17,8 @@ uv run --locked --extra fa2 python ...
 优先使用 LSP 读取代码结构。Python 和 Bash LSP 已配置；在新会话里进入本 repo 后，可以先启动：
 
 ```text
-lsp_start_server(server_id="python", workspace_root="/home/damaoooo/Downloads/regraphv2")
-lsp_start_server(server_id="bash", workspace_root="/home/damaoooo/Downloads/regraphv2")
+lsp_start_server(server_id="python", workspace_root="<repo root>")
+lsp_start_server(server_id="bash", workspace_root="<repo root>")
 ```
 
 建议先用 `lsp_document_symbols` / `lsp_goto_definition` / `lsp_find_references` 看关键文件。`lsp_file_exports(include_signatures=true)` 在本项目的一些重型模块上可能超时，必要时改用 `lsp_document_symbols` 加定向读取。
@@ -102,7 +102,7 @@ bash Scripts/train/train_test_oc_graph_ablation.sh ddg
 
 ## 大规模数据生成
 
-大规模 Dataset-1 fused 数据（Ray / Slurm，多机）在 `rope-gnn-cluster` 分支上维护和运行（Shaheen 集群），本分支不再保留 `Scripts/ray_opt_ablation/`。需要查看或修改 fused 流水线时切到该分支。
+大规模 Dataset-1 fused 数据（Ray / Slurm，多机）在 `modernBERT-cluster` 分支上维护和运行（Slurm 集群），本分支不再保留 `Scripts/ray_opt_ablation/`。需要查看或修改 fused 流水线时切到该分支。
 
 论文（SEC'27 artifact）使用的是 `Oc`：`sroa, mem2reg, simplifycfg, early-cse, sccp, correlated-propagation, jump-threading, simplifycfg, reassociate, gvn, dce, bdce, adce, simplifycfg`，定义在 `Scripts/task2_reoptimize.py`，与 `sec27-artifact` 分支一致。生成训练/评估数据一律用 `--opt-level Oc`，它不等同于 clang `-O?`。
 
@@ -130,7 +130,7 @@ python api_server.py
 
 - 本项目很多默认路径是本机绝对路径，尤其 `Pretrain/pretrain_config.py`、`Scripts/task1_lift.py` 和若干 shell 脚本。运行前先确认路径，不要盲目搬命令。
 - 训练和评估默认会很久、吃 GPU、写大量 checkpoint/embedding。除非用户明确要跑，先只做静态分析或给命令。
-- 旧 `Scripts/ablation.sh` 已归档并移除，其历史调用混用了训练池和测试映射。新任务参考 `Scripts/train/train_test_oc_graph_ablation.sh`、`Scripts/train/run_modernbert_comparison.sh` 和当前 `evaluation.py`；旧产物恢复说明见 NAS 上的 `/mnt/nas/ReLL-archives/2026-10-21-roformer-retirement/README.md`。
+- 旧 `Scripts/ablation.sh` 已归档并移除，其历史调用混用了训练池和测试映射。新任务参考 `Scripts/train/train_test_oc_graph_ablation.sh` 和当前 `evaluation.py`。
 - `DataProcess` 依赖 `results.db`，数据库中 `results` 表记录 `input_path` 等 graph generation 结果。
 - CFG 图边有第 5 个 probability/edge_attr，DDG 图边没有 edge_attr。`Model/graph_utils.py` 的 `build_batched_span_graph_tensors(..., include_edge_attr=True/False)` 是训练和评估 collator 的共同关键路径。
 - `PretrainConfig.__setattr__` 会同步 `max_seq_length` 和 `max_position_embeddings`，改序列长度时不要只改其中一个。

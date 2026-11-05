@@ -18,7 +18,7 @@ import numpy as np, pandas as pd
 
 HERE = Path(__file__).resolve().parent
 KEYS = HERE / "keys_Oc_full_test_pool.parquet"
-TALOS_ROWS = Path("/home/damaoooo/Dataset-1-ReGraphv2/Dataset-1-Oc-fused/test_talos_final_set/full_test_pool_indices.npy")
+TALOS_ROWS = HERE / "full_test_pool_indices.npy"  # callers (e.g. the per-dataset sampler) set KEYS / TALOS_ROWS
 PROTOCOL = "cpu_seed42_v1"
 SEED, MAXQ, CHUNK, OVERSAMPLE, POOLS = 42, 100000, 8192, 64, (100, 10000)
 SUBSET_ID = {"talos_gcc": 1, "talos_clang": 2}
@@ -107,7 +107,7 @@ def main():
     assert "torch" not in sys.modules
     env = {"numpy": np.__version__, "pandas": pd.__version__, "python": platform.python_version(), "host": socket.gethostname(),
            "platform": platform.platform(), "torch_imported": False,
-           "regraphv2_git_head": subprocess.run(["git", "-C", "/home/damaoooo/Downloads/regraphv2", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()}
+           "regraphv2_git_head": subprocess.run(["git", "-C", str(HERE), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()}
     protocol = {"name": PROTOCOL, "bit_generator": "numpy PCG64 via default_rng(seed_sequence)", "seed": SEED,
                 "query_stream": "default_rng([42, subset_id, task_id, 0])", "negative_stream": "default_rng([42, subset_id, task_id, P, block])",
                 "subset_id": SUBSET_ID, "task_id_and_order": TASK_ID, "max_queries": MAXQ, "block_queries": CHUNK,

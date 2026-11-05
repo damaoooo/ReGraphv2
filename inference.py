@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -81,7 +82,7 @@ class FunctionGraphJson:
 
 @dataclass
 class InferencePipelineConfig:
-    repo_root: str = "/home/damaoooo/Downloads/regraphv2"
+    repo_root: str = str(Path(__file__).resolve().parent)
     tokenizer_path: str = DEFAULT_TOKENIZER_PATH
     python_path: str = "python"
     workers: int = os.cpu_count() or 1

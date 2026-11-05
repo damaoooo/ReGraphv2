@@ -2,11 +2,10 @@
 
 split_functions (EXCLUDED_SEGMENTS filter via X.ll.lift.json) extracts the module's functions, and
 Tokenizer.corpus_builder.function_corpus_text turns each into the text DataProcess.FileProcessor tokenizes.
-Function files exist on $TMPDIR one module at a time (Shaheen's file-count quota rules out the on-disk
-<binary>_functions/ trees corpus_builder walks); per module this publishes <out>/<rel>.parquet with
-columns function_name, text.
+Function files exist in $TMPDIR one module at a time (no on-disk <binary>_functions/ trees, which keeps the
+file count low); per module this publishes <out>/<rel>.parquet with columns function_name, text.
 
-    python Scripts/shaheen/corpus_text.py --bc-root <level>/bc --list train_list.txt --out <corpus>/<OPT> --workers 384
+    python Scripts/tokenizer/corpus_text.py --bc-root <level>/bc --list train_list.txt --out <corpus>/<OPT> --workers $(nproc)
 """
 import os
 

@@ -34,7 +34,7 @@ class PretrainConfig(ModernBertConfig):
         max_seq_length: int = 2048,
         # === 路径配置 ===
         tokenizer_path: str = DEFAULT_TOKENIZER_PATH,
-        train_dataset_dir: str = "/home/damaoooo/Downloads/regraphv2/IR/dataset-1/train_final_set",
+        train_dataset_dir: str = "IR/dataset-1/train_final_set",
         train_dataset_pool_path: Optional[str] = None,
         train_dataset_idx_path: Optional[str] = None,
         train_dataset_map_path: Optional[str] = None,

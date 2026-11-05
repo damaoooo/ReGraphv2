@@ -67,3 +67,6 @@ tmp/
 
 # Weights & Biases run directories
 wandb/
+
+# Local data / experiment workspace (datasets, runs, scores): never committed
+/workspace/

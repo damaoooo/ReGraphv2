@@ -38,7 +38,7 @@ DEFAULT_DATASET2_LENGTH_STATS = {
     "min": 31,
     "max": 2048,
     "resolved_dataset_path": (
-        "/home/damaoooo/Downloads/regraphv2/IR/Dataset-2/db2_final_set/train_dataset_pool"
+        str(Path(__file__).resolve().parents[2] / "IR" / "Dataset-2" / "db2_final_set" / "train_dataset_pool")
     ),
 }
 

@@ -103,14 +103,17 @@ def entry_function(L, variables, ret=I64):
     func = ir.Function(module, ir.FunctionType(ret, [I64, I64]), "f")
     func.lvars = {}
     builder = ir.IRBuilder(func.append_basic_block("entry"))
+    # Slots are keyed like the lifter does (L._lvar_key: "funcresult" or ("lvar", mba.vars index)).
     func.lvars["funcresult"] = builder.alloca(ret, name="funcresult")
     builder.store(ir.Constant(ret, 0), func.lvars["funcresult"])
-    for var, arg in zip([v for v in variables if v.is_arg_var], func.args):
-        func.lvars[var.name] = builder.alloca(I64, name=var.name)
-        builder.store(arg, func.lvars[var.name])
-    for var in variables:
-        if not var.is_arg_var and not var.is_result_var:
-            func.lvars[var.name] = builder.alloca(ir.IntType(var.width * 8), name=var.name)
+    args = iter(func.args)
+    for idx, var in enumerate(variables):
+        if var.is_result_var:
+            continue
+        slot = builder.alloca(I64 if var.is_arg_var else ir.IntType(var.width * 8), name=var.name)
+        func.lvars[L._lvar_key(idx, var)] = slot
+        if var.is_arg_var:
+            builder.store(next(args), slot)
     return module, func, builder
 
 

@@ -19,13 +19,12 @@ Scripts/
 │   └── ida2asm.py         # 汇编基线：把每个 IDA 函数导出为 .asm
 ├── train/                 # 训练 + 评估包装脚本
 │   ├── train_test_fused_opt.sh
-│   ├── train_test_oc_graph_ablation.sh
-│   └── run_modernbert_comparison.sh
+│   └── train_test_oc_graph_ablation.sh
 └── benchmarks/
     └── speedtest.py       # 模型吞吐/显存测速
 ```
 
-大规模 fused 数据（Ray / Slurm 多机预处理）不在本分支，见 `rope-gnn-cluster` 分支。
+大规模 fused 数据（Slurm 集群上的多机预处理）不在本分支，见 `modernBERT-cluster` 分支。
 
 ## 数据管线（task1 ~ task4）
 
@@ -79,7 +78,7 @@ uv run --locked --extra pipeline python -m pytest tests/test_function_extraction
 
 需要 LLVM 18.1 和 OpenSSL 开发包。这一次构建同时生成 CFG/DDG、MetaRemover 插件（`LLVMTools/build/lib/`）和 `split_funcs`（`LLVMTools/build/bin/`）。源码分别放在 `LLVMTools/cfg_exporter/`、`ddg_exporter/`、`meta_remover/`、`split_functions/`；Python 图解析仍在 `GraphBuilder/`，提取驱动在 `Scripts/split_functions.py`。两个历史 DDG 实验源码保留，但不加入默认构建。
 
-请在实际运行环境（例如 Shaheen 的 LLVM 容器）内构建，二进制不会提交到 Git。`split_funcs` 与 PATH 中 `llvm-extract` 的版本必须一致；缺失时自动警告并回退到纯 CLI 两级分块，已有工具损坏或版本不一致则报错，不静默降级。
+请在实际运行环境（例如集群上的 LLVM 容器）内构建，二进制不会提交到 Git。`split_funcs` 与 PATH 中 `llvm-extract` 的版本必须一致；缺失时自动警告并回退到纯 CLI 两级分块，已有工具损坏或版本不一致则报错，不静默降级。
 
 可用 `REGRAPH_SPLIT_FUNCS=/absolute/path/to/split_funcs` 指定工具；指向不存在的路径可测试 CLI 回退。独立运行 shell 脚本默认使用 `python3`（仅标准库），Task 3 会显式传入当前 Python。
 
@@ -100,7 +99,6 @@ bash Scripts/train/train_test_fused_opt.sh Oc              # 论文主设置：O
 bash Scripts/train/train_test_fused_opt.sh O0              # 其他优化级别对比
 bash Scripts/train/train_test_fused_opt.sh O2 --skip-train
 bash Scripts/train/train_test_oc_graph_ablation.sh ddg     # 图分支消融：cfg / ddg / none / all
-bash Scripts/train/run_modernbert_comparison.sh            # ModernBERT 与归档 RoFormer 结果对比
 ```
 
 脚本会按自身位置推断仓库根目录，也可以用 `REPO_ROOT=...` 覆盖；各脚本的数据/输出路径参数见 `--help`。
