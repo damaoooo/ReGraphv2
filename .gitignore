@@ -65,3 +65,6 @@ tmp/
 
 # Local deduplication records, not source artifacts.
 .dedup*
+
+# paper PDFs stay out of the public repository
+paper/*.pdf
