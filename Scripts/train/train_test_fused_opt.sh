@@ -17,6 +17,7 @@ reuse_embeddings=0
 resume=0
 skip_train=0
 output_root=""
+split_suffix=""
 train_overrides=()
 
 print_help() {
@@ -43,6 +44,7 @@ Options:
   --eval-samples N       Test anchors to sample. 0 means all. Default: 0
   --pool-samples N       Retrieval pool samples. 0 means full pool. Default: 0
   --output-root DIR      Output directory. Default: ./runs/dataset1_<opt>_fused
+  --split-suffix SUFFIX  Use {train,validation,test}_final_set<SUFFIX>, e.g. _4096. Default: none
   --train-set KEY=VALUE  Extra Pretrain config override for training, repeatable.
   --resume               Resume training from the latest checkpoint.
   --skip-train           Only run test evaluation using the existing model.
@@ -126,6 +128,10 @@ while [[ $# -gt 0 ]]; do
 			output_root="$2"
 			shift 2
 			;;
+		--split-suffix)
+			split_suffix="$2"
+			shift 2
+			;;
 		--train-set)
 			train_overrides+=(--set "$2")
 			shift 2
@@ -170,9 +176,9 @@ cd "${REPO_ROOT}"
 
 opt_lower="$(tr '[:upper:]' '[:lower:]' <<< "${opt_level}")"
 dataset_root="${REPO_ROOT}/IR/Dataset-1-${opt_level}-fused"
-train_dir="${dataset_root}/train_final_set"
-validation_dir="${dataset_root}/validation_final_set"
-test_dir="${dataset_root}/test_final_set"
+train_dir="${dataset_root}/train_final_set${split_suffix}"
+validation_dir="${dataset_root}/validation_final_set${split_suffix}"
+test_dir="${dataset_root}/test_final_set${split_suffix}"
 test_pool="${test_dir}/train_dataset_pool"
 test_map="${test_dir}/train_positive_map.pkl"
 
