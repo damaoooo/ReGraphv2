@@ -70,3 +70,5 @@ wandb/
 
 # Local data / experiment workspace (datasets, runs, scores): never committed
 /workspace/
+# Paper PDFs stay local (anonymous review)
+paper/*.pdf
