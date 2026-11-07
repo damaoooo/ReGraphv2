@@ -1,14 +1,37 @@
 # ReLL 项目上下文（modernBERT-gnn 分支）
 
+## 接手必读（先看这里）
+
+本仓库是**公开**的。实验结果、论文口径、审稿意见只放在本地、不进 git 的文件里。接手实验或改论文时，按顺序读：
+
+1. **`workspace/AGENTS.md`**（本地，被 `.gitignore` 和 `.git/info/exclude` 忽略）：实验设计、全部结果的出处、论文写作口径、已知例外和局限、操作规矩。**改论文前必须读完。**
+2. `workspace/docs/PAPER_BRIEF_2026-11-04.md`：给改论文用的完整结果和论证，数字由脚本从打分文件生成。
+3. `workspace/docs/REPORT_2026-11-05_{zh,en}.pdf`：同一批结果的 LaTeX 报告（图和表），生成脚本 `workspace/exp/code/qwen_eval/make_report.py`。
+4. 本文件余下部分：代码结构、环境、训练和评估命令。
+
+如果 `workspace/` 不存在，说明你不在作者的工作站上：只能做代码层面的工作，不要猜测或编造实验数字。
+
 ## 项目定位
 
-面向 binary function similarity / retrieval 的研究代码库，模型名 **ReLL**（旧名 ReGraphv2，代码和路径里仍可见）。流程分四步：
+面向 binary function similarity / retrieval 的研究代码库，模型名 **ReLL**（旧名 ReGraphv2，代码和路径里仍可见，对外一律写 ReLL）。流程分四步：
 1. 用基于 IDA Pro / Hex-Rays 的 lifter 把二进制函数 lift 成 LLVM IR；
 2. 用保守的重优化 pass 组合 `-Oc` 规范化；
 3. 提取函数级 IR、CFG、DDG；
 4. 用 ModernBERT 编码器加 CFG / DDG 图分支，以 MoCo 对比学习训练函数嵌入。
 
-lift + `-Oc` 这一层与模型无关：IR 可以直接给其他文本模型，也可以重编译成 x86 目标文件（`.re`），交给只吃二进制的工具。
+lift + `-Oc` 这一层与模型无关：IR 可以直接给其他文本模型，也可以重编译成 x86 目标文件（`.re`），交给只吃二进制的工具。论文的主张是这层预处理本身的价值，而不是 ReLL 是最好的模型。
+
+## 实验流水线概览
+
+只描述流程，不含结果；结果见 `workspace/AGENTS.md`。
+
+1. **数据**：Talos Dataset-1（关闭内联重新编译）和 coreutils 9.5，6 种架构（arm / mips / x86，各 32 / 64 位），gcc 和 clang 多个版本与优化级别。
+2. **lift**：`Scripts/ida2llvm.py`（IDA 9.4，新建 IDB，关闭 Lumina）。数据生成在 Slurm 集群上做（`modernBERT-cluster` 分支）。
+3. **重优化**：7 个级别 O0（不做 LLVM 重优化）、O1、O2、O3、Os、Oz、Oc；`task4_recompile.py` 把 Oc IR 编回 x86 / x86-64 的 `.re`。
+4. **建数据集**：`DataProcess/` 生成 `*_final_set`（token、CFG、DDG、positive map）。
+5. **训练和嵌入**：ReLL 每个级别一个模型（`Scripts/train/train_test_fused_opt.sh`）；baseline 在 `baseline/`（本地 checkout，不进 git）。
+6. **打分**：所有方法共用一份冻结的候选列表，用 `Scripts/scoring/` 打分（R@1 和 MRR，Pool100 / Pool10000）。
+7. **报告**：`make_report.py` 从打分文件生成中英文报告。
 
 ## 分支
 
@@ -48,7 +71,7 @@ lsp_start_server(server_id="bash", workspace_root="<repo root>")
 
 `lsp_file_exports(include_signatures=true)` 在一些重型模块上可能超时，必要时改用 `lsp_document_symbols` 加定向读取。
 
-不要全量扫描数据目录。`workspace/`、`IR/`、`Binaries/`、`runs/`、`logs/` 都可能很大，而且都被 git 忽略，只在任务明确需要时读取具体文件。本地大数据（数据集、模型运行、分数）统一放在 `workspace/` 下，任何时候都不要提交。
+不要全量扫描数据目录（`workspace/` 的布局见 `workspace/AGENTS.md`）。`workspace/`、`IR/`、`Binaries/`、`runs/`、`logs/` 都可能很大，而且都被 git 忽略，只在任务明确需要时读取具体文件。本地大数据（数据集、模型运行、分数）统一放在 `workspace/` 下，任何时候都不要提交。
 
 ## 目录地图
 
