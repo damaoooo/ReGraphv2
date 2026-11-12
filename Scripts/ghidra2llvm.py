@@ -761,8 +761,16 @@ class HighEmitter(P.StrictHighPcodeLLVMEmitter):
         preds = [int(x) for x in self.current_block.get("in", [])]
         if len(preds) != len(inputs):
             raise UnsupportedPcode("multiequal_arity")
+        # A predecessor can reach this block over several edges (cbranch whose two targets coincide, switch cases with a
+        # shared target). LLVM then needs one incoming entry per edge with the SAME value; Ghidra must give the same
+        # input on all of them, otherwise the join cannot be expressed -> reject. Each such predecessor gets one fixup.
+        first: Dict[int, Dict[str, Any]] = {}
+        for pred, v in zip(preds, inputs):
+            if pred in first and self._phi_input_id(first[pred]) != self._phi_input_id(v):
+                raise UnsupportedPcode("phi_duplicate_edge_conflict")
+            first.setdefault(pred, v)
         if self.is_memory(output):
-            for pred, v in zip(preds, inputs):
+            for pred, v in first.items():
                 if self.is_memory(v):
                     if v["space"] != output["space"] or v["offset"] != output["offset"] or v["size"] != output["size"]:
                         raise UnsupportedPcode("memory_phi_storage_mismatch")
@@ -774,13 +782,21 @@ class HighEmitter(P.StrictHighPcodeLLVMEmitter):
             ty = f"i{int(output['size']) * 8}"
         name = f"%p{self.temp_index}"
         self.temp_index += 1
-        incoming = []
-        for pred, v in zip(preds, inputs):
-            ph = f"__PHI_{len(self.edge_fixups)}__"
-            incoming.append(f"[ {ph}, %bb{pred} ]")
-            self.edge_fixups.append(("value", pred, v, ty, (len(self.lines), ph)))
+        incoming, ph_of = [], {}
+        for pred, v in first.items():
+            ph_of[pred] = f"__PHI_{len(self.edge_fixups)}__"
+            self.edge_fixups.append(("value", pred, v, ty, (len(self.lines), ph_of[pred])))
+        for pred in preds:  # one entry per edge, duplicates share the predecessor's single value
+            incoming.append(f"[ {ph_of[pred]}, %bb{pred} ]")
         self.lines.append(f"  {name} = phi {ty} {', '.join(incoming)}")
         self.values[self.key(output)] = LLVMValue(P._type_width(ty), name, ty=None if ty.startswith("i") else ty)
+
+    @staticmethod
+    def _phi_input_id(v: Dict[str, Any]) -> Tuple:
+        """Identity of a MULTIEQUAL input: constants by value, everything else by storage and SSA id."""
+        if v["is_constant"]:
+            return ("const", int(v["offset"]), int(v["size"]))
+        return (v["space"], int(v["offset"]), int(v["size"]), v.get("uid"))
 
     def edge_value_lines(self, v: Dict[str, Any], ty: str) -> Tuple[str, List[str]]:
         """(operand text, instructions to place at the end of the predecessor) for a phi input."""
@@ -866,15 +882,19 @@ class HighEmitter(P.StrictHighPcodeLLVMEmitter):
         selfsym = self.prog.declare_function(self.name)
         rel = self.new_temp(self.prog.ptr_bits, f"sub {self.int_ty} {target.text}, ptrtoint (ptr {selfsym} to {self.int_ty})")
         cases = []
-        seen = set()
+        seen: Dict[int, int] = {}
         for o in outs:
             start = self.blocks_by_index[o].get("start")
             if not start:
                 raise UnsupportedPcode("branchind_target_without_address")
             off = int(start) - self.entry
             if off in seen:
-                continue
-            seen.add(off)
+                if seen[off] == o:
+                    continue
+                # the decompiler duplicated the target block for different cases; the jump address alone cannot
+                # tell which copy a case reaches, so routing by address would be silently wrong -> reject
+                raise UnsupportedPcode("branchind_duplicate_target_blocks")
+            seen[off] = o
             cases.append(f"{self.int_ty} {off}, label %bb{o}")
         lbl = f"swdefault{self.temp_index}"
         self.temp_index += 1
@@ -916,7 +936,10 @@ class HighEmitter(P.StrictHighPcodeLLVMEmitter):
         else:
             val = self.new_typed_temp(rty, f"call {fnty} {callee}({arg_text})")
             self.write(output, val)
-        if not indirect and self.prog.is_noreturn(int(t["offset"])):
+        # noreturn only cuts the block when Ghidra's block graph agrees (no successor). If the decompiler kept a
+        # fall-through edge (e.g. a PLT __assert_fail it did not treat as noreturn here), follow the graph: the
+        # successor's phis count this edge, and the edge is dead at run time anyway.
+        if not indirect and self.prog.is_noreturn(int(t["offset"])) and not self.current_block.get("out"):
             self.lines.append("  unreachable")
             self.block_done = True
 
@@ -1001,7 +1024,7 @@ def lift(binary: str, output: str, names_tsv: Optional[str], mode: str, ghidra_h
                         from ghidra2llvm_raw import RawEmitter  # noqa
                         em = RawEmitter(fn, prog, name)
                     body = em.emit()
-                    bodies.append("\n".join(body))
+                    bodies.append((name, "\n".join(body)))
                     defined.add(name)
                     rec.update(status="lifted")
                     if getattr(em, "approx", None):
@@ -1016,11 +1039,41 @@ def lift(binary: str, output: str, names_tsv: Optional[str], mode: str, ghidra_h
         hdr = [f"; ghidra2llvm lifter={LIFTER_ID} mode={mode} language={prog.rec['language']}",
                f'target datalayout = "{prog.datalayout}"', f'target triple = "{prog.triple}"', ""]
         globs = prog.emit_globals()
-        decls = [f"declare void {_q(n)}()" for n in sorted(prog.declared_functions) if n not in defined]
-        text = "\n".join(hdr + globs + [""] + decls + [""] + bodies) + "\n"
         tmpout = out.with_suffix(".ll.tmp")
-        tmpout.write_text(text, encoding="utf-8")
-        r = subprocess.run(["llvm-as-18", str(tmpout), "-o", "/dev/null"], capture_output=True, text=True)
+
+        def assemble(keep, path):
+            names = {n for n, _ in keep}
+            decls = [f"declare void {_q(n)}()" for n in sorted(prog.declared_functions) if n not in names]
+            path.write_text("\n".join(hdr + globs + [""] + decls + [""] + [b for _, b in keep]) + "\n", encoding="utf-8")
+            return subprocess.run(["llvm-as-18", str(path), "-o", "/dev/null"], capture_output=True, text=True)
+
+        r = assemble(bodies, tmpout)
+        if r.returncode != 0 and len(bodies) > 1:
+            # isolate: a function that does not verify on its own is rejected (whole function), the rest is kept
+            from concurrent.futures import ThreadPoolExecutor
+
+            def alone(i):
+                return i, assemble([bodies[i]], Path(tmp) / f"verify_{i}.ll")
+
+            with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as ex:
+                bad = {i: rr.stderr for i, rr in ex.map(alone, range(len(bodies))) if rr.returncode != 0}
+            if bad:
+                byname = {rec.get("name"): rec for rec in records}
+                for i, err in bad.items():
+                    lines_ = err.splitlines()
+                    first = next((ln.split("error:", 1)[1].strip() for ln in lines_ if "error:" in ln), None)
+                    if first is None:  # verifier message: the line after "does not verify as correct!"
+                        k = next((j for j, ln in enumerate(lines_) if "does not verify" in ln), None)
+                        first = lines_[k + 1] if k is not None and k + 1 < len(lines_) else err[:200]
+                    rec = byname.get(bodies[i][0])
+                    if rec is not None:
+                        rec.update(status="rejected", reason=("llvm_verify_failed: " + first)[:200])
+                        rec.pop("approx", None)
+                        rec.pop("livein_params", None)
+                    reasons["llvm_verify_failed"] += 1
+                    defined.discard(bodies[i][0])
+                bodies = [x for i, x in enumerate(bodies) if i not in bad]
+                r = assemble(bodies, tmpout)
         if r.returncode != 0:
             result.update(status="verify_failed", error=r.stderr[-2000:])
         elif not defined:
